@@ -27,7 +27,8 @@ export type DecisionAction = "reply" | "broadcast" | "dm" | "react" | "defer" | 
 export interface ContinuityDoc {
   goal: string;
   plan: { done: string[]; now: string; next: string[] };
-  workingSet: { files?: string[]; artifacts?: string[]; urls?: string[] };
+  /** `tools`: deferred tool names in use — the successor `tool_describe`s them before acting (slice 9). */
+  workingSet: { files?: string[]; artifacts?: string[]; urls?: string[]; tools?: string[] };
   decisions: { what: string; why: string }[];
   openLoops: string[];
   lessons: string[];

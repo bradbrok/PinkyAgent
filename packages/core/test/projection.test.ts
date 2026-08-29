@@ -74,7 +74,7 @@ const BLOCK = "[harness notice] Recalled memories\n<memories>\n- widgets cost $4
 const doc: ContinuityDoc = {
   goal: "ship the continuity engine",
   plan: { done: ["read design"], now: "write the loop", next: ["tests"] },
-  workingSet: { files: ["/a.ts"], urls: [] },
+  workingSet: { files: ["/a.ts"], urls: [], tools: ["mcp__srv__create_issue"] },
   decisions: [{ what: "shed runs last", why: "cut-point safety" }],
   openLoops: ["is 90% the right hard fraction?"],
   lessons: ["never mutate the system prompt mid-run"],
@@ -93,8 +93,28 @@ describe("serializeContinuity", () => {
     expect(out).toContain("**Goal:** ship the continuity engine");
     expect(out).toContain("- now: write the loop");
     expect(out).toContain("- file: /a.ts");
+    expect(out).toContain("- tool: mcp__srv__create_issue");
     expect(out).toContain("- shed runs last (because: cut-point safety)");
     expect(out).toContain("**Mood:** focused");
+  });
+
+  it("renders a Working Set of nothing but deferred tools (slice 9)", () => {
+    // The tools line is the only thing that can populate the section: a
+    // successor that loses these names has to tool_search for them again,
+    // because they are not in its header.
+    const out = serializeContinuity({
+      ...doc,
+      workingSet: { tools: ["mcp__srv__a", "mcp__srv__b"] },
+    });
+    expect(out).toContain("## Working Set");
+    expect(out).toContain("- tool: mcp__srv__a");
+    expect(out).toContain("- tool: mcp__srv__b");
+    expect(out).not.toContain("- file:");
+  });
+
+  it("omits the Working Set entirely when every list is empty", () => {
+    const out = serializeContinuity({ ...doc, workingSet: { files: [], urls: [], tools: [] } });
+    expect(out).not.toContain("## Working Set");
   });
 });
 

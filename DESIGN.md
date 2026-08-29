@@ -356,6 +356,40 @@ Mid-run arrivals get queue modes (OpenClaw): `steer` (inject into active run),
 - **Steering**: live agents are addressable peers — `send`, `wait`, park → revive. In
   cloud form: an agent mailbox table + wake-on-message (§P7).
 
+### 7.1 The tool plane: header vs catalog
+
+Tool definitions render at prefix position 0 (`tools → system → messages`), so the tool
+list is the head of every cache key and its size is a bill paid on every request. An MCP
+server publishes tens to hundreds of tools, and the set moves whenever a server is added,
+restarted or updated — which would invalidate every cache tier for the whole thread (§4.5,
+§9). The partition is therefore explicit:
+
+- **Header** = the always-on tools + `shed_context` + three fixed meta-tools
+  (`tool_search`, `tool_describe`, `tool_call`). Those four names can never be moved out:
+  the hard boundary forces `shed_context` by name, and deferring the search tool would
+  leave the model a door it cannot find.
+- **Catalog** = everything else, in a Postgres table (name, description, JSON Schema,
+  flattened argument text for FTS), invalidated-never-deleted like the memory plane so a
+  name from an old continuity document still resolves.
+- **Which is which** is a setting, per tool and per source, so a human — or a delegated
+  agent under P8 — chooses what the header costs. Precedence:
+  `alwaysOn` > `deferred` > `defaultMode[builtin|mcp]`; built-ins default to the header,
+  MCP tools to the catalog.
+
+**A loaded schema is appended, never a header rewrite.** `tool_describe` and `tool_call`
+answer as ordinary tool results, so discovering and using a tool extends the prefix the
+same way any other turn does; the system prompt names the three meta-tools in one static
+sentence and never enumerates the catalog. The partition is recomputed per run from the
+reloaded settings, which makes a header change a deliberate act with a visible price (one
+cold prompt) rather than a side effect of a server coming back up.
+
+Phase 1 (built) is that uniform meta-tool path, and it works on every provider route.
+Phase 2 (later) is provider-native deferral — Anthropic's `defer_loading` / `tool_reference`
+— riding the *same* catalog: the model gets names in the header and pulls schemas on
+demand, while `tool_search`/`tool_call` stay as the portable fallback for routes without
+it. The catalog is the durable half either way, which is why it is a table and not a
+process's in-memory list.
+
 ---
 
 ## 8. Durability and execution
@@ -410,6 +444,7 @@ disposable tool-execution environments:
 | Distractor confusion | Breunig: sharded prompts −39% | One coordinator per conversation; subagent outputs arrive as single curated artifacts |
 | Few-shot mimicry loops | Manus: uniform patterns induce mimicry | Structured variation in event serialization; timestamps only in log, not prompt prefix (cache + mimicry) |
 | KV-cache thrash | Manus: 10× cost delta cached vs not | Stable system prefix; append-only within a window; tool set masked not mutated mid-window, and the mask itself deferred to the forced retry (§4.5); conversation breakpoints on the last two messages; notices and the recall block journaled, and tool-call arguments canonicalized on both sides of the log so jsonb key order cannot move a byte — wake N+1 is a byte-extension of wake N |
+| Tool-list churn at position 0 | Tool defs render ahead of system and messages; an MCP server's list moves under you | Header/catalog partition (§7.1): the header is a small fixed set, everything else is a catalog reached by three meta-tools, and loading a tool appends a result instead of rewriting the header. A server's rows are trusted by config hash on start and kept across an outage, so the header is identical before and after a connect |
 | Destructive memory edits | Mem0 2026: UPDATE/DELETE degrade quality | Invalidation-not-deletion; sleep-worker-only consolidation; hot edits limited to append + annotate |
 
 ---
@@ -440,6 +475,13 @@ disposable tool-execution environments:
 - **LLM layer**: provider-agnostic with role aliases (`default`, `smol`, `advisor`),
   prompt-cache-aware.
 - **Embeddings**: `text-embedding-3-small` behind an interface; local bge for dev.
+- **Tools over MCP**: `@modelcontextprotocol/client` 2.0 (spec revision 2026-07-28:
+  stateless, Streamable HTTP, `server/discover` negotiation with an automatic fallback to
+  the 2025 `initialize` era, `tools/list` freshness hints, `subscriptions/listen` for list
+  changes). The second — and only other — runtime dependency in the repo besides
+  `postgres`. Roots, sampling and logging are deprecated in that revision and not
+  implemented. Servers are declared in the settings table, never a file, and are
+  human-write-only (§P8).
 - **Gateways**: a JSONL stdio protocol is the primary ingress — one command object per
   stdin line, one event object per stdout line, for a long-lived process another program
   drives (the pi-headless shape). It needs no socket, no signature verification and no
@@ -464,6 +506,10 @@ disposable tool-execution environments:
 7. **HITL**: `human_request` events, notify-and-break, webhook resume.
 8. **Hardening**: sandboxed execution, per-tenant quotas, memory ABAC polish, temporal
    graph voice in recall.
+9. **MCP + deferred tools** (§7.1): the `tool_catalog` table, the three meta-tools, the
+   header/catalog partition from settings, and an MCP client plane that syncs configured
+   servers into the catalog and dispatches `tools/call`. Built out of order — ahead of 4–8
+   — because the tool header is a prefix-position-0 cost that every later slice pays.
 
 ---
 
@@ -478,6 +524,14 @@ disposable tool-execution environments:
   punted to v2 with a `principal_aliases` table.
 - **Procedural memory promotion**: when does a repeated lesson become a system-prompt
   rule? Dangerous if automatic — start human-approved.
+- **`tool_catalog` has no RLS** (§7.1, §8.3): it holds tool schemas rather than user data
+  and every read and write states `tenant_id`, but `memories` is still the only table with
+  a database-side policy. The follow-up belongs with slice 8, when RLS is extended past
+  the memory plane — the GUC and the `withTenant` wrapper it keys on are already there.
+- **Per-channel MCP servers**: `mcp.servers` is read once at bootstrap from the global +
+  agent scopes, so a channel-scoped row is ignored (and warned about). Honoring one means
+  a manager and a set of child processes per channel — a lifecycle question, not a config
+  value — and it is unanswered until there is a second party on the pipe (§6).
 - **Cost model**: restarts discard cache warmth; measure $/task vs a compaction baseline
   early (pillar P2's main economic risk). Instrumented rather than deferred: `pinky stats
   restarts` prices each rebuild's first turn, `pinky stats cache` the steady-state hit

@@ -86,9 +86,10 @@ suite("migrate() on a throwaway database", () => {
     const rows = await fresh.query<{ version: number }>(
       `select version from schema_migrations order by version`,
     );
-    // 0001, 0003 and 0005 are one-shots; 0002 and 0004 are `.rerun.sql` and are
-    // deliberately never recorded, so they are re-attempted on every migrate.
-    expect(rows.map((r) => Number(r.version))).toEqual([1, 3, 5]);
+    // 0001, 0003, 0005 and 0006 are one-shots; 0002 and 0004 are `.rerun.sql`
+    // and are deliberately never recorded, so they are re-attempted on every
+    // migrate.
+    expect(rows.map((r) => Number(r.version))).toEqual([1, 3, 5, 6]);
   });
 
   it("leaves memories with RLS enabled AND forced", async () => {
@@ -111,6 +112,7 @@ suite("migrate() on a throwaway database", () => {
       "schema_migrations",
       "settings",
       "threads",
+      "tool_catalog",
     ]);
   });
 
@@ -126,7 +128,7 @@ suite("migrate() on a throwaway database", () => {
     const after = await fresh!.query<{ version: number; applied_at: string }>(
       `select version, applied_at from schema_migrations order by version`,
     );
-    expect(after.map((r) => Number(r.version))).toEqual([1, 3, 5]);
+    expect(after.map((r) => Number(r.version))).toEqual([1, 3, 5, 6]);
     // Identical timestamps prove the one-shots were skipped, not re-run.
     expect(after.map((r) => String(r.applied_at))).toEqual(before.map((r) => String(r.applied_at)));
   });

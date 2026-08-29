@@ -1,8 +1,12 @@
 import { describe, expect, it } from "bun:test";
 import {
+  MAX_TOOL_SEARCH_LIMIT,
   MIN_APPROX_WINDOW_TOKENS,
   MIN_FRACTION_GAP,
+  SELF_CONFIG_KEYS,
   SettingsStore,
+  isImmutableSettingKey,
+  isKnownSettingPath,
   isSelfConfigWritable,
   validateSettings,
 } from "../src/settings";
@@ -325,6 +329,10 @@ describe("validateSettings", () => {
   const withMemory = (memory: Record<string, unknown>) => ({ ...DEFAULT_SETTINGS, memory });
   const withSelfConfig = (selfConfig: unknown) => ({ ...DEFAULT_SETTINGS, selfConfig });
   const allowing = (...allowedKeys: unknown[]) => withSelfConfig({ enabled: true, allowedKeys });
+  const withTools = (tools: unknown) => ({ ...DEFAULT_SETTINGS, tools });
+  const someTools = (patch: Record<string, unknown>) =>
+    withTools({ ...DEFAULT_SETTINGS.tools, ...patch });
+  const withServers = (servers: unknown) => ({ ...DEFAULT_SETTINGS, mcp: { servers } });
 
   it("accepts the defaults and returns them", () => {
     expect(validateSettings(structuredClone(DEFAULT_SETTINGS))).toEqual(DEFAULT_SETTINGS);
@@ -461,6 +469,179 @@ describe("validateSettings", () => {
       withMemory({ ...DEFAULT_SETTINGS.memory, autoRecal: true }),
       /memory\.autoRecal: unknown setting key/,
     ],
+    // --- tool partition (slice 9) ----------------------------------------
+    ["missing tools sub-tree", withTools("nope"), /tools: expected an object/],
+    [
+      "unknown tools key",
+      someTools({ alwaysOnn: [] }),
+      /tools\.alwaysOnn: unknown setting key \(known: defaultMode, alwaysOn, deferred, searchLimit\)/,
+    ],
+    [
+      "non-object defaultMode",
+      someTools({ defaultMode: "always" }),
+      /tools\.defaultMode: expected an object/,
+    ],
+    [
+      "unknown defaultMode key",
+      someTools({ defaultMode: { ...DEFAULT_SETTINGS.tools.defaultMode, builtins: "always" } }),
+      /tools\.defaultMode\.builtins: unknown setting key \(known: builtin, mcp\)/,
+    ],
+    [
+      "a defaultMode that is neither always nor deferred",
+      someTools({ defaultMode: { builtin: "sometimes", mcp: "deferred" } }),
+      /tools\.defaultMode\.builtin: expected "always" or "deferred", got "sometimes"/,
+    ],
+    [
+      "a missing defaultMode.mcp",
+      someTools({ defaultMode: { builtin: "always" } }),
+      /tools\.defaultMode\.mcp: expected "always" or "deferred", got undefined/,
+    ],
+    ["non-array alwaysOn", someTools({ alwaysOn: "bash" }), /tools\.alwaysOn: expected an array of tool names/],
+    ["non-array deferred", someTools({ deferred: {} }), /tools\.deferred: expected an array of tool names/],
+    [
+      "a non-string tool name",
+      someTools({ alwaysOn: ["bash", 7] }),
+      /tools\.alwaysOn\[1\]: expected a tool name .*got 7/,
+    ],
+    [
+      "an empty tool name",
+      someTools({ deferred: [""] }),
+      /tools\.deferred\[0\]: expected a tool name .*got ""/,
+    ],
+    [
+      "a tool name with surrounding whitespace",
+      someTools({ alwaysOn: [" bash"] }),
+      /tools\.alwaysOn\[0\]: expected a tool name \(a non-empty string with no surrounding whitespace\)/,
+    ],
+    [
+      "a duplicated tool name",
+      someTools({ alwaysOn: ["bash", "recall", "bash"] }),
+      /tools\.alwaysOn\[2\]: duplicate tool name "bash"/,
+    ],
+    // Precedence is alwaysOn > deferred, so a name in both is a line that does
+    // nothing — reported on the list being ignored.
+    [
+      "a tool named in BOTH lists",
+      someTools({ alwaysOn: ["recall"], deferred: ["bash", "recall"] }),
+      /tools\.deferred\[1\]: "recall" is also in tools\.alwaysOn/,
+    ],
+    [
+      "zero searchLimit",
+      someTools({ searchLimit: 0 }),
+      /tools\.searchLimit: expected an integer in \[1, 50\]/,
+    ],
+    ["fractional searchLimit", someTools({ searchLimit: 8.5 }), /tools\.searchLimit/],
+    ["string searchLimit", someTools({ searchLimit: "8" }), /tools\.searchLimit/],
+    [
+      "a searchLimit past the cap",
+      someTools({ searchLimit: 51 }),
+      /tools\.searchLimit: expected an integer in \[1, 50\]/,
+    ],
+    // --- mcp servers (slice 9) --------------------------------------------
+    ["missing mcp sub-tree", { ...DEFAULT_SETTINGS, mcp: "nope" }, /mcp: expected an object/],
+    [
+      "unknown mcp key",
+      { ...DEFAULT_SETTINGS, mcp: { servers: {}, timeoutMs: 1000 } },
+      /mcp\.timeoutMs: unknown setting key \(known: servers\)/,
+    ],
+    ["non-object servers", withServers([]), /mcp\.servers: expected an object mapping a server name/],
+    [
+      "an uppercase server name",
+      withServers({ GitHub: { transport: "stdio", command: "x" } }),
+      /mcp\.servers\.GitHub: invalid server name/,
+    ],
+    [
+      "a server name starting with a dash",
+      withServers({ "-github": { transport: "stdio", command: "x" } }),
+      /mcp\.servers\.-github: invalid server name/,
+    ],
+    [
+      "a server name over 32 characters",
+      withServers({ [`a${"b".repeat(32)}`]: { transport: "stdio", command: "x" } }),
+      /invalid server name/,
+    ],
+    // `__` is the tool-name separator: server "github__issues" + tool "create"
+    // and server "github" + tool "issues__create" are the same final name, so
+    // they are one tool_catalog primary key, dispatch goes to whichever server
+    // the runtime reaches first, and serverState("github") stops finding its
+    // own generation.
+    [
+      "a server name containing the tool-name separator",
+      withServers({ github__issues: { transport: "stdio", command: "x" } }),
+      /mcp\.servers\.github__issues: invalid server name — "__" is the tool-name separator/,
+    ],
+    [
+      "a server name that is only a separator",
+      withServers({ __: { transport: "stdio", command: "x" } }),
+      /invalid server name/,
+    ],
+    [
+      "a non-object server entry",
+      withServers({ github: "npx -y server" }),
+      /mcp\.servers\.github: expected an object, got "npx -y server"/,
+    ],
+    [
+      "an unknown transport",
+      withServers({ github: { transport: "sse", url: "http://x/" } }),
+      /mcp\.servers\.github: expected "transport" to be "stdio" or "http", got "sse"/,
+    ],
+    [
+      "a key from the other arm of the union",
+      withServers({ github: { transport: "stdio", command: "x", url: "http://x/" } }),
+      /mcp\.servers\.github: unknown key "url" for a "stdio" server \(known: transport, command, args, env, cwd\)/,
+    ],
+    [
+      "a stdio server with no command",
+      withServers({ github: { transport: "stdio" } }),
+      /mcp\.servers\.github: a "stdio" server needs a non-empty "command", got undefined/,
+    ],
+    [
+      "a stdio server with a blank command",
+      withServers({ github: { transport: "stdio", command: "   " } }),
+      /a "stdio" server needs a non-empty "command"/,
+    ],
+    [
+      "non-string args",
+      withServers({ github: { transport: "stdio", command: "npx", args: ["-y", 7] } }),
+      /mcp\.servers\.github: "args" expects an array of strings/,
+    ],
+    [
+      "args that are not an array",
+      withServers({ github: { transport: "stdio", command: "npx", args: "-y server" } }),
+      /"args" expects an array of strings/,
+    ],
+    [
+      "a non-string env value",
+      withServers({ github: { transport: "stdio", command: "npx", env: { TOKEN: 7 } } }),
+      /mcp\.servers\.github: "env" expects an object of string values/,
+    ],
+    [
+      "an empty cwd",
+      withServers({ github: { transport: "stdio", command: "npx", cwd: "" } }),
+      /mcp\.servers\.github: "cwd" expects a non-empty string/,
+    ],
+    [
+      "an http server with no url",
+      withServers({ remote: { transport: "http" } }),
+      /mcp\.servers\.remote: an "http" server needs a non-empty "url", got undefined/,
+    ],
+    [
+      "a url that is not absolute",
+      withServers({ remote: { transport: "http", url: "/mcp" } }),
+      /mcp\.servers\.remote: "url" expects an absolute http\(s\) URL, got "\/mcp"/,
+    ],
+    [
+      "a url on a non-http scheme",
+      withServers({ remote: { transport: "http", url: "ftp://example.com/mcp" } }),
+      /mcp\.servers\.remote: "url" expects the http or https scheme/,
+    ],
+    [
+      "a non-string header value",
+      withServers({
+        remote: { transport: "http", url: "https://example.com/mcp", headers: { Auth: null } },
+      }),
+      /mcp\.servers\.remote: "headers" expects an object of string values/,
+    ],
     // --- self-configuration (DESIGN.md P8, revised) -----------------------
     ["missing selfConfig sub-tree", { ...DEFAULT_SETTINGS, selfConfig: "nope" }, /selfConfig: expected an object/],
     [
@@ -520,6 +701,23 @@ describe("validateSettings", () => {
       allowing("selfConfig.allowedKeys"),
       /selfConfig\.allowedKeys\[0\]: "selfConfig\.allowedKeys" can never be delegated to an agent/,
     ],
+    // mcp joins them (slice 9): a server entry is a command to run on this
+    // host, so no allow-list may name it in any form.
+    [
+      "mcp in the allow-list",
+      allowing("mcp"),
+      /selfConfig\.allowedKeys\[0\]: "mcp" can never be delegated to an agent/,
+    ],
+    [
+      "the mcp subtree in the allow-list",
+      allowing("mcp.*"),
+      /selfConfig\.allowedKeys\[0\]: "mcp\.\*" can never be delegated to an agent/,
+    ],
+    [
+      "mcp.servers in the allow-list",
+      allowing("tools.*", "mcp.servers"),
+      /selfConfig\.allowedKeys\[1\]: "mcp\.servers" can never be delegated to an agent/,
+    ],
   ];
 
   for (const [name, candidate, match] of cases) {
@@ -564,9 +762,155 @@ describe("validateSettings", () => {
   });
 
   it("accepts the delegation forms a human can write", () => {
-    for (const entry of ["*", "model", "context", "context.*", "context.advisoryFraction", "memory.autoRecall"]) {
+    for (const entry of [
+      "*",
+      "model",
+      "context",
+      "context.*",
+      "context.advisoryFraction",
+      "memory.autoRecall",
+      "tools",
+      "tools.*",
+      "tools.alwaysOn",
+    ]) {
       expect(validateSettings(allowing(entry)).selfConfig.allowedKeys).toEqual([entry]);
     }
+  });
+
+  it("never offers an immutable sub-tree when it lists the delegable ones", () => {
+    // "mcp.*" is refused above; advertising `mcp` in the "sub-trees: ..." hint
+    // for an unrelated typo would send the human straight back into it.
+    const message = String(
+      (() => {
+        try {
+          validateSettings(allowing("tolls.*"));
+        } catch (err) {
+          return (err as Error).message;
+        }
+        return "";
+      })(),
+    );
+    expect(message).toContain("names no settings sub-tree");
+    expect(message).toContain("tools");
+    expect(message).not.toContain("mcp");
+    expect(message).not.toContain("selfConfig,");
+  });
+
+  // --- tool partition (slice 9) -----------------------------------------
+  it("round-trips a fully populated tools block unchanged", () => {
+    const tools = {
+      defaultMode: { builtin: "deferred", mcp: "always" },
+      alwaysOn: ["recall", "retain"],
+      deferred: ["bash"],
+      searchLimit: 25,
+    };
+    expect(validateSettings(withTools(tools)).tools).toEqual(tools as never);
+  });
+
+  it("accepts the searchLimit bounds exactly", () => {
+    expect(MAX_TOOL_SEARCH_LIMIT).toBe(50);
+    expect(() => validateSettings(someTools({ searchLimit: 1 }))).not.toThrow();
+    expect(() => validateSettings(someTools({ searchLimit: MAX_TOOL_SEARCH_LIMIT }))).not.toThrow();
+    expect(() => validateSettings(someTools({ searchLimit: MAX_TOOL_SEARCH_LIMIT + 1 }))).toThrow();
+  });
+
+  it("accepts the same name in alwaysOn on one snapshot and deferred on another", () => {
+    // Only the SAME snapshot holding both is contradictory; a channel that
+    // defers what another channel forces on is two ordinary decisions.
+    expect(() => validateSettings(someTools({ alwaysOn: ["bash"] }))).not.toThrow();
+    expect(() => validateSettings(someTools({ deferred: ["bash"] }))).not.toThrow();
+  });
+
+  it("does NOT check tool names against a live tool list", () => {
+    // The catalog is runtime state: MCP servers come and go and `bash` depends
+    // on --shell, so "no such tool" is not a fact this validator can know. A
+    // name matching nothing is inert, which is the failure mode we want —
+    // config stays writable ahead of the server that will serve it.
+    const tools = someTools({ alwaysOn: ["mcp__github__create_issue"], deferred: ["no_such_tool"] });
+    expect(validateSettings(tools).tools.alwaysOn).toEqual(["mcp__github__create_issue"]);
+  });
+
+  // --- mcp servers (slice 9) --------------------------------------------
+  it("round-trips both transports unchanged, placeholders and all", () => {
+    // `${...}` values stay literal here: they are resolved from process.env at
+    // connect time, so a settings row never holds the secret itself.
+    const servers = {
+      github: {
+        transport: "stdio",
+        command: "npx",
+        args: ["-y", "@modelcontextprotocol/server-github"],
+        env: { GITHUB_TOKEN: "${GITHUB_TOKEN}" },
+        cwd: "/srv/mcp",
+      },
+      remote: {
+        transport: "http",
+        url: "https://mcp.example.com/rpc",
+        headers: { Authorization: "Bearer ${MCP_TOKEN}" },
+      },
+    };
+    expect(validateSettings(withServers(servers)).mcp.servers).toEqual(servers as never);
+  });
+
+  it("accepts a minimal entry of each transport, and the empty map", () => {
+    expect(() =>
+      validateSettings(withServers({ a: { transport: "stdio", command: "./server" } })),
+    ).not.toThrow();
+    expect(() =>
+      validateSettings(withServers({ "a-b_9": { transport: "http", url: "http://localhost:9/mcp" } })),
+    ).not.toThrow();
+    expect(validateSettings(withServers({})).mcp.servers).toEqual({});
+  });
+
+  it("keeps single _ and - legal — only the doubled underscore collides", () => {
+    for (const name of ["github_issues", "github-issues", "a_b-c_9"]) {
+      expect(() =>
+        validateSettings(withServers({ [name]: { transport: "stdio", command: "x" } })),
+      ).not.toThrow();
+    }
+    expect(() =>
+      validateSettings(withServers({ github__issues: { transport: "stdio", command: "x" } })),
+    ).toThrow(/tool-name separator/);
+  });
+
+  it("accepts a 32-character server name and refuses the 33rd character", () => {
+    const ok = `a${"b".repeat(31)}`;
+    expect(ok).toHaveLength(32);
+    expect(() =>
+      validateSettings(withServers({ [ok]: { transport: "stdio", command: "x" } })),
+    ).not.toThrow();
+    expect(() =>
+      validateSettings(withServers({ [`${ok}c`]: { transport: "stdio", command: "x" } })),
+    ).toThrow(/invalid server name/);
+  });
+
+  it("names a dotted server key without pretending it is a path", () => {
+    // "a.b" can never be a legal name; the message has to be able to say so
+    // without reading as `mcp.servers.a` -> `b`.
+    let message = "";
+    try {
+      validateSettings(withServers({ "a.b": { transport: "stdio", command: "x" } }));
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain('mcp.servers["a.b"]: invalid server name');
+  });
+
+  it("reports every bad server in one error, not just the first", () => {
+    let message = "";
+    try {
+      validateSettings(
+        withServers({
+          good: { transport: "stdio", command: "x" },
+          bad1: { transport: "stdio" },
+          bad2: { transport: "http", url: "nope" },
+        }),
+      );
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain("mcp.servers.bad1");
+    expect(message).toContain("mcp.servers.bad2");
+    expect(message).not.toContain("mcp.servers.good");
   });
 
   it("ships self-configuration off with an empty allow-list", () => {
@@ -922,6 +1266,26 @@ describe("isSelfConfigWritable", () => {
     ["model", [], false],
     ["model", ["*", "tenantId"], true],
     ["tenantId", ["tenantId", "*"], false],
+    // --- slice 9 -------------------------------------------------------
+    // The tool partition IS delegable: it is what an agent tuning its own
+    // context pressure should be able to reach.
+    ["tools.alwaysOn", ["tools.*"], true],
+    ["tools.deferred", ["tools.*"], true],
+    ["tools.searchLimit", ["tools.*"], true],
+    ["tools.defaultMode.mcp", ["tools.*"], true],
+    ["tools", ["tools.*"], false],
+    ["tools", ["tools"], true],
+    ["tools.alwaysOn", ["tools"], true],
+    ["tools.alwaysOn", ["*"], true],
+    ["tools.alwaysOn", ["memory.*"], false],
+    // MCP never is, by any route: a server entry is a command on this host.
+    ["mcp", ["*"], false],
+    ["mcp.servers", ["*"], false],
+    ["mcp.servers.github", ["*"], false],
+    ["mcp", ["mcp"], false],
+    ["mcp.servers", ["mcp.*"], false],
+    ["mcp.servers.github", ["mcp.servers"], false],
+    ["mcp.servers", ["*", "mcp", "mcp.*", "mcp.servers"], false],
   ];
 
   for (const [key, allowed, expected] of cases) {
@@ -965,5 +1329,276 @@ describe("SettingsStore.set on selfConfig (the human delegation path)", () => {
     ]);
     const snapshot = await new SettingsStore(db).load({ scopes: ["agent:pinky"] });
     expect(snapshot.selfConfig).toEqual({ enabled: true, allowedKeys: ["context.*"] });
+  });
+});
+
+/**
+ * Which keys EXIST is derived from DEFAULT_SETTINGS, so slice 9's two new
+ * sub-trees are addressable the day they land there — with one exception the
+ * walk has to get right: `mcp.servers` is an open map, so its children are
+ * server names a human invents, not schema fields.
+ */
+describe("the key set derived from DEFAULT_SETTINGS", () => {
+  it("includes every tools and mcp path", () => {
+    for (const key of [
+      "tools",
+      "tools.defaultMode",
+      "tools.defaultMode.builtin",
+      "tools.defaultMode.mcp",
+      "tools.alwaysOn",
+      "tools.deferred",
+      "tools.searchLimit",
+      "mcp",
+      "mcp.servers",
+    ]) {
+      expect(SELF_CONFIG_KEYS).toContain(key);
+      expect(isKnownSettingPath(key)).toBe(true);
+    }
+  });
+
+  it("does not turn array elements into keys", () => {
+    expect(SELF_CONFIG_KEYS.some((k) => k.startsWith("tools.alwaysOn."))).toBe(false);
+    expect(isKnownSettingPath("tools.alwaysOn.0")).toBe(false);
+  });
+
+  it("treats mcp.servers.<name> as a legal ROW key without enumerating names", () => {
+    // The derived list cannot contain a server name (DEFAULT_SETTINGS ships
+    // `servers: {}`), but a row keyed `mcp.servers.github` is exactly how one
+    // server is added — so the pruner has to accept it, or `set` would write a
+    // row `load` then silently drops.
+    expect(SELF_CONFIG_KEYS.some((k) => k.startsWith("mcp.servers."))).toBe(false);
+    expect(isKnownSettingPath("mcp.servers.github")).toBe(true);
+    // One level only: a server config is a discriminated union, set whole.
+    expect(isKnownSettingPath("mcp.servers.github.command")).toBe(false);
+    expect(isKnownSettingPath("mcp.servers.")).toBe(false);
+  });
+
+  it("has no other open map: memory/context children are still fixed", () => {
+    expect(isKnownSettingPath("memory.anything")).toBe(false);
+    expect(isKnownSettingPath("context.anything")).toBe(false);
+  });
+
+  it("marks mcp immutable at every depth, and tools at none", () => {
+    for (const key of ["mcp", "mcp.servers", "mcp.servers.github"]) {
+      expect(isImmutableSettingKey(key)).toBe(true);
+    }
+    for (const key of ["tools", "tools.alwaysOn", "tools.defaultMode.mcp"]) {
+      expect(isImmutableSettingKey(key)).toBe(false);
+    }
+    // Prefix confusion: "mcp" must not swallow a sibling that starts with it.
+    expect(isImmutableSettingKey("mcpServers")).toBe(false);
+  });
+});
+
+/**
+ * Slice 9 through the store: the overlay replaces a list rather than merging
+ * it, one bad server entry loses only itself, and a bad tool list falls back to
+ * empty instead of taking the run down.
+ */
+describe("tools and mcp through load()", () => {
+  it("replaces tools.alwaysOn wholesale — the overlay never merges arrays", () => {
+    // A merged union would make a narrower scope unable to REMOVE anything,
+    // and `alwaysOn` is the header cache key: "agent:pinky runs with exactly
+    // these" has to be expressible.
+    const db = dbWithAllRows([
+      ["global", "tools.alwaysOn", ["recall", "retain"]],
+      ["agent:pinky", "tools.alwaysOn", ["bash"]],
+    ]);
+    return new SettingsStore(db)
+      .load({ scopes: ["agent:pinky"] })
+      .then((snapshot) => expect(snapshot.tools.alwaysOn).toEqual(["bash"]));
+  });
+
+  it("lets a channel empty a list its global scope filled", async () => {
+    const db = dbWithAllRows([
+      ["global", "tools.deferred", ["bash"]],
+      ["channel:c1", "tools.deferred", []],
+    ]);
+    const snapshot = await new SettingsStore(db).load({ scopes: ["channel:c1"] });
+    expect(snapshot.tools.deferred).toEqual([]);
+  });
+
+  it("merges one server row into the map beside another scope's", async () => {
+    const db = dbWithAllRows([
+      ["global", "mcp.servers.github", { transport: "stdio", command: "npx" }],
+      ["channel:c1", "mcp.servers.remote", { transport: "http", url: "https://x.example/mcp" }],
+    ]);
+    const snapshot = await new SettingsStore(db).load({ scopes: ["channel:c1"] });
+    expect(Object.keys(snapshot.mcp.servers).sort()).toEqual(["github", "remote"]);
+  });
+
+  it("a row keyed `mcp.servers` REPLACES the map, as any parent key does", async () => {
+    const db = dbWithAllRows([
+      ["global", "mcp.servers.github", { transport: "stdio", command: "npx" }],
+      ["agent:pinky", "mcp.servers", { remote: { transport: "http", url: "https://x.example/mcp" } }],
+    ]);
+    const snapshot = await new SettingsStore(db).load({ scopes: ["agent:pinky"] });
+    expect(Object.keys(snapshot.mcp.servers)).toEqual(["remote"]);
+  });
+
+  it("drops ONE bad server entry and keeps the rest of the map", async () => {
+    const db = dbWithAllRows([
+      [
+        "global",
+        "mcp.servers",
+        {
+          github: { transport: "stdio", command: "npx" },
+          broken: { transport: "stdio" },
+        },
+      ],
+    ]);
+    const { store, messages } = loudStore(db);
+    const snapshot = await store.load();
+
+    expect(Object.keys(snapshot.mcp.servers)).toEqual(["github"]);
+    expect(messages.some((m) => m.includes("mcp.servers.broken"))).toBe(true);
+    expect(messages.some((m) => m.includes("github"))).toBe(false);
+  });
+
+  it("drops a server whose NAME cannot be a name, dot and all", async () => {
+    // The repair target here cannot be a dotted path (the name holds the dot),
+    // which is the whole reason an issue can carry raw segments.
+    const db = dbWithAllRows([
+      [
+        "global",
+        "mcp.servers",
+        {
+          "a.b": { transport: "stdio", command: "npx" },
+          ok: { transport: "stdio", command: "npx" },
+        },
+      ],
+    ]);
+    const { store, messages } = loudStore(db);
+    const snapshot = await store.load();
+
+    expect(Object.keys(snapshot.mcp.servers)).toEqual(["ok"]);
+    expect(messages.some((m) => m.includes('mcp.servers["a.b"]'))).toBe(true);
+  });
+
+  it("drops a bad entry written as its own row, leaving the row's siblings", async () => {
+    const db = dbWithAllRows([
+      ["global", "mcp.servers.github", { transport: "stdio", command: "npx" }],
+      ["global", "mcp.servers.broken", { transport: "http", url: "not a url" }],
+    ]);
+    const { store, messages } = loudStore(db);
+    const snapshot = await store.load();
+
+    expect(Object.keys(snapshot.mcp.servers)).toEqual(["github"]);
+    expect(messages.some((m) => /mcp\.servers\.broken.*absolute http/.test(m))).toBe(true);
+  });
+
+  it("resets a bad tool list to empty without touching the other one", async () => {
+    const db = dbWithAllRows([
+      ["global", "tools.alwaysOn", ["bash", "bash"]],
+      ["global", "tools.deferred", ["recall"]],
+      ["global", "tools.searchLimit", 500],
+    ]);
+    const { store, messages } = loudStore(db);
+    const snapshot = await store.load();
+
+    expect(snapshot.tools.alwaysOn).toEqual([]);
+    expect(snapshot.tools.deferred).toEqual(["recall"]);
+    expect(snapshot.tools.searchLimit).toBe(DEFAULT_SETTINGS.tools.searchLimit);
+    expect(messages.some((m) => /tools\.alwaysOn\[1\].*duplicate/.test(m))).toBe(true);
+    expect(messages.some((m) => /tools\.searchLimit.*falling back/.test(m))).toBe(true);
+  });
+
+  it("resets only tools.deferred when a name is in both lists", async () => {
+    const db = dbWithAllRows([
+      ["global", "tools.alwaysOn", ["bash"]],
+      ["global", "tools.deferred", ["bash"]],
+    ]);
+    const { store, messages } = loudStore(db);
+    const snapshot = await store.load();
+
+    expect(snapshot.tools.alwaysOn).toEqual(["bash"]);
+    expect(snapshot.tools.deferred).toEqual([]);
+    expect(messages.some((m) => m.includes("also in tools.alwaysOn"))).toBe(true);
+  });
+
+  it("prunes an unreadable row under mcp.servers, and says which", async () => {
+    const db = dbWithAllRows([
+      ["global", "mcp.servers.github.command", "npx"],
+      ["global", "model", "openrouter/kept"],
+    ]);
+    const { store, messages } = loudStore(db);
+    const snapshot = await store.load();
+
+    expect(snapshot.mcp.servers).toEqual({});
+    expect(snapshot.model).toBe("openrouter/kept");
+    expect(messages[0]).toContain("mcp.servers.github.command");
+    expect(messages[0]).toContain("no such setting key");
+  });
+
+  it("never throws on a wholly bogus tools/mcp pair", async () => {
+    const db = dbWithAllRows([
+      ["global", "tools", "yes please"],
+      ["global", "mcp", 7],
+    ]);
+    const { store, messages } = loudStore(db);
+    const snapshot = await store.load();
+    expect(snapshot.tools).toEqual(DEFAULT_SETTINGS.tools);
+    expect(snapshot.mcp).toEqual(DEFAULT_SETTINGS.mcp);
+    expect(messages.length).toBeGreaterThan(0);
+  });
+});
+
+describe("SettingsStore.set on tools and mcp (the human write path)", () => {
+  it("writes one server as a plain jsonb object under its own key", async () => {
+    const db = dbWithScopedRows([]);
+    const server = { transport: "stdio", command: "npx", args: ["-y", "srv"] };
+    await new SettingsStore(db).set("global", "mcp.servers.github", server);
+    expect(insertCalls(db)[0]!.params).toEqual(["global", "mcp.servers.github", server]);
+    expect(typeof insertCalls(db)[0]!.params![2]).toBe("object");
+  });
+
+  it("round-trips that row through load — the write is not silently pruned", async () => {
+    const server = { transport: "stdio", command: "npx" };
+    const db = dbWithScopedRows([["global", "mcp.servers.github", server]]);
+    const { store, messages } = loudStore(db);
+    expect((await store.load()).mcp.servers).toEqual({ github: server } as never);
+    expect(messages).toEqual([]);
+  });
+
+  it("rejects a bad server entry and issues no insert", async () => {
+    const db = dbWithScopedRows([]);
+    await expect(
+      new SettingsStore(db).set("global", "mcp.servers.github", { transport: "stdio" }),
+    ).rejects.toThrow(/mcp\.servers\.github: a "stdio" server needs a non-empty "command"/);
+    expect(insertCalls(db)).toHaveLength(0);
+  });
+
+  it("rejects an illegal server NAME at the key, before anything is stored", async () => {
+    const db = dbWithScopedRows([]);
+    await expect(
+      new SettingsStore(db).set("global", "mcp.servers.GitHub", { transport: "stdio", command: "x" }),
+    ).rejects.toThrow(/invalid server name/);
+    expect(insertCalls(db)).toHaveLength(0);
+  });
+
+  it("rejects a searchLimit past the cap and a name in both lists", async () => {
+    const over = dbWithScopedRows([]);
+    await expect(new SettingsStore(over).set("global", "tools.searchLimit", 200)).rejects.toThrow(
+      /tools\.searchLimit: expected an integer in \[1, 50\]/,
+    );
+    expect(insertCalls(over)).toHaveLength(0);
+
+    // Cross-key, within one scope's effective snapshot: alwaysOn is already
+    // stored, so the deferred write is the one that reads as doing nothing.
+    const clash = dbWithScopedRows([["global", "tools.alwaysOn", ["bash"]]]);
+    await expect(new SettingsStore(clash).set("global", "tools.deferred", ["bash"])).rejects.toThrow(
+      /also in tools\.alwaysOn/,
+    );
+    expect(insertCalls(clash)).toHaveLength(0);
+  });
+
+  it("writes a tool list as a plain jsonb array", async () => {
+    const db = dbWithScopedRows([]);
+    await new SettingsStore(db).set("agent:pinky", "tools.alwaysOn", ["recall", "retain"]);
+    expect(insertCalls(db)[0]!.params).toEqual([
+      "agent:pinky",
+      "tools.alwaysOn",
+      ["recall", "retain"],
+    ]);
   });
 });

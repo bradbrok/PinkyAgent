@@ -90,12 +90,37 @@ export function assertGatewaySecrets(env: EnvConfig): void {
   }
 }
 
+/**
+ * One MCP server (slice 9), as a human writes it under `mcp.servers.<name>`.
+ *
+ * A discriminated union, and validated as one: `transport` picks which keys
+ * are legal, so a `url` on a stdio entry is a rejection rather than a field
+ * quietly doing nothing. Values in `env`/`headers` may be written as
+ * "${ENV_NAME}" — the connect path resolves them from the process environment,
+ * so a settings row holds the reference and never the secret.
+ *
+ * Nothing here is checked for liveness at validation time (does the command
+ * exist, does the URL answer, does the server speak a protocol we support):
+ * that is McpManager's business at connect time, because a server being down
+ * must degrade to "no tools from that server", never to a snapshot that fails
+ * to load.
+ */
+export type McpServerConfig =
+  | { transport: "stdio"; command: string; args?: string[]; env?: Record<string, string>; cwd?: string }
+  | { transport: "http"; url: string; headers?: Record<string, string> };
+
 /** Behavioral settings, sourced from the `settings` table (scope overlay:
  *  global < channel:<id> < agent:<id>).
  *
  *  This type plus DEFAULT_SETTINGS *is* the schema: settings.ts derives the
  *  set of legal keys from DEFAULT_SETTINGS and hand-checks each field in
- *  validateSettings(). Adding a field here means adding its rule there. */
+ *  validateSettings(). Adding a field here means adding its rule there.
+ *
+ *  A row REPLACES the value at its key; it never merges into it. `context` as
+ *  a key replaces the whole sub-tree, and an array value (`tools.alwaysOn`)
+ *  written at `agent:<id>` is that run's entire list — not the union with the
+ *  one in `global`. Merging would leave a narrower scope unable to remove
+ *  anything it inherited. */
 export interface SettingsSnapshot {
   tenantId: string;
   /** Provider/model-id, e.g. "openrouter/moonshotai/kimi-k2". */
@@ -129,6 +154,50 @@ export interface SettingsSnapshot {
     recallTokenBudget: number;
   };
   /**
+   * Header vs catalog partition of the tool set (slice 9). Tool schemas render
+   * at prefix position 0, so the header is a cache key: changing `alwaysOn`
+   * invalidates every provider cache tier and is journaled like any setting;
+   * changing `deferred` is free. The three meta-tools and `shed_context` are
+   * always in the header. Precedence: alwaysOn > deferred > defaultMode[source].
+   *
+   * The two lists hold exact tool names, and validateSettings checks their
+   * SHAPE only — never their existence. The catalog is runtime state (MCP
+   * servers come and go, `bash` depends on `--shell`), so "no such tool" is
+   * not a fact the validator can know without making config unwritable while a
+   * server is down. A name matching nothing is inert.
+   */
+  tools: {
+    defaultMode: { builtin: "always" | "deferred"; mcp: "always" | "deferred" };
+    alwaysOn: string[];
+    deferred: string[];
+    /** Results per `tool_search`; 1..MAX_TOOL_SEARCH_LIMIT (settings.ts). The
+     *  hits land in the conversation, so the page size is a context bill. */
+    searchLimit: number;
+  };
+  /**
+   * MCP servers (slice 9), keyed by a short name that prefixes their tools
+   * (`mcp__<name>__<tool>`, so the name is validated
+   * `^(?!.*__)[a-z0-9][a-z0-9_-]{0,31}$` — no dots, which keeps
+   * `mcp.servers.<name>` unambiguous as a row key, and no `__`, because that
+   * is the separator itself: server `github__issues` + tool `create` and
+   * server `github` + tool `issues__create` would both render as
+   * `mcp__github__issues__create`, one `tool_catalog` primary key for two
+   * servers. A single `_` or `-` is fine).
+   *
+   * NEVER agent-writable — a stdio `command` is arbitrary host execution and an
+   * http `url` is where the agent's tool calls go — so `mcp` and `mcp.*` are
+   * immutable like tenantId, denied even under a `"*"` allow-list. Adding a
+   * server is a human act: `pinky config set mcp.servers.github '<json>'`.
+   *
+   * This is the schema's one open map: its keys are names a human invents, so
+   * settings.ts treats `mcp.servers.<name>` as a legal row key (one level
+   * deep — an entry is a union, set whole) and a single unusable entry is
+   * dropped on load without taking the other servers with it.
+   */
+  mcp: {
+    servers: Record<string, McpServerConfig>;
+  };
+  /**
    * Human-granted self-configuration (DESIGN.md P8, revised).
    *
    * P8 used to read "agents cannot write settings, full stop". It now reads:
@@ -141,7 +210,8 @@ export interface SettingsSnapshot {
    * it can read and correct instead of a process that will not boot.
    *
    * This sub-tree is itself never agent-writable — an agent that could widen
-   * its own allow-list would have no allow-list. Neither is `tenantId`.
+   * its own allow-list would have no allow-list. Neither is `tenantId`, nor
+   * `mcp` (see above).
    */
   selfConfig: {
     /** Master switch. Default false: only a human (`pinky config set`) flips it. */
@@ -169,6 +239,13 @@ export const DEFAULT_SETTINGS: SettingsSnapshot = {
     recallLimit: 12,
     recallTokenBudget: 5_000,
   },
+  tools: {
+    defaultMode: { builtin: "always", mcp: "deferred" },
+    alwaysOn: [],
+    deferred: [],
+    searchLimit: 8,
+  },
+  mcp: { servers: {} },
   // Off, and empty, until a human says otherwise.
   selfConfig: { enabled: false, allowedKeys: [] },
 };

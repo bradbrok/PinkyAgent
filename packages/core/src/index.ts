@@ -9,3 +9,4 @@ export * from "./projection";
 export * from "./mailbox";
 export * from "./settings";
 export * from "./memory";
+export * from "./tool-catalog";

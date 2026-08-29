@@ -18,6 +18,14 @@ const BASE_TOOLS = [
   // a human turns selfConfig on (DESIGN.md P8, revised).
   "settings_get",
   "settings_set",
+  // The catalog door (slice 9). Unconditional on purpose: the tool list is the
+  // cached prefix, so a header that gained or lost these three depending on
+  // whether an MCP server was reachable at boot would cost a cold cache per
+  // wake. Without `ctx.deferred` they answer "no deferred tools on this
+  // surface" (DESIGN.md §4.5/§9).
+  "tool_search",
+  "tool_describe",
+  "tool_call",
 ];
 
 describe("createTools", () => {

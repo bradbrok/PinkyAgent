@@ -16,9 +16,11 @@
  * 1. `selfConfig.enabled` — off by default, flipped only from the human CLI.
  * 2. `selfConfig.allowedKeys` — the human names what is delegable. Empty
  *    grants nothing, even with the switch on.
- * 3. The immutables — `tenantId` (which tenant's data this is) and
- *    `selfConfig` itself (an agent that can widen its own allow-list has
- *    none). Denied even by `"*"`.
+ * 3. The immutables — `tenantId` (which tenant's data this is), `selfConfig`
+ *    itself (an agent that can widen its own allow-list has none), and `mcp`
+ *    (slice 9: a stdio `command` is arbitrary host execution and an http `url`
+ *    is where the agent's own tool calls go, so adding a server stays a human
+ *    act). Denied even by `"*"`.
  *
  * Scope: "agent:<id>" or "channel:<id>" only. `global` stays human-only, so a
  * self-tuning agent can never reach into another channel's or agent's config.
@@ -240,7 +242,8 @@ export class SettingsSetTool implements Tool {
     if (isImmutableSettingKey(key)) {
       return fail(
         `${this.name}: '${key}' can never be changed by a tool, allow-list or not ` +
-          "(tenantId picks the tenant; selfConfig is the delegation itself). Ask a human to run " +
+          "(tenantId picks the tenant; selfConfig is the delegation itself; mcp.servers is arbitrary " +
+          "host execution — a stdio command, or the URL your tool calls go to). Ask a human to run " +
           `\`pinky config set ${key} <value>\`.`,
       );
     }

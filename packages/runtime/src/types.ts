@@ -144,12 +144,52 @@ export interface ToolContext {
    * `tokensBefore` of the continuity event (DESIGN.md §4).
    */
   contextTokens?: number;
+  /**
+   * The deferred-tool plane (slice 9): catalog search/describe plus dispatch.
+   * Absent ⇒ the three meta-tools answer "no deferred tools on this surface".
+   */
+  deferred?: DeferredTools;
   signal?: AbortSignal;
 }
 
 export interface ToolResult {
   text: string;
   isError?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Deferred tools (slice 9). Tool schemas render at prefix position 0, so the
+// header holds only always-on tools plus three fixed meta-tools; every other
+// tool lives in the Postgres catalog and reaches the model as an ordinary tool
+// result — appended, never a header rewrite (DESIGN.md §9 "masked not mutated").
+// ---------------------------------------------------------------------------
+
+export interface CatalogHit {
+  name: string;
+  /** Capped (~200 chars) in search results; full text via describe(). */
+  description: string;
+  source: "builtin" | "mcp";
+  server?: string;
+}
+
+export interface CatalogEntry extends CatalogHit {
+  /** JSON Schema for the tool's arguments (MCP inputSchema / Tool.parameters). */
+  parameters: Record<string, unknown>;
+}
+
+export interface ToolCatalogView {
+  search(query: string, limit: number): Promise<CatalogHit[]>;
+  describe(name: string): Promise<CatalogEntry | null>;
+}
+
+export interface DeferredTools {
+  catalog: ToolCatalogView;
+  /**
+   * Execute a DEFERRED tool by catalog name. Unknown name or arguments that
+   * fail the schema come back as an isError result carrying the schema, so
+   * the model can correct itself without a describe round-trip.
+   */
+  call(name: string, args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult>;
 }
 
 export interface Tool {
@@ -255,6 +295,8 @@ export interface AgentLoopOptions {
   memory?: MemoryContext;
   systemPrompt: string;
   cwd: string;
+  /** Deferred-tool plane; copied into every ToolContext. Absent ⇒ none. */
+  deferred?: DeferredTools;
   maxTurns?: number;
   /** Human-owned settings snapshot (from the settings table). The loop reads
    *  model + context thresholds from here; agents cannot mutate it. */

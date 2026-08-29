@@ -43,12 +43,19 @@
  * schema/0004_jsonb_repair.rerun.sql.
  *
  * Keys are top-level settings field names ("tenantId",
- * "model", "context", "replyGate", "memory", "selfConfig") or dotted sub-paths
- * ("context.advisoryFraction") — the loader materializes a snapshot by merging
- * each row into the tree, so "context" as a whole replaces the sub-tree while
- * dotted keys merge granularly. Within one scope rows apply in key order, so
- * "context" lands before "context.advisoryFraction" and the dotted key refines
- * the sub-tree the parent key just replaced.
+ * "model", "context", "replyGate", "memory", "tools", "mcp", "selfConfig") or
+ * dotted sub-paths ("context.advisoryFraction") — the loader materializes a
+ * snapshot by merging each row into the tree, so "context" as a whole replaces
+ * the sub-tree while dotted keys merge granularly. Within one scope rows apply
+ * in key order, so "context" lands before "context.advisoryFraction" and the
+ * dotted key refines the sub-tree the parent key just replaced. A value
+ * REPLACES, never merges: `tools.alwaysOn` written at agent:<id> is the whole
+ * array for that run, not the union with the one in `global`.
+ *
+ * `mcp.servers` is the one OPEN MAP in the schema — its child keys are server
+ * names a human chooses, not fields DEFAULT_SETTINGS can enumerate — so
+ * `mcp.servers.<name>` is a legal row key (see OPEN_MAP_KEYS) and one bad
+ * entry is dropped on its own rather than taking the whole map with it.
  */
 import type { Db } from "./db";
 import { jsonbParam } from "./pg";
@@ -138,15 +145,53 @@ export const MIN_FRACTION_GAP = 0.05;
 /** Float slack, so an exactly-0.05 gap written as 0.7/0.75 is not rejected. */
 const GAP_EPSILON = 1e-9;
 
+/**
+ * Ceiling for `tools.searchLimit`. `tool_search` results are rendered into the
+ * conversation as a tool result, so the page size is a context bill; past a few
+ * dozen hits the model is reading a catalog dump instead of searching one.
+ */
+export const MAX_TOOL_SEARCH_LIMIT = 50;
+
+/** The two modes a tool can be in (slice 9): rendered in the header prefix, or
+ *  reachable only through `tool_search`/`tool_describe`/`tool_call`. */
+const TOOL_MODES = ["always", "deferred"] as const;
+
+/**
+ * `mcp.servers` key rule (slice 9). The name prefixes every tool the server
+ * contributes (`mcp__<name>__<tool>`), so it has to survive a provider's tool
+ * name charset and stay readable: lowercase, no dots (a dot would make the
+ * settings row key ambiguous), 32 chars.
+ *
+ * And no `__`, because that is the SEPARATOR in the tool name. Server
+ * `github__issues` with tool `create` and server `github` with tool
+ * `issues__create` both render as `mcp__github__issues__create`: one primary
+ * key in `tool_catalog`, so the second server's row silently overwrites the
+ * first's, dispatch goes to whichever server the runtime map happens to reach
+ * first, and `serverState("github")` no longer finds the row it wrote — its
+ * config-hash trust never rearms and it re-lists on every start. A single
+ * `_` or `-` is still fine; only the doubled underscore is ambiguous.
+ */
+const SERVER_NAME_RE = /^(?!.*__)[a-z0-9][a-z0-9_-]{0,31}$/;
+
 // Hand-written key lists (no schema library — this repo has one runtime dep).
 // DEFAULT_SETTINGS is the base *and* the source of truth for "what exists".
 const TOP_KEYS = Object.keys(DEFAULT_SETTINGS);
 const CONTEXT_KEYS = Object.keys(DEFAULT_SETTINGS.context);
 const REPLY_GATE_KEYS = Object.keys(DEFAULT_SETTINGS.replyGate);
 const MEMORY_KEYS = Object.keys(DEFAULT_SETTINGS.memory);
+const TOOLS_KEYS = Object.keys(DEFAULT_SETTINGS.tools);
+const DEFAULT_MODE_KEYS = Object.keys(DEFAULT_SETTINGS.tools.defaultMode);
+const MCP_KEYS = Object.keys(DEFAULT_SETTINGS.mcp);
 const SELF_CONFIG_BLOCK_KEYS = Object.keys(DEFAULT_SETTINGS.selfConfig);
 
-/** Walk DEFAULT_SETTINGS into the dotted paths a settings row may address. */
+/**
+ * Walk DEFAULT_SETTINGS into the dotted paths a settings row may address.
+ *
+ * Only what the defaults SHOW exists: `mcp.servers` is `{}`, so the walk stops
+ * there and no server name is ever mistaken for a schema field (see
+ * OPEN_MAP_KEYS for how a row addressing one entry stays legal). Arrays are
+ * leaves — `tools.alwaysOn` is one key, never one key per element.
+ */
 function collectKeys(node: Record<string, unknown>, prefix = ""): string[] {
   const out: string[] = [];
   for (const [key, value] of Object.entries(node)) {
@@ -169,10 +214,31 @@ export const SELF_CONFIG_KEYS: string[] = collectKeys(
 
 const KNOWN_PATHS = new Set(SELF_CONFIG_KEYS);
 
+/**
+ * Sub-trees whose CHILD keys are chosen by the human, not by the schema.
+ *
+ * `mcp.servers` maps a server name to its config, so DEFAULT_SETTINGS can
+ * never enumerate the legal keys under it — and a row keyed
+ * `mcp.servers.github` is exactly how a human adds one server without
+ * rewriting the whole map. Without this, `set()` would happily write that row
+ * and `load()` would then prune it as "no such setting key": a write that
+ * silently does nothing, which is the worst outcome available.
+ *
+ * ONE level deep only. A server config is a discriminated union (stdio vs
+ * http), so it is set whole; `mcp.servers.github.command` would let half a
+ * union be written and is pruned like any other unreadable row.
+ */
+const OPEN_MAP_KEYS = ["mcp.servers"] as const;
+
 /** True for a key a settings row may legally address ("model", "memory",
- *  "context.hardFraction"). What `load()` prunes rows by. */
+ *  "context.hardFraction", "mcp.servers.<name>"). What `load()` prunes rows by. */
 export function isKnownSettingPath(key: string): boolean {
-  return KNOWN_PATHS.has(key);
+  if (KNOWN_PATHS.has(key)) return true;
+  return OPEN_MAP_KEYS.some((map) => {
+    if (!key.startsWith(`${map}.`)) return false;
+    const child = key.slice(map.length + 1);
+    return child !== "" && !child.includes(".");
+  });
 }
 
 /** Keys that have children, i.e. the ones "<key>.*" can stand for. */
@@ -189,9 +255,21 @@ const SUBTREE_KEYS: string[] = Object.entries(
  *   operates in. A tool that could rewrite it could read another tenant.
  * - `selfConfig` itself: an agent that can widen its own allow-list does not
  *   have an allow-list, it has a formality.
+ * - `mcp` and everything under it (slice 9): an `mcp.servers` entry carries a
+ *   stdio `command`, i.e. an arbitrary process on the host, and an http `url`
+ *   plus headers, i.e. where the agent's tool calls (and any secret in those
+ *   headers) go. Delegating that would make every other gate in this file
+ *   decorative — an agent could add a server whose tools do the thing it was
+ *   not allowed to do. Adding a server stays a human act (`pinky config set`).
  */
 export function isImmutableSettingKey(key: string): boolean {
-  return key === "tenantId" || key === "selfConfig" || key.startsWith("selfConfig.");
+  return (
+    key === "tenantId" ||
+    key === "selfConfig" ||
+    key.startsWith("selfConfig.") ||
+    key === "mcp" ||
+    key.startsWith("mcp.")
+  );
 }
 
 /**
@@ -236,14 +314,16 @@ function allowedEntryProblem(entry: unknown): string | null {
   if (isImmutableSettingKey(named)) {
     return (
       `${show(entry)} can never be delegated to an agent ` +
-      `(tenantId picks the tenant; selfConfig is the delegation itself)`
+      `(tenantId picks the tenant; selfConfig is the delegation itself; ` +
+      `mcp servers are arbitrary host execution)`
     );
   }
   if (entry === "*") return null;
   if (entry.endsWith(".*")) {
-    return SUBTREE_KEYS.includes(named)
-      ? null
-      : `${show(entry)} names no settings sub-tree (sub-trees: ${SUBTREE_KEYS.join(", ")})`;
+    if (SUBTREE_KEYS.includes(named)) return null;
+    // Never advertise a sub-tree the answer above already refused.
+    const offerable = SUBTREE_KEYS.filter((k) => !isImmutableSettingKey(k));
+    return `${show(entry)} names no settings sub-tree (sub-trees: ${offerable.join(", ")})`;
   }
   if (!SELF_CONFIG_KEYS.includes(entry)) {
     return (
@@ -255,9 +335,87 @@ function allowedEntryProblem(entry: unknown): string | null {
   return null;
 }
 
+/** An object whose every value is a string (`env`, `headers`). */
+function isStringRecord(v: unknown): v is Record<string, string> {
+  return isRecord(v) && Object.values(v).every((x) => typeof x === "string");
+}
+
+const STDIO_SERVER_KEYS = ["transport", "command", "args", "env", "cwd"];
+const HTTP_SERVER_KEYS = ["transport", "url", "headers"];
+
+/**
+ * The rule for ONE `mcp.servers` entry (slice 9), returning null when the
+ * entry is a usable server. Split out for the same reason as
+ * allowedEntryProblem: the strict caller reports it with the entry's name and
+ * the lenient one drops that entry alone.
+ *
+ * Shape only. Whether the command exists, the URL answers, or the server
+ * speaks a protocol version we support is discovered at connect time by
+ * McpManager, which must never be able to stop a wake — a server that is down
+ * degrades to "no tools from that server", not to a broken snapshot.
+ *
+ * `env`/`headers` values may be "${ENV_NAME}"; they are resolved from the
+ * process environment when the transport is opened and are stored, and
+ * validated, unresolved — so a settings row never holds a secret.
+ */
+function serverProblem(config: unknown): string | null {
+  if (!isRecord(config)) return `expected an object, got ${show(config)}`;
+  const transport = config.transport;
+  if (transport !== "stdio" && transport !== "http") {
+    return `expected "transport" to be "stdio" or "http", got ${show(transport)}`;
+  }
+  // The union is discriminated, so the legal key set is the transport's own:
+  // `url` on a stdio server is a config someone believes is doing something.
+  const known = transport === "stdio" ? STDIO_SERVER_KEYS : HTTP_SERVER_KEYS;
+  for (const key of Object.keys(config)) {
+    if (!known.includes(key)) {
+      return `unknown key ${show(key)} for a "${transport}" server (known: ${known.join(", ")})`;
+    }
+  }
+
+  if (transport === "stdio") {
+    if (typeof config.command !== "string" || config.command.trim() === "") {
+      return `a "stdio" server needs a non-empty "command", got ${show(config.command)}`;
+    }
+    if (
+      config.args !== undefined &&
+      !(Array.isArray(config.args) && config.args.every((a) => typeof a === "string"))
+    ) {
+      return `"args" expects an array of strings, got ${show(config.args)}`;
+    }
+    if (config.env !== undefined && !isStringRecord(config.env)) {
+      return `"env" expects an object of string values, got ${show(config.env)}`;
+    }
+    if (config.cwd !== undefined && (typeof config.cwd !== "string" || config.cwd.trim() === "")) {
+      return `"cwd" expects a non-empty string, got ${show(config.cwd)}`;
+    }
+    return null;
+  }
+
+  const url = config.url;
+  if (typeof url !== "string" || url.trim() === "") {
+    return `an "http" server needs a non-empty "url", got ${show(url)}`;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return `"url" expects an absolute http(s) URL, got ${show(url)}`;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return `"url" expects the http or https scheme, got ${show(url)}`;
+  }
+  if (config.headers !== undefined && !isStringRecord(config.headers)) {
+    return `"headers" expects an object of string values, got ${show(config.headers)}`;
+  }
+  return null;
+}
+
 /**
  * How the loader repairs one issue:
- * - `delete` — the path names no setting at all; drop it from the snapshot.
+ * - `delete` — nothing can read this path: it names no setting at all, or it
+ *              is one unusable entry of an open map (`mcp.servers.<name>`,
+ *              which loses itself and not its siblings). Drop it.
  * - `reset`  — the value is wrong; fall back to DEFAULT_SETTINGS.
  * - `filter` — `selfConfig.allowedKeys` holds entries that name nothing real;
  *              keep the legal ones.
@@ -270,6 +428,13 @@ interface Issue {
   /** "<path>: <what was expected>, got <what was found>". */
   message: string;
   repair: Repair;
+  /**
+   * Repair target as raw segments, for the one case a dotted string cannot
+   * express: an `mcp.servers` entry whose NAME contains a "." (illegal, and
+   * therefore exactly the entry that has to be deletable). Defaults to
+   * `path.split(".")`.
+   */
+  segments?: string[];
 }
 
 /**
@@ -278,8 +443,18 @@ interface Issue {
  */
 function collectIssues(candidate: Record<string, unknown>): Issue[] {
   const issues: Issue[] = [];
-  const bad = (path: string, message: string, repair: Repair = "reset"): void => {
-    issues.push({ path, message: `${path}: ${message}`, repair });
+  const bad = (
+    path: string,
+    message: string,
+    repair: Repair = "reset",
+    segments?: string[],
+  ): void => {
+    issues.push({ path, message: `${path}: ${message}`, repair, ...(segments ? { segments } : {}) });
+  };
+  /** One issue about element `i` of an array leaf: the message keeps the index
+   *  (like selfConfig.allowedKeys), the repair target is the array. */
+  const badElement = (path: string, index: number, message: string): void => {
+    issues.push({ path, message: `${path}[${index}]: ${message}`, repair: "reset" });
   };
 
   for (const key of Object.keys(candidate)) {
@@ -408,6 +583,160 @@ function collectIssues(candidate: Record<string, unknown>): Issue[] {
     }
   }
 
+  // Header vs catalog partition of the tool set (slice 9). Tool schemas render
+  // at prefix position 0, so `alwaysOn` is a cache key and `deferred` is free.
+  //
+  // NOTE: names are NOT checked against a live tool list here. The catalog is
+  // runtime state — MCP servers come and go, `bash` depends on `--shell` — so
+  // "there is no such tool" is not a fact this validator can know, and treating
+  // it as one would make config unwritable exactly while a server is down. A
+  // name matching nothing is inert (partitionTools only consults these lists
+  // for tools that exist), which is the failure we want: the config for a
+  // server may legitimately be written before the server is up.
+  const tools = candidate.tools;
+  if (!isRecord(tools)) {
+    bad("tools", `expected an object, got ${show(tools)}`);
+  } else {
+    for (const key of Object.keys(tools)) {
+      if (!TOOLS_KEYS.includes(key)) {
+        bad(`tools.${key}`, `unknown setting key (known: ${TOOLS_KEYS.join(", ")})`, "delete");
+      }
+    }
+
+    const defaultMode = tools.defaultMode;
+    if (!isRecord(defaultMode)) {
+      bad("tools.defaultMode", `expected an object, got ${show(defaultMode)}`);
+    } else {
+      for (const key of Object.keys(defaultMode)) {
+        if (!DEFAULT_MODE_KEYS.includes(key)) {
+          bad(
+            `tools.defaultMode.${key}`,
+            `unknown setting key (known: ${DEFAULT_MODE_KEYS.join(", ")})`,
+            "delete",
+          );
+        }
+      }
+      for (const source of DEFAULT_MODE_KEYS) {
+        const mode = defaultMode[source];
+        if (!(TOOL_MODES as readonly unknown[]).includes(mode)) {
+          bad(
+            `tools.defaultMode.${source}`,
+            `expected ${TOOL_MODES.map((m) => `"${m}"`).join(" or ")}, got ${show(mode)}`,
+          );
+        }
+      }
+    }
+
+    // Two lists of exact tool names. De-duplicated because a repeated name is
+    // always a mistake and never means anything different from one mention.
+    const nameList = (path: string, value: unknown): void => {
+      if (!Array.isArray(value)) {
+        bad(path, `expected an array of tool names, got ${show(value)}`);
+        return;
+      }
+      const seen = new Set<string>();
+      for (let i = 0; i < value.length; i++) {
+        const entry = value[i];
+        if (typeof entry !== "string" || entry.trim() === "" || entry.trim() !== entry) {
+          badElement(
+            path,
+            i,
+            `expected a tool name (a non-empty string with no surrounding whitespace), ` +
+              `got ${show(entry)}`,
+          );
+          continue;
+        }
+        if (seen.has(entry)) badElement(path, i, `duplicate tool name ${show(entry)}`);
+        seen.add(entry);
+      }
+    };
+    nameList("tools.alwaysOn", tools.alwaysOn);
+    nameList("tools.deferred", tools.deferred);
+
+    // Precedence is alwaysOn > deferred, so a name in both is not a conflict
+    // the runtime resolves — it is a human who believes one of the two lines
+    // is doing something. Reported on `deferred`, the one being ignored.
+    const alwaysOn = tools.alwaysOn;
+    const deferred = tools.deferred;
+    if (Array.isArray(alwaysOn) && Array.isArray(deferred)) {
+      const forcedOn = new Set(alwaysOn.filter((n): n is string => typeof n === "string"));
+      for (let i = 0; i < deferred.length; i++) {
+        const name = deferred[i];
+        if (typeof name === "string" && forcedOn.has(name)) {
+          badElement(
+            "tools.deferred",
+            i,
+            `${show(name)} is also in tools.alwaysOn — a tool is one or the other ` +
+              `(alwaysOn wins, so this entry does nothing)`,
+          );
+        }
+      }
+    }
+
+    const searchLimit = tools.searchLimit;
+    if (!isPositiveInt(searchLimit) || searchLimit > MAX_TOOL_SEARCH_LIMIT) {
+      bad(
+        "tools.searchLimit",
+        `expected an integer in [1, ${MAX_TOOL_SEARCH_LIMIT}] ` +
+          `(a bigger page is a catalog dump in the conversation, not a search), ` +
+          `got ${show(searchLimit)}`,
+      );
+    }
+  }
+
+  // MCP servers (slice 9). Immutable to agents (isImmutableSettingKey), so
+  // everything here is talking to a human at `pinky config set`.
+  const mcp = candidate.mcp;
+  if (!isRecord(mcp)) {
+    bad("mcp", `expected an object, got ${show(mcp)}`);
+  } else {
+    for (const key of Object.keys(mcp)) {
+      if (!MCP_KEYS.includes(key)) {
+        bad(`mcp.${key}`, `unknown setting key (known: ${MCP_KEYS.join(", ")})`, "delete");
+      }
+    }
+    const servers = mcp.servers;
+    if (!isRecord(servers)) {
+      bad(
+        "mcp.servers",
+        `expected an object mapping a server name to its config, got ${show(servers)}`,
+      );
+    } else {
+      for (const [name, config] of Object.entries(servers)) {
+        // One bad entry loses ITSELF, never the other servers: `delete` on the
+        // entry's own path. A name holding a "." cannot be addressed by a
+        // dotted path at all, hence the explicit segments.
+        // Dotted display whenever the name CAN be one path segment (even an
+        // illegal name like "GitHub" reads best that way — it is the row key
+        // the human typed); bracketed only when a "." would lie about depth.
+        const path =
+          name !== "" && !name.includes(".")
+            ? `mcp.servers.${name}`
+            : `mcp.servers[${show(name)}]`;
+        const segments = ["mcp", "servers", name];
+        if (!SERVER_NAME_RE.test(name)) {
+          // A doubled underscore is legal-looking but ambiguous, so it gets
+          // its own sentence rather than being left to the regex.
+          const why = name.includes("__")
+            ? `"__" is the tool-name separator, so a name containing it collides: ` +
+              `server "github__issues" + tool "create" and server "github" + tool ` +
+              `"issues__create" are both mcp__github__issues__create. Single "_" and "-" are fine`
+            : `expected ${SERVER_NAME_RE.source}`;
+          bad(
+            path,
+            `invalid server name — ${why} ` +
+              `(it prefixes every tool the server contributes, as mcp__<name>__<tool>)`,
+            "delete",
+            segments,
+          );
+          continue;
+        }
+        const problem = serverProblem(config);
+        if (problem !== null) bad(path, problem, "delete", segments);
+      }
+    }
+  }
+
   // Human-granted self-configuration (DESIGN.md P8, revised). This block is
   // the delegation itself, so its own rules are the strictest in the file: an
   // entry that names nothing real would silently grant nothing (or, worse,
@@ -494,8 +823,9 @@ function getPath(root: Record<string, unknown>, key: string): unknown {
   return cur;
 }
 
-function deletePath(root: Record<string, unknown>, key: string): void {
-  const parts = key.split(".");
+/** Remove the leaf named by raw segments (an `mcp.servers` entry name may hold
+ *  a ".", so the caller cannot always hand over a dotted path). */
+function deleteSegments(root: Record<string, unknown>, parts: string[]): void {
   let cur: unknown = root;
   for (let i = 0; i < parts.length - 1; i++) {
     cur = isRecord(cur) ? cur[parts[i]!] : undefined;
@@ -542,7 +872,7 @@ function sanitizeSettings(
     for (const issue of issues) {
       if (issue.repair === "delete") {
         warn(`settings: ignoring ${issue.message} — the value is not used`);
-        deletePath(root, issue.path);
+        deleteSegments(root, issue.segments ?? issue.path.split("."));
         continue;
       }
       if (issue.repair === "filter") {

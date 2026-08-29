@@ -12,6 +12,9 @@
  *   pinky memory forget <id-or-prefix> [--reason "..."]
  *   pinky stats restarts [--channel <id>] [--limit N]   what context restarts cost
  *   pinky stats cache [--channel <id>] [--thread <id>] [--limit N]  prompt-cache hit rate
+ *   pinky mcp list                         configured MCP servers and their state
+ *   pinky mcp sync [<server>...] [--timeout-ms N]   connect and republish the catalog
+ *   pinky tools list [--scope <scope>...]  head vs deferred, as a run would partition it
  *   pinky smoke                            end-to-end in-process smoke (FakeProvider, A2A, memory)
  *   pinky prompt "<text>"                  run one agent turn against a local cli thread
  *   pinky headless [--shell] [--a2a] [--shared]  long-lived JSONL service on stdin/stdout
@@ -42,9 +45,11 @@ import {
   EventStore,
   MemoryStore,
   SettingsStore,
+  ToolCatalogStore,
   assertScope,
   parseA2AAddress,
   threadKey,
+  type CatalogRecord,
   type Db,
   type EnvConfig,
   type LoadOptions,
@@ -55,13 +60,17 @@ import {
 } from "@pinky/core";
 import {
   createEmbedder,
+  createFakeProvider,
   createProvider,
   isEmbeddingsDisabledError,
+  partitionTools,
+  runAgentLoop,
+  buildSystemPrompt,
+  FAKE_DEFERRED_MARKER,
+  DeferredToolRegistry,
   FakeEmbedder,
   FakeProvider,
   LocalMessenger,
-  runAgentLoop,
-  buildSystemPrompt,
   ShedContextTool,
   type A2AEnvelope,
   type AgentRunResult,
@@ -72,9 +81,11 @@ import {
   type Provider,
   type RunAgentLoopOptions,
   type Tool,
+  type ToolSource,
 } from "@pinky/runtime";
 import { runHeadless, startGateway, type RawIngress, type WakeEnqueue } from "@pinky/gateway";
 import { createTools } from "@pinky/tools";
+import { McpManager, defaultTransportFactory, type McpServerState } from "@pinky/mcp";
 
 const SCHEMA_DIR = new URL("../../core/schema", import.meta.url).pathname;
 
@@ -91,6 +102,12 @@ const A2A_SWEEP_MS = 30_000;
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** Human log line. Always stderr: on `pinky headless` stdout is the protocol,
+ *  and everything below this line is shared with that surface. */
+function logStderr(msg: string): void {
+  process.stderr.write(`${msg}\n`);
 }
 
 async function openDb(): Promise<{ db: Db; env: EnvConfig }> {
@@ -143,6 +160,15 @@ export interface BootstrapOptions {
   /** Pin the embedder (smoke's FakeEmbedder); `null` forces FTS-only recall.
    *  Omitted => built from `settings.memory.embeddingModel` + the env. */
   embedder?: Embedder | null;
+  /**
+   * Start the MCP plane. Default true.
+   *
+   * A read-only query (`pinky stats`, `pinky memory`) has no tool set and no
+   * reason to spawn somebody's configured stdio servers as child processes, so
+   * it passes false: the manager is still constructed — `boot.mcp` is not
+   * optional, and every read on it answers empty — but nothing connects.
+   */
+  mcp?: boolean;
 }
 
 export interface Bootstrap {
@@ -158,6 +184,18 @@ export interface Bootstrap {
   events: EventStore;
   messenger: LocalMessenger;
   memory: MemoryStore;
+  /** The deferred-tool catalog (slice 9): what `tool_search`/`tool_describe`
+   *  read, and where every MCP sync and `upsertBuiltins` writes. */
+  catalog: ToolCatalogStore;
+  /**
+   * The MCP plane. `servers` is read ONCE, here, from the BOOTSTRAP scopes
+   * (global + whatever `opts.scopes` adds — `agent:pinky` on the agent
+   * surfaces). A `channel:<id>`-scoped `mcp.servers` row is therefore NOT
+   * honored: per-channel servers would need one manager (and one set of child
+   * processes) per channel, which is a different design, not a config value.
+   * makeRunAgent warns on stderr when a reloaded snapshot disagrees.
+   */
+  mcp: McpManager;
   /** null => FTS-only recall: no vector voice, and retains store no embedding. */
   embedder: Embedder | null;
   /** Bind the store (+ embedder, when there is one) to one surface's scope. */
@@ -209,6 +247,20 @@ export async function bootstrap(opts: BootstrapOptions = {}): Promise<Bootstrap>
   const db = withTenant(rootDb, settings.tenantId);
   const store = new MemoryStore(db, settings.tenantId);
   const embedder = opts.embedder !== undefined ? opts.embedder : openEmbedder(settings);
+  const catalog = new ToolCatalogStore(db, settings.tenantId);
+  // Logs to STDERR, always: this manager runs inside `pinky headless`, whose
+  // stdout is the JSONL protocol, and a connect line on stdout is a corrupt
+  // stream (cli/test/integration/mcp-tools.test.ts is the guard).
+  const mcp = new McpManager({
+    servers: settings.mcp.servers,
+    catalog,
+    log: logStderr,
+    env: process.env,
+  });
+  // Awaits the per-server catalog trust probes and nothing else: a configured
+  // server that is slow, wedged or absent must never delay a boot, so the
+  // connects run on background loops (McpManager rule 1).
+  if (opts.mcp !== false) await mcp.start();
 
   return {
     env,
@@ -217,18 +269,45 @@ export async function bootstrap(opts: BootstrapOptions = {}): Promise<Bootstrap>
     events: new EventStore(db),
     messenger: new LocalMessenger(db, { nodeId: env.nodeId, peers, a2aSecret }),
     memory: store,
+    catalog,
+    mcp,
     embedder,
     memoryContextFor: (scope) => ({ store, scope, ...(embedder ? { embedder } : {}) }),
     reloadSettings: (loadOpts) => loadSettings(db, loadOpts),
-    close: () => rootDb.close(),
+    close: async () => {
+      // MCP first: closing the clients is what reaps the stdio children, and
+      // an orphaned child outliving the pool would hold the terminal open.
+      await mcp.close();
+      await rootDb.close();
+    },
   };
+}
+
+/**
+ * Publish this surface's built-in tools into the catalog (slice 9).
+ *
+ * Upsert-only and per surface on purpose: `pinky prompt` registers `bash` and
+ * `pinky headless` (without `--shell`) does not, so a generational replace
+ * would have two processes stamping and clearing each other's rows forever
+ * (ToolCatalogStore.upsertBuiltins says the same from the other side).
+ *
+ * Every built-in goes in, including the ones that can never be deferred
+ * (`shed_context`, the three meta-tools): the catalog is also what
+ * `pinky tools list` and a `tool_search` with an empty query read, and a model
+ * asking "what can I do" should see the whole set, not the subset that happens
+ * to be movable.
+ */
+async function registerBuiltins(boot: Bootstrap, tools: Tool[]): Promise<void> {
+  await boot.catalog.upsertBuiltins(
+    tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })),
+  );
 }
 
 /**
  * Per-run overrides a caller may hand `runAgentLoop`, SUBTRACTED from its
  * option type rather than listed, so the set cannot drift: everything the
- * surface owns (db, tools, memory, settings…) is fixed by makeRunAgent and the
- * remainder is per-run — today `maxTurns`, `deliver`, `signal` and `onEvent`,
+ * surface owns (db, tools, the deferred plane, memory, settings…) is fixed by
+ * makeRunAgent and the remainder is per-run — today `maxTurns`, `deliver`, `signal` and `onEvent`,
  * and whatever the runtime adds next without an edit here. That is exactly the
  * set `pinky headless` needs (DESIGN.md §11: one abortable run per thread,
  * streaming every appended event and every deliver() to stdout).
@@ -245,11 +324,19 @@ export type RunAgentOverrides = Omit<
   | "systemPrompt"
   | "cwd"
   | "settings"
+  | "deferred"
 >;
 
 export interface RunAgentOptions {
   agentId: string;
-  tools: Tool[];
+  /**
+   * The BUILT-IN candidates for this surface — `createTools(...)` plus
+   * `ShedContextTool`. Not "the tools the run gets": the MCP tools are added
+   * per run from `boot.mcp.tools()` and the whole set is then partitioned
+   * (slice 9), so what reaches the provider is the HEAD of that partition and
+   * the rest is reachable only through the meta-tools.
+   */
+  builtins: Tool[];
   /** Fixed provider (smoke's FakeProvider). Default: built per run from the
    *  run's settings, so `pinky config set model` lands on the next wake. */
   provider?: Provider;
@@ -271,32 +358,208 @@ export type RunAgent = (
   batch?: RawIngress[],
 ) => Promise<AgentRunResult>;
 
-/** One `runAgentLoop` call, pre-bound to a surface. `pinky headless` builds
- *  its per-run hooks (deliver/signal/onEvent) as the `overrides` argument. */
+/** First line of a tool description — what buildSystemPrompt prints, and
+ *  therefore the only part of a description the cached prefix depends on. */
+function firstLine(text: string): string {
+  return (text.split("\n", 1)[0] ?? "").trim();
+}
+
+/** Which `defaultMode` a tool falls under when no list names it. The `mcp__`
+ *  prefix is structural (mcpToolName builds it), so this needs no registry. */
+const sourceOf = (name: string): ToolSource => (name.startsWith("mcp__") ? "mcp" : "builtin");
+
+/**
+ * `buildSystemPrompt`, memoized on the head tool NAMES.
+ *
+ * The system prompt is the cached prefix (DESIGN.md §4.5/§9) and it lists the
+ * head tools, so it can no longer be built once per process: `tools.alwaysOn`
+ * is a setting, and a setting can change between wakes. Building it per run is
+ * correct and costs nothing; the memo exists so that an UNCHANGED head yields
+ * the identical string — the same object, even — which makes "the prefix is
+ * stable unless the header moved" visible in the code rather than a property
+ * you have to trust.
+ */
+function memoSystemPrompt(agentId: string, nodeId: string): (tools: Tool[]) => string {
+  let key: string | undefined;
+  let prompt = "";
+  return (tools) => {
+    // Name AND the description line the prompt actually prints: an MCP resync
+    // can republish a tool under the same name with new prose, and keying on
+    // names alone would leave a stale one-liner in the cached prefix forever.
+    // Keyed this way the prompt changes exactly when the header does — which
+    // is the invalidation the provider is going to charge for anyway.
+    // NUL as the separator, written as an escape so this file stays plain text
+    // (a literal one makes grep call it binary), because no name or first line
+    // can contain it and the two halves can never run together.
+    const next = tools.map((t) => `${t.name}\u0000${firstLine(t.description)}`).join("\u0000");
+    if (next !== key) {
+      key = next;
+      prompt = buildSystemPrompt({ agentId, nodeId, tools });
+    }
+    return prompt;
+  };
+}
+
+/**
+ * One `runAgentLoop` call, pre-bound to a surface. `pinky headless` builds
+ * its per-run hooks (deliver/signal/onEvent) as the `overrides` argument.
+ *
+ * The tool set is assembled PER RUN (slice 9), not once per process:
+ *
+ *   1. `builtins` + whatever the MCP plane can execute right now;
+ *   2. `partitionTools` splits that by the RELOADED settings — `head` is what
+ *      renders in the request (and in the system prompt), `deferred` is
+ *      reachable only through tool_search/tool_describe/tool_call;
+ *   3. the deferred half becomes a `DeferredToolRegistry` over the catalog.
+ *
+ * `head` is never re-sorted here: partitionTools already ordered it by code
+ * unit, and that order is part of the provider cache key.
+ */
 export function makeRunAgent(boot: Bootstrap, opts: RunAgentOptions): RunAgent {
-  const systemPrompt = buildSystemPrompt({
-    agentId: opts.agentId,
-    nodeId: boot.env.nodeId,
-    tools: opts.tools,
-  });
+  const systemPromptFor = memoSystemPrompt(opts.agentId, boot.env.nodeId);
   const cwd = opts.cwd ?? process.cwd();
+  // `mcp.servers` was read at bootstrap from the bootstrap scopes; a run's
+  // reloaded snapshot may carry a channel-scoped one that nothing acts on.
+  // Warned once per distinct value — a per-run line would be a page of
+  // identical text on a long-lived process.
+  const bootServers = JSON.stringify(boot.settings.mcp.servers);
+  const warnedServers = new Set<string>();
 
   return async (thread, overrides = {}, batch) => {
     const settings = opts.settingsFor ? await opts.settingsFor(thread) : boot.settings;
     const scope = opts.scopeFor?.(thread, batch);
+
+    const runServers = JSON.stringify(settings.mcp.servers);
+    if (runServers !== bootServers && !warnedServers.has(runServers)) {
+      warnedServers.add(runServers);
+      logStderr(
+        `[mcp] channel ${thread.channelId} overrides mcp.servers; IGNORED — the MCP plane is ` +
+          "built once at startup from the global + agent scopes. Set servers there, or run a " +
+          "separate process for that channel.",
+      );
+    }
+
+    const { head, deferred } = partitionTools(
+      [...opts.builtins, ...boot.mcp.tools()],
+      settings.tools,
+      sourceOf,
+    );
+
     return runAgentLoop({
       db: boot.db,
       provider: opts.provider ?? createProvider(settings.model, process.env),
-      tools: opts.tools,
+      tools: head,
       thread,
       agentId: opts.agentId,
       messenger: boot.messenger,
-      systemPrompt,
+      systemPrompt: systemPromptFor(head),
       cwd,
       settings,
+      deferred: new DeferredToolRegistry({
+        catalog: boot.catalog,
+        tools: new Map(deferred.map((t) => [t.name, t])),
+        // The catalog is tenant-wide and never withdraws a built-in, so it
+        // knows names this run either already has in the header or cannot run
+        // at all (`bash`, catalogued by `pinky prompt`). Handing over the head
+        // set is what lets tool_call answer those two cases precisely instead
+        // of blaming an offline server.
+        headNames: new Set(head.map((t) => t.name)),
+      }),
       ...(scope ? { memory: boot.memoryContextFor(scope) } : {}),
       ...overrides,
     });
+  };
+}
+
+/**
+ * SIGTERM / SIGINT -> the same shutdown EOF gets, then an honest exit code.
+ *
+ * Without this a signal is fatal by default: Bun terminates the process, the
+ * `finally` that calls `boot.close()` never runs, and every MCP stdio child
+ * this process spawned is REPARENTED AND LEFT RUNNING. Under a supervisor
+ * (systemd, `docker stop`, a k8s rollout) that is one orphan per server per
+ * restart, holding its own database handles and file descriptors forever —
+ * and signals are exactly how those supervisors stop a long-lived service, so
+ * it is the normal path, not an edge case.
+ *
+ * The shape mirrors the client-gone path (`closeStdout` -> abort -> drain):
+ *
+ *   1. `drain()` aborts the session so in-flight runs cancel and the surface
+ *      stops accepting work — the same abort EOF triggers, so a signal and a
+ *      closed pipe end a session identically;
+ *   2. `close()` tears the process down in dependency order (`boot.close()`
+ *      closes the MCP clients, which is what reaps the children, BEFORE the
+ *      connection pool);
+ *   3. exit with 128 + the signal number, the convention a supervisor reads.
+ *
+ * Two safety valves, because a shutdown that hangs is worse than an abrupt
+ * one: a SECOND signal exits immediately (the operator asked twice), and a
+ * drain or close that has not finished within {@link SHUTDOWN_GRACE_MS} exits
+ * anyway. Nothing here writes to stdout — on `pinky headless` that is the
+ * protocol, and a shutdown note on it would corrupt the stream.
+ *
+ * Returns an unsubscribe for the normal exit path, so a completed command does
+ * not sit in the event loop holding two listeners.
+ */
+const SHUTDOWN_SIGNALS = ["SIGTERM", "SIGINT"] as const;
+type ShutdownSignal = (typeof SHUTDOWN_SIGNALS)[number];
+
+/** 128 + signal number — what a shell (and a supervisor) reads as "stopped by
+ *  that signal" rather than "failed". */
+const SIGNAL_EXIT_CODE: Record<ShutdownSignal, number> = { SIGTERM: 143, SIGINT: 130 };
+
+/** Cap on the whole drain+close. A supervisor SIGKILLs after its own timeout;
+ *  exiting first, on our own terms, is what keeps the children reaped. */
+const SHUTDOWN_GRACE_MS = 10_000;
+
+export function installShutdown(opts: {
+  /** Stop accepting work and let in-flight runs settle (abort + await). */
+  drain: () => Promise<void> | void;
+  /** Release everything, MCP children before the pool. */
+  close: () => Promise<void>;
+  graceMs?: number;
+}): () => void {
+  let shuttingDown = false;
+
+  const handle = (signal: ShutdownSignal): void => {
+    const code = SIGNAL_EXIT_CODE[signal];
+    if (shuttingDown) {
+      logStderr(`[shutdown] second ${signal}; exiting now`);
+      process.exit(code);
+    }
+    shuttingDown = true;
+    logStderr(`[shutdown] ${signal}: draining, then closing mcp children and the pool`);
+    // Never awaited by anyone: this IS the top of the stack for a signal.
+    void (async () => {
+      // The timer wins if a drain or a close wedges. Unref'd so it is not the
+      // reason the process is still alive.
+      const timer = setTimeout(() => {
+        logStderr(`[shutdown] still closing after ${opts.graceMs ?? SHUTDOWN_GRACE_MS}ms; exiting`);
+        process.exit(code);
+      }, opts.graceMs ?? SHUTDOWN_GRACE_MS);
+      timer.unref();
+      try {
+        await opts.drain();
+      } catch (err) {
+        logStderr(`[shutdown] drain failed: ${errorMessage(err)}`);
+      }
+      try {
+        await opts.close();
+      } catch (err) {
+        logStderr(`[shutdown] close failed: ${errorMessage(err)}`);
+      }
+      clearTimeout(timer);
+      process.exit(code);
+    })();
+  };
+
+  const listeners = SHUTDOWN_SIGNALS.map((signal) => {
+    const listener = (): void => handle(signal);
+    process.on(signal, listener);
+    return [signal, listener] as const;
+  });
+  return () => {
+    for (const [signal, listener] of listeners) process.off(signal, listener);
   };
 }
 
@@ -557,7 +820,9 @@ async function cmdMemory(args: string[]): Promise<void> {
   const { flags, rest } = parseFlags(raw, ["all"]);
   const scope = cliScope(stringFlag(flags, "scope-channel"));
 
-  const boot = await bootstrap();
+  // Read-only over the memory plane: no tool set, so no reason to spawn a
+  // configured MCP server's child processes for a `memory list`.
+  const boot = await bootstrap({ mcp: false });
   try {
     if (sub === "list") {
       const rows = await boot.memory.list({
@@ -773,7 +1038,7 @@ async function cmdStatsRestarts(raw: string[]): Promise<void> {
   const channel = stringFlag(flags, "channel");
   const limit = intFlag(flags, "limit", 20);
 
-  const boot = await bootstrap({ migrate: false, embedder: null });
+  const boot = await bootstrap({ migrate: false, embedder: null, mcp: false });
   try {
     const rows = await boot.db.query<RestartRow>(RESTART_SQL, [
       boot.settings.tenantId,
@@ -1125,7 +1390,7 @@ async function cmdStatsCache(raw: string[]): Promise<void> {
   const thread = stringFlag(flags, "thread");
   const limit = intFlag(flags, "limit", 50);
 
-  const boot = await bootstrap({ migrate: false, embedder: null });
+  const boot = await bootstrap({ migrate: false, embedder: null, mcp: false });
   try {
     const rows = await boot.db.query<CacheRow>(CACHE_SQL, [
       boot.settings.tenantId,
@@ -1196,6 +1461,243 @@ async function cmdStats(args: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// mcp / tools — the human's window on slice 9
+// ---------------------------------------------------------------------------
+
+const MCP_USAGE =
+  "usage: pinky mcp <list|sync> ...\n" +
+  "  pinky mcp list                              configured servers and their state\n" +
+  "  pinky mcp sync [<server>...] [--timeout-ms N]  connect, wait, republish the catalog";
+
+/** Column widths for `pinky mcp list`. Server keys are capped at 32 chars by
+ *  their own regex, so nothing here needs clipping except the error. */
+const MCP_COL = { server: 18, status: 14, era: 7, protocol: 12, name: 24 };
+/** One line of `lastError` is enough to recognize the failure; the full text
+ *  is in the stderr log the manager already wrote. */
+const MCP_ERROR_CHARS = 60;
+
+function mcpRow(state: McpServerState): string {
+  return (
+    `${padRight(state.server, MCP_COL.server)}  ` +
+    `${padRight(state.status, MCP_COL.status)}  ` +
+    `${padRight(state.era ?? "-", MCP_COL.era)}  ` +
+    `${padRight(state.protocolVersion ?? "-", MCP_COL.protocol)}  ` +
+    `${padRight(clip(state.serverName ?? "-", MCP_COL.name), MCP_COL.name)}  ` +
+    `${padLeft(String(state.toolCount), 5)}  ` +
+    clip(state.lastError ?? "-", MCP_ERROR_CHARS)
+  );
+}
+
+/**
+ * `pinky mcp list` — what the MCP plane thinks of each configured server.
+ *
+ * A snapshot of a process that has just started, so `trusted-cache` and
+ * `connecting` are the normal answers here: bootstrap does not wait for a
+ * server (that is the point), and the catalog is what makes request 1
+ * answerable anyway. `pinky mcp sync` is the command that waits.
+ */
+async function cmdMcpList(): Promise<void> {
+  // No embedder: nothing here recalls anything, and a missing API key should
+  // not print a memory warning over a table about MCP.
+  const boot = await bootstrap({ scopes: [`agent:${AGENT_ID}`], embedder: null });
+  try {
+    const states = boot.mcp.states();
+    console.log(
+      `${padRight("server", MCP_COL.server)}  ${padRight("status", MCP_COL.status)}  ` +
+        `${padRight("era", MCP_COL.era)}  ${padRight("protocol", MCP_COL.protocol)}  ` +
+        `${padRight("server name", MCP_COL.name)}  ${padLeft("tools", 5)}  last error`,
+    );
+    for (const state of states) console.log(mcpRow(state));
+    if (states.length === 0) {
+      console.log(
+        "(no mcp servers configured; add one with " +
+          `\`pinky config set mcp.servers.<name> '{"transport":"stdio","command":"..."}'\`)`,
+      );
+    } else if (states.some((s) => s.status === "trusted-cache" || s.status === "connecting")) {
+      // Not a defect: this process started a moment ago and never waits for a
+      // server. Say so, so "connecting" does not read as "stuck".
+      console.log("");
+      console.log(
+        "(a server is still connecting — this command never waits; `pinky mcp sync` does)",
+      );
+    }
+  } finally {
+    await boot.close();
+  }
+}
+
+/**
+ * `pinky mcp sync [<server>...]` — connect, wait, and say what the catalog holds.
+ *
+ * The one place the CLI blocks on an MCP server, because it is the one place a
+ * human asked it to: after adding or repointing a server you want to know
+ * whether it answers and what it published, not to discover it later through a
+ * `tool_search` that returns nothing. Exits 1 if any named server errored, so
+ * it is usable as a deployment step.
+ */
+async function cmdMcpSync(raw: string[]): Promise<void> {
+  const { flags, rest } = parseFlags(raw);
+  const timeoutMs = intFlag(flags, "timeout-ms", 15_000);
+  const boot = await bootstrap({ scopes: [`agent:${AGENT_ID}`], embedder: null });
+  let failed = 0;
+  try {
+    const configured = boot.mcp.states().map((s) => s.server);
+    const wanted = rest.length > 0 ? rest : configured;
+    const unknown = wanted.filter((s) => !configured.includes(s));
+    if (unknown.length > 0) {
+      throw new Error(
+        `not configured: ${unknown.join(", ")}` +
+          (configured.length > 0 ? ` (configured: ${configured.join(", ")})` : ""),
+      );
+    }
+    if (wanted.length === 0) {
+      console.log("no mcp servers configured; nothing to sync");
+      return;
+    }
+    // Concurrently: two slow servers should cost one timeout, not two.
+    const settled = await Promise.all(
+      wanted.map((server) => waitForServer(boot.mcp, server, timeoutMs)),
+    );
+    for (const [i, state] of settled.entries()) {
+      const server = wanted[i]!;
+      if (!state) {
+        console.log(`${padRight(server, MCP_COL.server)}  not configured`);
+        failed++;
+        continue;
+      }
+      // The catalog, not the client: what a NEXT process would be served.
+      const published = await boot.catalog.serverState(server);
+      console.log(
+        `${padRight(server, MCP_COL.server)}  ${padRight(state.status, MCP_COL.status)}  ` +
+          `${padRight(state.era ?? "-", MCP_COL.era)}  ` +
+          `${padRight(state.protocolVersion ?? "-", MCP_COL.protocol)}  ` +
+          `catalog ${padLeft(String(published?.count ?? 0), 4)} tool(s)` +
+          (state.lastError ? `  ${clip(state.lastError, MCP_ERROR_CHARS)}` : ""),
+      );
+      if (state.status !== "connected") failed++;
+    }
+  } finally {
+    await boot.close();
+  }
+  if (failed > 0) {
+    console.error(`mcp sync: ${failed} server(s) did not connect`);
+    process.exit(1);
+  }
+}
+
+async function cmdMcp(args: string[]): Promise<void> {
+  const [sub, ...rest] = args;
+  if (sub === "list") return cmdMcpList();
+  if (sub === "sync") return cmdMcpSync(rest);
+  throw new Error(MCP_USAGE);
+}
+
+const TOOLS_USAGE =
+  "usage: pinky tools list [--scope <scope>]...\n" +
+  "  --scope may be repeated (global | channel:<id> | agent:<id>);\n" +
+  `  default: the scopes an agent surface boots with (global + agent:${AGENT_ID}).`;
+
+/** Every `--scope X` / `--scope=X` in `args`, validated, with the rest of the
+ *  argv returned. parseFlags keeps only the LAST value of a repeated flag, and
+ *  this one is legitimately repeatable — an overlay is a list. */
+function collectScopes(args: string[]): { scopes: string[]; rest: string[] } {
+  const scopes: string[] = [];
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--scope") {
+      const value = args[++i];
+      if (value === undefined) throw new Error("--scope requires a value");
+      scopes.push(assertScope(value));
+      continue;
+    }
+    if (arg.startsWith("--scope=")) {
+      const value = arg.slice("--scope=".length);
+      if (!value) throw new Error("--scope requires a value");
+      scopes.push(assertScope(value));
+      continue;
+    }
+    rest.push(arg);
+  }
+  return { scopes, rest };
+}
+
+/** A catalog row as `partitionTools` sees it. The execute() is never called —
+ *  this command reports the PARTITION, and the partition is a pure function of
+ *  the names and the settings. Building a real tool would mean connecting to
+ *  every server just to print a table. */
+function catalogAsTool(record: CatalogRecord): Tool {
+  return {
+    name: record.name,
+    description: record.description,
+    parameters: record.parameters,
+    execute: () =>
+      Promise.resolve({ text: `${record.name} is not executable from \`pinky tools list\``, isError: true }),
+  };
+}
+
+/**
+ * `pinky tools list` — the header/catalog split, exactly as a run computes it.
+ *
+ * Not a re-implementation of the rule: it calls the same `partitionTools` with
+ * the same settings overlay a wake would load, so what it prints is the
+ * PARTITION a run with these scopes would compute. The header is the provider
+ * cache key and the most expensive thing in a request, and until now the only
+ * way to see the split was to run the agent and read a log.
+ *
+ * It is a view of the CATALOG, not of one process's tool objects, so the
+ * counts are a superset of any single request: catalogued built-ins from
+ * OTHER surfaces are included (`bash`, registered by `pinky prompt`, is
+ * `head` here even in a headless deployment that never loads it), and so are
+ * tools from servers that are currently offline — which a run would still
+ * find via tool_search, since the catalog outlives a connection.
+ */
+async function cmdToolsList(raw: string[]): Promise<void> {
+  const { scopes } = collectScopes(raw);
+  const wanted = scopes.length > 0 ? scopes : [`agent:${AGENT_ID}`];
+  // No MCP plane: the catalog already knows every name, and listing tools must
+  // not spawn a server (nor wait for one).
+  const boot = await bootstrap({ scopes: wanted, mcp: false, embedder: null });
+  try {
+    // `boot.settings` IS the overlay for `wanted` (bootstrap loaded it with
+    // exactly those scopes), so this is the snapshot a run in that scope reads.
+    const settings = boot.settings;
+    const records = await boot.catalog.entries();
+    const { head, deferred } = partitionTools(records.map(catalogAsTool), settings.tools, sourceOf);
+    const mode = new Map<string, string>();
+    for (const tool of head) mode.set(tool.name, "head");
+    for (const tool of deferred) mode.set(tool.name, "deferred");
+
+    console.log(
+      `${padRight("mode", 8)}  ${padRight("source", 7)}  ${padRight("server", MCP_COL.server)}  name`,
+    );
+    for (const record of records) {
+      console.log(
+        `${padRight(mode.get(record.name) ?? "?", 8)}  ${padRight(record.source, 7)}  ` +
+          `${padRight(record.server ?? "-", MCP_COL.server)}  ${record.name}`,
+      );
+    }
+    if (records.length === 0) {
+      console.log("(the tool catalog is empty; run `pinky prompt`, `pinky headless` or `pinky mcp sync` once)");
+    }
+    console.log("");
+    console.log(
+      `scopes ${wanted.join(" + ")}  head ${head.length} (rendered in every request)  ` +
+        `deferred ${deferred.length} (reached via tool_search/tool_describe/tool_call)  ` +
+        `defaultMode builtin=${settings.tools.defaultMode.builtin} mcp=${settings.tools.defaultMode.mcp}`,
+    );
+  } finally {
+    await boot.close();
+  }
+}
+
+async function cmdTools(args: string[]): Promise<void> {
+  const [sub, ...rest] = args;
+  if (sub === "list") return cmdToolsList(rest);
+  throw new Error(TOOLS_USAGE);
+}
+
+// ---------------------------------------------------------------------------
 // smoke
 // ---------------------------------------------------------------------------
 
@@ -1208,6 +1710,19 @@ const SMOKE_MEMORY_AGENT = "smoke";
 /** Distinctive enough that the FTS voice can find it and nothing else. */
 const SMOKE_CANARY = "The smoke canary passphrase is zebra-quartz.";
 const SMOKE_QUERY = "smoke canary passphrase";
+
+/** Settings key the smoke MCP server is registered under, hence the prefix of
+ *  every tool it publishes (`mcp__smokefx__…`). Not in the settings table:
+ *  smoke builds its own manager so a dev machine's real servers stay out. */
+const SMOKE_MCP_SERVER = "smokefx";
+/** The modern (2026-07-28) stdio fixture, spawned as a real child process —
+ *  this leg is worth having precisely because it is not a mock. */
+const SMOKE_MCP_FIXTURE = new URL("../../mcp/test/fixtures/modern-server.ts", import.meta.url).pathname;
+/** How long smoke waits for that child to spawn, negotiate and publish. */
+const SMOKE_MCP_TIMEOUT_MS = 20_000;
+/** How long a closed manager gets to reap its child before it is an orphan. */
+const SMOKE_MCP_REAP_MS = 3_000;
+const SMOKE_MCP_PROMPT = "please echo pinky-smoke-42 through a catalog tool";
 
 /**
  * Newest seq in a thread, or 0 when it has none — smoke's per-run mark.
@@ -1236,14 +1751,68 @@ async function latestSeq(db: Db, ref: ThreadRef): Promise<number> {
   return toSeqNumber(row?.seq);
 }
 
+/**
+ * Wait for one MCP server to SETTLE — `connected` or `error` — or give up.
+ *
+ * The manager deliberately has no "await my servers" method: a run must never
+ * block on a child process spawning (McpManager rule 1), and the catalog is
+ * what makes request 1 answerable without one. But a human typing
+ * `pinky mcp sync` and a smoke check are the two callers that do want the
+ * answer, so the waiting lives here, in the surface that asked, rather than in
+ * the plane that must not do it.
+ *
+ * Polled rather than event-driven on purpose: `states()` is the manager's only
+ * public read, and a poll cannot miss a transition that happened between two
+ * awaits. Returns the last state seen; `undefined` only when the server is not
+ * configured at all.
+ */
+async function waitForServer(
+  mcp: McpManager,
+  server: string,
+  timeoutMs: number,
+): Promise<McpServerState | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const state = mcp.state(server);
+    if (!state) return undefined;
+    if (state.status === "connected" || state.status === "error") return state;
+    if (Date.now() >= deadline) return state;
+    await Bun.sleep(50);
+  }
+}
+
+/** True once `pid` is gone (or was never there). A closed stdio transport has
+ *  killed its child and awaited its exit, so this normally answers on the
+ *  first probe; the poll covers the SIGKILL path, which does not wait. */
+async function childReaped(pid: number | null | undefined, timeoutMs: number): Promise<boolean> {
+  if (pid === null || pid === undefined) return true;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      // Signal 0 tests for existence without delivering anything.
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    if (Date.now() >= deadline) return false;
+    await Bun.sleep(50);
+  }
+}
+
 async function cmdSmoke(): Promise<void> {
   // Deterministic, offline, and dimension-matched to the real column.
   const embedder = new FakeEmbedder({ dimensions: SMOKE_EMBEDDING_DIMENSIONS });
   // peers/secret emptied: smoke is a single-node in-process check and must not
   // start POSTing to a peer configured in someone's .env.
-  const boot = await bootstrap({ peers: {}, a2aSecret: "", embedder });
+  // `mcp: false`: smoke brings its OWN manager (leg 4) pointed at the fixture,
+  // and must neither depend on nor disturb whatever servers this machine has
+  // configured — spawning them here would make a local `pinky config` decide
+  // whether smoke passes.
+  const boot = await bootstrap({ peers: {}, a2aSecret: "", embedder, mcp: false });
   const { env, settings, db, events, messenger } = boot;
-  const tools = createTools();
+  const builtins = createTools();
+  // Slice 9: what this surface can run is what the catalog should say it can.
+  await registerBuiltins(boot, builtins);
   // The memory plane is the thing under test here, so nothing about it is left
   // to the dev database's settings rows.
   const smokeSettings: SettingsSnapshot = {
@@ -1255,6 +1824,7 @@ async function cmdSmoke(): Promise<void> {
   const threadB: ThreadRef = { tenantId: settings.tenantId, channelId: "cli:smoke", threadId: "beta" };
   const threadM: ThreadRef = { tenantId: settings.tenantId, channelId: "cli:smoke", threadId: "memory" };
   const threadR: ThreadRef = { tenantId: settings.tenantId, channelId: "cli:smoke", threadId: "memory-recall" };
+  const threadT: ThreadRef = { tenantId: settings.tenantId, channelId: "cli:smoke", threadId: "mcp-tools" };
 
   // `alpha` and `beta` are smoke's own addresses on this node, and the receipt
   // counts below are exact counts — so anything an interrupted earlier run
@@ -1267,10 +1837,11 @@ async function cmdSmoke(): Promise<void> {
   // Smoke reuses fixed thread ids, so the log carries every previous run.
   // Everything asserted below is read from these marks FORWARD — otherwise a
   // run that journaled nothing would still "pass" on yesterday's events.
-  const [markA, markB, markM] = await Promise.all([
+  const [markA, markB, markM, markT] = await Promise.all([
     latestSeq(db, threadA),
     latestSeq(db, threadB),
     latestSeq(db, threadM),
+    latestSeq(db, threadT),
   ]);
 
   const betaHeard: A2AEnvelope[] = [];
@@ -1291,7 +1862,7 @@ async function cmdSmoke(): Promise<void> {
   ];
   const runA = await makeRunAgent(boot, {
     agentId: "alpha",
-    tools,
+    builtins,
     provider: new FakeProvider(alphaScript),
     settingsFor: () => Promise.resolve(smokeSettings),
   })(threadA);
@@ -1337,7 +1908,7 @@ async function cmdSmoke(): Promise<void> {
   ];
   const runM = await makeRunAgent(boot, {
     agentId: SMOKE_MEMORY_AGENT,
-    tools,
+    builtins,
     provider: new FakeProvider(memoryScript),
     settingsFor: () => Promise.resolve(smokeSettings),
     scopeFor: () => memoryScope,
@@ -1361,11 +1932,101 @@ async function cmdSmoke(): Promise<void> {
   });
   const runR = await makeRunAgent(boot, {
     agentId: SMOKE_MEMORY_AGENT,
-    tools,
+    builtins,
     provider: recallProvider,
     settingsFor: () => Promise.resolve(smokeSettings),
     scopeFor: () => ({ ...memoryScope, channelId: threadR.channelId }),
   })(threadR);
+
+  // --- 4. deferred tools over a REAL MCP server (slice 9) ----------------
+  //
+  // The whole point of the slice in one leg: a tool that is NOT in the request
+  // header is found by search, read by describe, executed by call, and its
+  // output comes back in the assistant's answer — while the header itself is
+  // unchanged (three meta-tools in, zero `mcp__` tools). The server is the
+  // modern stdio fixture spawned as a child process, because a mock cannot
+  // fail the way a real one can.
+  //
+  // Its own manager, not `boot.mcp`: smoke must not depend on (or disturb) the
+  // servers a dev machine has configured in its settings table.
+  const spawnedTransports: { pid?: number | null }[] = [];
+  const smokeMcp = new McpManager({
+    servers: {
+      [SMOKE_MCP_SERVER]: { transport: "stdio", command: "bun", args: ["run", SMOKE_MCP_FIXTURE] },
+    },
+    catalog: boot.catalog,
+    // stderr: smoke prints its own PASS/FAIL lines on stdout and the manager's
+    // connect chatter is not one of them.
+    log: logStderr,
+    env: process.env,
+    // The default factory, wrapped only to keep the child's pid so the orphan
+    // check below can be an assertion instead of a hope.
+    transportFactory: (server, config, mcpEnv) => {
+      const transport = defaultTransportFactory(server, config, mcpEnv);
+      spawnedTransports.push(transport as unknown as { pid?: number | null });
+      return transport;
+    },
+  });
+
+  let mcpNames: string[] = [];
+  let headNames: string[] = [];
+  let runT: AgentRunResult | undefined;
+  let historyT: Awaited<ReturnType<typeof events.history>> = [];
+  let mcpState: McpServerState | undefined;
+  let reaped = false;
+  try {
+    await smokeMcp.start();
+    mcpState = await waitForServer(smokeMcp, SMOKE_MCP_SERVER, SMOKE_MCP_TIMEOUT_MS);
+    mcpNames = await boot.catalog.listNames({ server: SMOKE_MCP_SERVER });
+
+    await events.append(threadT, {
+      type: "ingress",
+      platform: "cli",
+      author: { platform: "cli", userId: "local" },
+      text: SMOKE_MCP_PROMPT,
+      refs: [],
+    });
+    // `fake/deferred` scripts the four turns; `received` is how the header the
+    // provider actually saw is read back (a FakeProvider records every
+    // CompleteOptions), which is the only honest way to assert on a cache key.
+    const deferredProvider = createFakeProvider("deferred");
+    runT = await makeRunAgent(
+      { ...boot, mcp: smokeMcp },
+      {
+        agentId: SMOKE_MEMORY_AGENT,
+        builtins,
+        provider: deferredProvider,
+        settingsFor: () => Promise.resolve(smokeSettings),
+      },
+    )(threadT);
+    headNames = deferredProvider.received[0]?.tools.map((t) => t.name) ?? [];
+    historyT = await events.history(threadT, { afterSeq: markT });
+  } finally {
+    // Closing the manager must reap the child; an orphaned `bun run` holding
+    // this process's pipes is exactly the failure this leg exists to catch.
+    await smokeMcp.close();
+    reaped = (
+      await Promise.all(
+        spawnedTransports.map((t) => childReaped(t.pid, SMOKE_MCP_REAP_MS)),
+      )
+    ).every(Boolean);
+  }
+  const toolResultNames = historyT
+    .filter((e) => e.data.type === "tool_result")
+    .map((e) => (e.data.type === "tool_result" ? e.data.name : ""));
+  const finalText = [...historyT]
+    .reverse()
+    .find((e) => e.data.type === "message")
+    ?.data;
+  const answer = finalText?.type === "message" ? finalText.text : "";
+  // Cleanup, like the memories below: DELETE, not the store's usual withdrawal.
+  // These rows are a fixture's residue in a shared dev database, and a
+  // `mcp__smokefx__*` row outliving the process that could run it would offer
+  // every later tool_search a tool nothing can execute.
+  await db.query(`delete from tool_catalog where tenant_id = $1 and server = $2`, [
+    settings.tenantId,
+    SMOKE_MCP_SERVER,
+  ]);
 
   // From this run's marks forward: one forward page each, which is orders of
   // magnitude more than a run appends.
@@ -1420,6 +2081,33 @@ async function cmdSmoke(): Promise<void> {
       "auto-recall block carried the memory across threads",
       (injected?.text ?? "").includes("zebra-quartz"),
     ],
+    // --- slice 9 -----------------------------------------------------------
+    ["mcp fixture connected over real stdio", mcpState?.status === "connected"],
+    [
+      "mcp fixture negotiated the modern era",
+      mcpState?.era === "modern" && (mcpState?.protocolVersion ?? "").startsWith("2026-"),
+    ],
+    [
+      "catalog holds the server's namespaced tools",
+      mcpNames.length > 0 && mcpNames.every((n) => n.startsWith(`mcp__${SMOKE_MCP_SERVER}__`)),
+    ],
+    [
+      "the three meta-tools are in the request header",
+      ["tool_search", "tool_describe", "tool_call"].every((n) => headNames.includes(n)),
+    ],
+    // The header is the cache key: an MCP tool in it would be a schema paid
+    // for on every request, which is the whole cost this slice avoids.
+    ["no mcp tool is in the request header (default mode: deferred)", !headNames.some((n) => n.startsWith("mcp__"))],
+    ["deferred run completed", runT?.stopReason === "completed"],
+    [
+      "the model searched, described and called a catalog tool",
+      ["tool_search", "tool_describe", "tool_call"].every((n) => toolResultNames.includes(n)),
+    ],
+    [
+      "the mcp tool's output reached the assistant's answer",
+      answer.includes("pinky-smoke-42") && answer.includes(FAKE_DEFERRED_MARKER),
+    ],
+    ["closing the mcp plane reaped its child process", reaped],
   ];
 
   let failed = 0;
@@ -1455,7 +2143,11 @@ async function cmdPrompt(text: string): Promise<void> {
   // Local operator surface: the human is at their own terminal running their
   // own agent, so shell access is theirs to grant — and for the same reason
   // the recall scope below trusts it with `user` and `private` memories.
-  const tools = [...createTools({ shell: true }), new ShedContextTool()];
+  const builtins = [...createTools({ shell: true }), new ShedContextTool()];
+  // This surface's built-ins go into the catalog before the first run, so a
+  // deferred built-in (`tools.deferred: ["bash"]`) is still findable and
+  // `pinky tools list` sees what this terminal can actually do.
+  await registerBuiltins(boot, builtins);
   const thread: ThreadRef = {
     tenantId: boot.settings.tenantId,
     channelId: CLI_CHANNEL_ID,
@@ -1463,7 +2155,7 @@ async function cmdPrompt(text: string): Promise<void> {
   };
   const runAgent = makeRunAgent(boot, {
     agentId: AGENT_ID,
-    tools,
+    builtins,
     scopeFor: () => ({
       agentId: AGENT_ID,
       channelId: CLI_CHANNEL_ID,
@@ -1471,6 +2163,19 @@ async function cmdPrompt(text: string): Promise<void> {
       includeUser: true,
       includePrivate: true,
     }),
+  });
+
+  // Ctrl-C at the operator's own terminal is the common case here, and it must
+  // still reap the MCP children this process spawned — same handler, same
+  // order (abort the run, close the plane, exit 130).
+  const interrupted = new AbortController();
+  let run: Promise<AgentRunResult> | undefined;
+  const stopShutdown = installShutdown({
+    drain: async () => {
+      interrupted.abort(new Error("shutdown signal"));
+      await run?.catch(() => {});
+    },
+    close: () => boot.close(),
   });
 
   let code = 0;
@@ -1482,13 +2187,16 @@ async function cmdPrompt(text: string): Promise<void> {
       text,
       refs: [],
     });
-    const result = await runAgent(thread, {
+    run = runAgent(thread, {
       deliver: async (t) => {
         process.stdout.write(`${t}\n`);
       },
+      signal: interrupted.signal,
     });
+    const result = await run;
     code = reportRun(result.stopReason, result.turns);
   } finally {
+    stopShutdown();
     await boot.close();
   }
   if (code !== 0) process.exit(code);
@@ -1497,11 +2205,6 @@ async function cmdPrompt(text: string): Promise<void> {
 // ---------------------------------------------------------------------------
 // headless — the JSONL service (DESIGN.md §11); the primary interface
 // ---------------------------------------------------------------------------
-
-/** Human log line. Always stderr: stdout is the protocol. */
-function logStderr(msg: string): void {
-  process.stderr.write(`${msg}\n`);
-}
 
 /**
  * Where a peer's message lands in the log.
@@ -1706,14 +2409,38 @@ async function cmdHeadless(args: string[]): Promise<void> {
   let boot: Bootstrap | undefined;
   let server: ReturnType<typeof startGateway> | undefined;
   let stopSweep: (() => void) | undefined;
+  let session: Promise<void> | undefined;
+  let released = false;
+  // Everything this process holds, released once. Called by the shutdown
+  // handler on a signal and by the `finally` on the normal path.
+  const release = async (): Promise<void> => {
+    if (released) return;
+    released = true;
+    stopSweep?.();
+    server?.stop();
+    await boot?.close();
+  };
+  // Installed BEFORE bootstrap: `mcp.start()` spawns stdio children inside it,
+  // so a signal arriving during startup must already have somewhere to land.
+  const stopShutdown = installShutdown({
+    drain: async () => {
+      // The same switch the client-gone path throws (DESIGN.md §11): the
+      // session stops reading stdin, in-flight runs abort, `exiting` is
+      // written, and runHeadless returns.
+      clientGone.abort(new Error("shutdown signal"));
+      await session?.catch(() => {});
+    },
+    close: release,
+  });
   try {
     boot = await bootstrap({ scopes: [`agent:${AGENT_ID}`] });
-    const tools = [...createTools({ shell: flags.shell === true }), new ShedContextTool()];
+    const builtins = [...createTools({ shell: flags.shell === true }), new ShedContextTool()];
+    await registerBuiltins(boot, builtins);
 
     const started = boot;
     const run = makeRunAgent(started, {
       agentId: AGENT_ID,
-      tools,
+      builtins,
       settingsFor: (thread) =>
         started.reloadSettings({ scopes: [`channel:${thread.channelId}`, `agent:${AGENT_ID}`] }),
       scopeFor: (thread, batch) => ({
@@ -1741,7 +2468,7 @@ async function cmdHeadless(args: string[]): Promise<void> {
     // message is a single-node failure mode too (issue #4).
     stopSweep = startA2ASweep(started.messenger, logStderr, { redeliverFor: AGENT_ID });
 
-    await runHeadless({
+    session = runHeadless({
       tenantId: started.settings.tenantId,
       agentId: AGENT_ID,
       nodeId: started.env.nodeId,
@@ -1761,6 +2488,7 @@ async function cmdHeadless(args: string[]): Promise<void> {
       log: logStderr,
       signal: clientGone.signal,
     });
+    await session;
   } catch (err) {
     // Startup failures land here too — a bad DATABASE_URL, a failed migration,
     // a port already bound. A client parsing stdout would otherwise see the
@@ -1772,9 +2500,8 @@ async function cmdHeadless(args: string[]): Promise<void> {
     });
     throw err;
   } finally {
-    stopSweep?.();
-    server?.stop();
-    await boot?.close();
+    stopShutdown();
+    await release();
   }
 }
 
@@ -1793,6 +2520,12 @@ try {
     case "stats":
       await cmdStats(rest);
       break;
+    case "mcp":
+      await cmdMcp(rest);
+      break;
+    case "tools":
+      await cmdTools(rest);
+      break;
     case "smoke":
       await cmdSmoke();
       break;
@@ -1804,7 +2537,7 @@ try {
       await cmdHeadless(rest);
       break;
     default:
-      console.error("usage: pinky <migrate|config|memory|stats|smoke|prompt|headless>");
+      console.error("usage: pinky <migrate|config|memory|stats|mcp|tools|smoke|prompt|headless>");
       process.exit(cmd ? 1 : 0);
   }
 } catch (err) {

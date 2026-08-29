@@ -768,9 +768,13 @@ suite("MemoryStore (live postgres)", () => {
       // repeats `tenant_id = $1` as well as relying on the policy.
       const rows = await admin.query<{ tenant_id: string }>(
         `select distinct tenant_id from memories
-          where text like '%armadillo secret' order by tenant_id`,
+          where text like '%armadillo secret'`,
       );
-      expect(rows.map((r) => r.tenant_id)).toEqual([TENANT, TENANT_B].sort());
+      // Sort on the JS side, not with `order by`: the server's collation is
+      // the image's (glibc en_US on pgvector/pgvector, C on alpine) and glibc
+      // ignores the hyphens in these ids at the first level, so a DB-ordered
+      // list only matches a code-point sort for some run ids. Flaky in CI once.
+      expect(rows.map((r) => r.tenant_id).sort()).toEqual([TENANT, TENANT_B].sort());
     });
   });
 

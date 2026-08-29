@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 PinkyAgent is a headless, event-sourced agent runtime (Bun 1.4 + TypeScript workspace, Postgres 16). **DESIGN.md is the spec**; code comments cite it by section (`DESIGN.md §4.1`). README.md covers quickstart, CLI, protocol, and env vars — don't duplicate those here; the slice ledger below is the one status summary kept in this file. Read DESIGN.md §1 (pillars) before changing anything structural.
 
-## Build status (DESIGN.md §12 slices) — as of 2026-08-28, PR #1 merged
+## Build status (DESIGN.md §12 slices) — as of 2026-08-29, PR #9 merged
 
 | Slice | State | Where |
 | --- | --- | --- |
@@ -19,8 +19,9 @@ PinkyAgent is a headless, event-sourced agent runtime (Bun 1.4 + TypeScript work
 | 7. HITL | **Not built** (`human_request` event type exists; nothing raises/resumes it) | — |
 | 8. Hardening | **Partial** — RLS on `memories` under `pinky_app`; no filesystem sandbox for `bash`, no per-tenant quotas, `global` memory visibility still tenant-fenced | `schema/0003_rls.sql`, `tools/bash.ts` |
 | P8 revised (not a slice) | **Done** — human-granted self-configuration via `settings_get`/`settings_set`, `selfConfig.*`, lenient `load()`, `pinky config unset` | `tools/settings.ts`, `core/settings.ts` |
+| Prompt-cache discipline (not a slice) | **Done** (PR #9, 2026-08-29) — Anthropic conversation breakpoints + TTL knob, OpenAI/DeepSeek cache counters + `prompt_cache_key`, reconstructable requests (journaled recall block / `notice` events / canonical tool args), `tool_choice` masking, `pinky stats cache` | `runtime/providers/*.ts`, `runtime/loop.ts`, `core/projection.ts`, `cli/index.ts` |
 
-Known open items (scope, not bugs): P6 durability has no checkpoint/resume (a crash mid-run re-calls the LLM); tenancy is one global `tenantId`; RLS covers only `memories`; headless runs a *trusted* memory scope by default (`--shared` drops private/user rows); stdout backpressure is ignored (Bun buffers); re-sending a completed prompt id replays it (`replay:true`); wake-on-message is wired in `pinky headless` only (`prompt`/`smoke` still poll `a2a_inbox`), and a `broadcast` row nothing subscribes to stays unconsumed and is re-fired by every sweep. Natural next slice: 5 or 6. Keep this table current when a slice lands.
+Known open items (scope, not bugs): P6 durability has no checkpoint/resume (a crash mid-run re-calls the LLM); tenancy is one global `tenantId`; RLS covers only `memories`; headless runs a *trusted* memory scope by default (`--shared` drops private/user rows); stdout backpressure is ignored (Bun buffers); re-sending a completed prompt id replays it (`replay:true`); wake-on-message is wired in `pinky headless` only (`prompt`/`smoke` still poll `a2a_inbox`), and a `broadcast` row nothing subscribes to stays unconsumed and is re-fired by every sweep; the Anthropic provider sends no `thinking` param and drops thinking blocks from replies (needs a decision before running a thinking-default model with tool use); slice 5 subagents must send the parent's *exact* `system`+`tools` to share its cache (dsh made fork children one-shot for this reason). Natural next slice: 5 or 6. Keep this table current when a slice lands.
 
 ## Commands
 

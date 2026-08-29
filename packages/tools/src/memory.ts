@@ -240,6 +240,12 @@ export class RecallTool implements Tool {
       ...(kinds ? { kinds } : {}),
     });
 
+    // Audit-only, and it must STAY that way: no `block` key (and no `scope`).
+    // That key is the loop's receipt for its own window-opening auto-recall
+    // pass — the projection hoists the first one that carries it to index 0 and
+    // the loop stops recalling once it exists (packages/core/src/events.ts,
+    // `block`). Writing one here would let the agent move byte 0 of a prompt
+    // the provider has already cached, mid-window, by calling `recall`.
     await ctx.emit({
       type: "memory",
       op: "recall",

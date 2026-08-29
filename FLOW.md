@@ -1,9 +1,9 @@
 # PinkyAgent — agent flow
 
 How one prompt travels from a client program to a reply, and what the agent
-loop does in between. Diagrams follow the code as of PR #7; the file paths in
-the notes are where each box lives. DESIGN.md is still the spec — this is the
-map of what is built.
+loop does in between. Diagrams follow the code as of the prompt-cache alignment
+work; the file paths in the notes are where each box lives. DESIGN.md is still
+the spec — this is the map of what is built.
 
 ## 1. End to end: JSONL client → headless service → agent loop → reply
 
@@ -30,15 +30,15 @@ sequenceDiagram
         H->>L: runAgent(thread, batch, {signal, onEvent, deliver})
         Note over L: settings reloaded for this run:<br/>global, then channel:id, then agent:pinky
         L->>ES: contextEvents(thread) — from the latest continuity boundary
-        L->>L: buildContext → projection (ingress/a2a/message/tool_result/continuity)
-        opt memory.autoRecall
+        L->>L: buildContext → projection (ingress/a2a/notice/message/tool_result/continuity,<br/>tool args canonicalized, plus the journaled recall block hoisted to index 0)
+        opt memory.autoRecall, and no recall event in this window carries a block key
             L->>M: search(query from last user texts + continuity memoryHints)
             M-->>L: hits (FTS + vector, RRF-fused, recency/importance rescored)
-            L->>L: memories block inserted as a user message at index 0 (never the system prompt)
+            L->>L: memories block inserted as a user message at index 0 (never the system prompt)<br/>journaled with its scope on the memory recall event, so every later wake replays it verbatim
         end
         loop each turn (≤ maxTurns)
-            L->>L: pressure ladder: advisory notice / forced shed_context
-            L->>P: complete(system, messages, tools)
+            L->>L: pressure ladder: advisory once per window / forced shed_context — each notice journaled, then pushed
+            L->>P: complete(system, messages, full tool list, cacheKey — tool_choice only on a forced retry)
             P-->>L: AssistantTurn {text, toolCalls, usage}
             L->>ES: append message event (+usage)
             ES-->>H: onEvent → {"type":"event", event}
@@ -68,20 +68,26 @@ guaranteed per thread: `run_started → (event | reply)* → run_finished`.
 
 ```mermaid
 flowchart TD
-    start([run starts]) --> load[loadContext: events since the latest continuity event<br/>buildContext → projection]
-    load --> recall{memory.autoRecall<br/>and memory context?}
-    recall -- yes --> block[autoRecall: FTS + vector search, budgeted<br/>&lt;memories&gt; block → user message at index 0]
-    recall -- no --> ladder
+    start([run starts]) --> load[loadContext: events since the latest continuity event<br/>buildContext → projection<br/>non-empty journaled recall block hoisted to index 0, notices in seq order<br/>tool args canonicalized on both sides of the log]
+    load --> journaled{"windowRecall: does this window already<br/>carry a recall event with a block key?"}
+    journaled -- "yes, memory on, scope not narrower" --> opened
+    journaled -- "no key, or memory off, or narrower scope than journaled" --> recall{memory.autoRecall<br/>and memory context?}
+    recall -- yes --> block["autoRecall: FTS + vector search, budgeted<br/>&lt;memories&gt; block → user message at index 0<br/>journaled with block + scope on the memory recall event<br/>found nothing → empty block, still claims the window<br/>store failed → nothing journaled, retried next wake"]
+    recall -- no --> opened
     block --> opened{window opens on a<br/>continuity boundary?}
     opened -- yes --> restart0[emit restart event<br/>tokensBefore / tokensAfter / recallTokens]
     opened -- no --> ladder
     restart0 --> ladder
 
     ladder{estimateTokens vs<br/>context.* thresholds}
-    ladder -- "≥ hardFraction" --> hard[push HARD notice as user msg<br/>only shed_context offered]
-    ladder -- "≥ advisoryFraction (once)" --> adv[push ADVISORY notice as user msg]
+    ladder -- "≥ hardFraction" --> forcing{"first forced attempt, or the retry?<br/>full tool list kept either way"}
+    ladder -- "context cap truncated the window" --> forcing
+    forcing -- first --> hard1["append notice event, then push HARD notice as user msg<br/>NO tool_choice — appending keeps the messages cache warm;<br/>the note plus the harness guard hold the boundary"]
+    forcing -- "retry — last attempt" --> hard2["append notice event, then push HARD RETRY notice as user msg<br/>tool_choice: shed_context — the guarantee, paid for with<br/>one uncached re-read of the transcript"]
+    ladder -- "≥ advisoryFraction — once per window, armed from the log" --> adv[append notice event, then push ADVISORY notice as user msg]
     ladder -- below --> llm
-    hard --> llm
+    hard1 --> llm
+    hard2 --> llm
     adv --> llm
 
     llm[provider.complete<br/>system prompt = stable cached prefix, never rewritten] --> journal[append message event<br/>with usage: input / output / cacheRead / cacheCreation]
@@ -122,6 +128,15 @@ flowchart TD
 Nothing in the log is ever rewritten: a restart moves the projection boundary
 forward, and everything before it stays for audit, replay, memory extraction
 and `pinky stats restarts`.
+
+Everything the loop pushes into `messages` it journals first — the pressure
+notices as `notice` events, the recalled block on its `memory` recall event —
+so the next wake's projection reproduces the same bytes in the same slots and
+the request stays a prefix-extension of the one the provider already cached.
+The same reason the loop and the projection both canonicalize tool-call
+arguments: jsonb re-sorts an object's keys, and a replayed `tool_use` that
+differs by one byte breaks the match from there to the end of the transcript.
+`pinky stats cache` is where you check that it held.
 
 ## 3. Wake-on-message: an A2A envelope becomes a run
 

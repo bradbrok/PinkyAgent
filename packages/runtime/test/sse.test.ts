@@ -125,10 +125,33 @@ describe("AnthropicProvider", () => {
       { type: "text", text: "be helpful", cache_control: { type: "ephemeral" } },
     ]);
     expect(body.max_tokens).toBe(64_000);
+    // ...and the last block of the last TWO messages carries the rolling
+    // conversation breakpoint (providers-caching.test.ts owns that contract).
     expect(body.messages).toEqual([
       { role: "user", content: [{ type: "text", text: "hello" }] },
-      { role: "assistant", content: [{ type: "tool_use", id: "c1", name: "echo", input: { a: 1 } }] },
-      { role: "user", content: [{ type: "tool_result", tool_use_id: "c1", content: "echo result" }] },
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "c1",
+            name: "echo",
+            input: { a: 1 },
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "c1",
+            content: "echo result",
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+      },
     ]);
     expect(body.tools).toEqual([
       { name: "echo", description: "echo it", input_schema: { type: "object" } },

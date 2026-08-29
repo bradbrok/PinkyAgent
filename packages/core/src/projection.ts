@@ -5,10 +5,12 @@
  * before the latest continuity is dropped from context. Everything after it
  * renders in a stable, serialized form so prompts are cache-friendly.
  *
- * Model-visible: `continuity`, `ingress`, `a2a`, `message`, `tool_result`.
- * Everything else (`decision`, `egress`, `error`, `memory`, `config`, …) is
- * audit-only and never costs context.
+ * Model-visible: `continuity`, `ingress`, `a2a`, `notice`, `message`,
+ * `tool_result`, and the `block` on the ONE `memory` recall event that opens a
+ * window. Everything else (`decision`, `egress`, `error`, `restart`, `config`,
+ * every other `memory` event) is audit-only and never costs context.
  */
+import { canonicalizeArgs } from "./events";
 import type { ContinuityDoc, ThreadEvent, ToolCall } from "./events";
 
 export interface ProjectedMessage {
@@ -67,6 +69,50 @@ export function latestContinuity(events: ThreadEvent[]): { seq: number; doc: Con
 }
 
 /**
+ * The auto-recall pass that OPENED this window, as journaled — or null when the
+ * window has never had one.
+ *
+ * `ran` exists to make the null the only signal: a recall that found nothing
+ * journals `block: ""`, and "ran and injected nothing" must not read as "never
+ * ran". The loop gates on the OBJECT, not on the text; if it gated on a
+ * non-empty block, a wake on an empty memory plane would leave the gate open
+ * and the NEXT wake would inject a block at index 0 — moving byte 0 and
+ * invalidating the whole cached prefix, which is exactly the failure this
+ * journaling exists to prevent (DESIGN.md §4.5 cache alignment, §5.4 once per
+ * WINDOW rather than once per wake).
+ */
+export interface WindowRecall {
+  /** Always true — the presence of this object IS "auto-recall already ran". */
+  ran: true;
+  /** The injected text; `""` when the pass injected nothing. */
+  block: string;
+  /** The scope width that produced it; absent on events written before §5.1 scoping. */
+  scope?: { includeUser: boolean; includePrivate: boolean };
+}
+
+/** {@link WindowRecall} for the window `events` ends in (boundary rule of buildContext). */
+export function windowRecall(events: ThreadEvent[]): WindowRecall | null {
+  const boundarySeq = latestContinuity(events)?.seq ?? 0;
+  return firstAutoRecall(events.filter((e) => e.seq >= boundarySeq));
+}
+
+/**
+ * The first auto-recall event inside an already-windowed list: the first
+ * `memory`/`recall` carrying the `block` KEY. An event without the key is an
+ * agent-initiated `recall` tool call — audit-only, and deliberately unable to
+ * claim a window (packages/core/src/events.ts, `block`).
+ */
+function firstAutoRecall(visible: ThreadEvent[]): WindowRecall | null {
+  for (const e of visible) {
+    const d = e.data;
+    if (d.type !== "memory" || d.op !== "recall") continue;
+    if (typeof d.block !== "string") continue;
+    return { ran: true, block: d.block, ...(d.scope ? { scope: d.scope } : {}) };
+  }
+  return null;
+}
+
+/**
  * Project the model context: the continuity boundary payload plus every
  * model-visible event after it (DESIGN.md §3). Pre-boundary events are never
  * sent to the model; they stay in the log for audit, replay, and memory
@@ -87,6 +133,15 @@ export function latestContinuity(events: ThreadEvent[]): { seq: number; doc: Con
  *
  * Together these also guarantee the projection never starts with a tool
  * message; a defensive trim enforces that regardless of input.
+ *
+ * The recalled-memories block is hoisted to index 0, ahead of the continuity
+ * document — literally where the loop injected it (DESIGN.md §5.4, "at context
+ * start and after each restart"). It is taken from the FIRST `memory` recall
+ * event in the window carrying the `block` KEY (the loop's own auto-recall
+ * pass); any later one is audit-only, so a mid-window recall the agent asked
+ * for cannot rewrite byte 0 of a prompt the provider has already cached. When
+ * that opening pass injected nothing its `block` is `""` and nothing is
+ * hoisted — the window opens with no memories and keeps it that way.
  */
 export function buildContext(events: ThreadEvent[]): ProjectedMessage[] {
   const boundary = latestContinuity(events);
@@ -123,8 +178,24 @@ export function buildContext(events: ThreadEvent[]): ProjectedMessage[] {
         msgs.push({ role: "user", text: `[a2a ${d.kind} from ${d.from}]: ${d.text}` });
         break;
       }
+      case "notice": {
+        // A harness-authored turn (the §4.1 pressure ladder). It renders in
+        // seq order, exactly where the loop pushed it, and as `user` — never
+        // `system`, which would move the cached prefix (§4.5/§9).
+        msgs.push({ role: "user", text: d.text });
+        break;
+      }
       case "message": {
-        const calls = d.toolCalls.filter((c) => answered.has(c.id));
+        // Canonical key order, because `data` is jsonb and jsonb SORTS an
+        // object's keys by (length, bytes) on the way in. Without this the
+        // `tool_use` arguments the loop sent in-run ({zulu, a, mm}) come back
+        // out reordered ({a, mm, zulu}), so wake N+1's request diverges from
+        // wake N's at the first tool call whose argument names differ in
+        // length — one cold prefix per wake (DESIGN.md §4.5). The loop
+        // canonicalizes at the other end too, so both renders agree.
+        const calls = d.toolCalls
+          .filter((c) => answered.has(c.id))
+          .map((c) => ({ ...c, args: canonicalizeArgs(c.args) }));
         if (!d.text && calls.length === 0) break; // nothing left to render
         const msg: ProjectedMessage = { role: "assistant", text: d.text };
         if (calls.length) {
@@ -145,8 +216,16 @@ export function buildContext(events: ThreadEvent[]): ProjectedMessage[] {
     }
   }
 
-  // A prompt must never open with a tool message.
+  // A prompt must never open with a tool message. Trimmed BEFORE the block is
+  // hoisted, so the rule is about the conversation, not about the block.
   while (msgs[0]?.role === "tool") msgs.shift();
+
+  // The recalled-memories block IS the context start (DESIGN.md §5.4): it goes
+  // in front of the continuity document, which is where the loop put it. An
+  // empty block is a recall that ran and injected nothing — journaled so the
+  // loop's gate can see it, but there is no message to replay.
+  const opened = firstAutoRecall(visible);
+  if (opened && opened.block !== "") msgs.unshift({ role: "user", text: opened.block });
   return msgs;
 }
 

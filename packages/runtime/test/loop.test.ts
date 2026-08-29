@@ -6,14 +6,14 @@
  * cut-point safety).
  */
 import { describe, expect, test } from "bun:test";
-import { EventStore, estimateTokens, threadKey } from "@pinky/core";
+import { DEFAULT_CONTEXT_EVENT_CAP, EventStore, buildContext, estimateTokens, threadKey } from "@pinky/core";
 import type { Db, SettingsSnapshot, ThreadEvent, ThreadEventData, ThreadRef, ToolCall } from "@pinky/core";
 import type { MemoryHit, MemoryStore, RecallScope, SearchInput } from "@pinky/core";
 import { runAgentLoop } from "../src/loop";
 import { ShedContextTool } from "../src/continuity";
 import { FakeProvider } from "../src/providers/fake";
 import type { AgentLoopOptions, Embedder, MemoryContext } from "../src/types";
-import type { AgentRunResult, AssistantTurn, CompleteOptions, LlmMessage, Provider, Tool } from "../src/types";
+import type { AgentRunResult, AssistantTurn, CompleteOptions, LlmMessage, Provider, Tool, ToolChoice } from "../src/types";
 import type { FakeScript } from "../src/providers/fake";
 import type { RunAgentLoopOptions } from "../src/loop";
 
@@ -24,17 +24,58 @@ import type { RunAgentLoopOptions } from "../src/loop";
 
 const norm = (sql: string): string => sql.replace(/\s+/g, " ");
 
+/**
+ * Postgres `jsonb` key order: by (length, then bytes) — NOT insertion order.
+ * Applied to what a read returns, which is where the reorder becomes visible.
+ */
+function jsonbOrder(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(jsonbOrder);
+  if (value === null || typeof value !== "object") return value;
+  const source = value as Record<string, unknown>;
+  const keys = Object.keys(source).sort((a, b) => a.length - b.length || (a < b ? -1 : a > b ? 1 : 0));
+  const out: Record<string, unknown> = {};
+  for (const key of keys) out[key] = jsonbOrder(source[key]);
+  return out;
+}
+
 class FakeDb implements Db {
   readonly events: ThreadEvent[] = [];
   private seqByThread = new Map<string, number>();
+
+  /**
+   * Test seam: reorder every stored `data` object's keys the way jsonb does,
+   * on READ. Off by default (most tests do not care); the cache-alignment
+   * tests turn it on, because without it a fake store preserves insertion
+   * order and the whole class of "wake N+1 renders different bytes" defects is
+   * structurally invisible here.
+   */
+  reorderJson = false;
 
   private eventsFor(key: string): ThreadEvent[] {
     return this.events.filter((e) => threadKey(e) === key).sort((a, b) => a.seq - b.seq);
   }
 
+  /**
+   * Test seam: land events directly in the store, bypassing EventStore.append.
+   *
+   * The only way to observe a TRUNCATED context window is to hold more than
+   * DEFAULT_CONTEXT_EVENT_CAP (5000) events, and 5000 real appends would be
+   * 5000 trips through the tx path to prove nothing. Seq bookkeeping matches
+   * append's, so the store keeps working normally afterwards.
+   */
+  seed(ref: ThreadRef, datas: ThreadEventData[]): void {
+    const key = `${ref.tenantId}:${ref.channelId}:${ref.threadId}`;
+    let seq = this.seqByThread.get(key) ?? 0;
+    for (const data of datas) {
+      seq += 1;
+      this.events.push({ ...ref, id: `seed-${seq}`, seq, ts: new Date().toISOString(), data });
+    }
+    this.seqByThread.set(key, seq);
+  }
+
   /** Mirrors what postgres.js hands back for a jsonb column: a parsed value,
    *  not JSON text (see the JSONB CONTRACT in packages/core/src/pg.ts). */
-  private static toRow(e: ThreadEvent): Record<string, unknown> {
+  private toRow(e: ThreadEvent): Record<string, unknown> {
     return {
       id: e.id,
       tenant_id: e.tenantId,
@@ -42,7 +83,7 @@ class FakeDb implements Db {
       thread_id: e.threadId,
       seq: e.seq,
       ts: e.ts,
-      data: e.data,
+      data: this.reorderJson ? jsonbOrder(e.data) : e.data,
     };
   }
 
@@ -68,7 +109,7 @@ class FakeDb implements Db {
         .filter((e) => e.seq >= from)
         .sort((a, b) => b.seq - a.seq)
         .slice(0, limit);
-      return Promise.resolve(rows.map(FakeDb.toRow) as T[]);
+      return Promise.resolve(rows.map((r) => this.toRow(r)) as T[]);
     }
     if (/from events/.test(s) && /seq > \$4/.test(s)) {
       const [tenantId, channelId, threadId] = params as [string, string, string];
@@ -77,7 +118,7 @@ class FakeDb implements Db {
       const rows = this.eventsFor(`${tenantId}:${channelId}:${threadId}`)
         .filter((e) => e.seq > after)
         .slice(0, limit);
-      return Promise.resolve(rows.map(FakeDb.toRow) as T[]);
+      return Promise.resolve(rows.map((r) => this.toRow(r)) as T[]);
     }
     return Promise.resolve([]);
   }
@@ -193,6 +234,10 @@ interface Prompt {
   system: string;
   tools: string[];
   messages: LlmMessage[];
+  /** Provider-side tool mask; absent on every turn but a forced shed. */
+  toolChoice: ToolChoice | undefined;
+  /** Cache routing key — must be the same string on every turn of a thread. */
+  cacheKey: string | undefined;
 }
 
 class SnapshotProvider implements Provider {
@@ -210,6 +255,8 @@ class SnapshotProvider implements Provider {
       system: opts.system,
       tools: opts.tools.map((t) => t.name),
       messages: opts.messages.map((m) => ({ ...m })),
+      toolChoice: opts.toolChoice,
+      cacheKey: opts.cacheKey,
     });
     return this.inner.complete(opts);
   }
@@ -463,8 +510,12 @@ describe("runAgentLoop context pressure ladder (DESIGN §4.1)", () => {
     expect(notice).toContain("context pressure");
     const noticeMsg = h.provider.prompts[2]!.messages.find((m) => m.text === notice)!;
     expect(noticeMsg.role).toBe("user");
-    // Notices are never journaled.
+    // The notice is journaled, ONCE, immediately before the turn it provoked:
+    // the prompt is a projection of the log (DESIGN §3), so a notice that
+    // existed only in this run's array would be missing from the next wake's
+    // prompt and the transcript would diverge from what the provider cached.
     expect(eventTypes(h.db).slice(before)).toEqual([
+      "notice",
       "message",
       "tool_result",
       "message",
@@ -472,6 +523,8 @@ describe("runAgentLoop context pressure ladder (DESIGN §4.1)", () => {
       "message",
       "egress",
     ]);
+    const journaled = h.db.events[before]!.data as Extract<ThreadEventData, { type: "notice" }>;
+    expect(journaled.text).toBe(notice);
   });
 
   test("without a shed_context tool, hard pressure degrades to normal operation", async () => {
@@ -482,7 +535,7 @@ describe("runAgentLoop context pressure ladder (DESIGN §4.1)", () => {
     expect(h.provider.prompts[0]!.tools).toEqual(["echo"]);
   });
 
-  test("hard pressure offers only shed_context and stops with 'shed' when no turns remain", async () => {
+  test("hard pressure forces a shed and stops with 'shed' when no turns remain", async () => {
     const h = harness(
       () => turn({ text: "", toolCalls: [call("s1", "shed_context", SHED_ARGS)], stopReason: "tool_calls" }),
       [echoTool, new ShedContextTool()],
@@ -492,7 +545,14 @@ describe("runAgentLoop context pressure ladder (DESIGN §4.1)", () => {
     expect(result).toEqual({ turns: 1, stopReason: "shed" });
 
     const req = h.provider.prompts[0]!;
-    expect(req.tools).toEqual(["shed_context"]);
+    // The tool DEFINITIONS are untouched — narrowing them would invalidate
+    // every cache tier (tools render at prefix position 0). And the FIRST
+    // forced attempt carries no `tool_choice` either: that invalidates the
+    // messages tier, i.e. one uncached re-read of the biggest transcript this
+    // thread will ever have. The notice plus the harness guard hold the
+    // boundary; only the retry pays for the guarantee (DESIGN §4.5/§9).
+    expect(req.tools).toEqual(["echo", "shed_context"]);
+    expect(req.toolChoice).toBeUndefined();
     expect(req.system).toBe("sys"); // HARD_NOTE does not touch the system prompt
     const notice = notices(req.messages)[0]!;
     expect(notice).toContain("context limit reached");
@@ -502,12 +562,13 @@ describe("runAgentLoop context pressure ladder (DESIGN §4.1)", () => {
     // so the successor wake is not billed twice (DESIGN §13).
     expect(eventTypes(h.db)).toEqual([
       "ingress",
+      "notice", // journaled ahead of the turn it forced
       "message",
       "continuity",
       "tool_result",
       "restart",
     ]);
-    const cont = h.db.events[2]!.data as Extract<ThreadEventData, { type: "continuity" }>;
+    const cont = h.db.events[3]!.data as Extract<ThreadEventData, { type: "continuity" }>;
     expect(cont.document.goal).toBe("finish the continuity engine");
     expect(cont.tokensBefore).toBeGreaterThan(0); // loop's per-turn estimate
   });
@@ -530,8 +591,17 @@ describe("runAgentLoop context pressure ladder (DESIGN §4.1)", () => {
     expect(first.isError).toBe(true);
     expect(first.text).toContain("only shed_context may be called");
     expect(h.db.events.some((e) => e.data.type === "tool_result" && e.data.text.startsWith("echo:"))).toBe(false);
-    // Second forced turn carries the retry notice.
+    // Why the guard is the load-bearing half: `echo` IS defined in the forced
+    // request (the list is never narrowed) and the first attempt sends no mask
+    // at all, so the guard is the only thing standing between the model and
+    // another `echo`.
+    expect(h.provider.prompts[0]!.tools).toEqual(["echo", "shed_context"]);
+    expect(h.provider.prompts[0]!.toolChoice).toBeUndefined();
+    // Second forced turn: the retry notice AND the mask, which is where a
+    // messages-tier invalidation finally buys something.
     expect(notices(h.provider.prompts[1]!.messages).at(-1)).toContain("final attempt");
+    expect(h.provider.prompts[1]!.tools).toEqual(["echo", "shed_context"]);
+    expect(h.provider.prompts[1]!.toolChoice).toEqual({ type: "tool", name: "shed_context" });
   });
 
   test("an invalid document on the forced turn is retried once, then the run stops", async () => {
@@ -700,7 +770,13 @@ function memoryHit(partial: Partial<MemoryHit> = {}): MemoryHit {
 class RecallStub {
   readonly searches: SearchInput[] = [];
   constructor(
-    private readonly opts: { hits?: MemoryHit[]; vectors?: boolean; searchError?: Error } = {},
+    private readonly opts: {
+      hits?: MemoryHit[];
+      /** Different hits per search, so two windows get distinguishable blocks. */
+      hitsByCall?: MemoryHit[][];
+      vectors?: boolean;
+      searchError?: Error;
+    } = {},
   ) {}
 
   async supportsVectors(): Promise<boolean> {
@@ -710,7 +786,7 @@ class RecallStub {
   async search(input: SearchInput): Promise<MemoryHit[]> {
     this.searches.push(input);
     if (this.opts.searchError) throw this.opts.searchError;
-    return this.opts.hits ?? [];
+    return this.opts.hitsByCall?.[this.searches.length - 1] ?? this.opts.hits ?? [];
   }
 }
 
@@ -724,13 +800,25 @@ class BrokenEmbedder implements Embedder {
   }
 }
 
-function memoryContext(store: RecallStub, embedder?: Embedder): MemoryContext {
+function memoryContext(
+  store: RecallStub,
+  embedder?: Embedder,
+  scope: RecallScope = SCOPE,
+): MemoryContext {
   return {
     store: store as unknown as MemoryStore,
-    scope: SCOPE,
+    scope,
     ...(embedder ? { embedder } : {}),
   };
 }
+
+/** A trusted local surface (default `pinky headless`): user + private rows. */
+const WIDE_SCOPE: RecallScope = {
+  ...SCOPE,
+  userId: "u1",
+  includeUser: true,
+  includePrivate: true,
+};
 
 const memoryEvents = (db: FakeDb): Extract<ThreadEventData, { type: "memory" }>[] =>
   db.events
@@ -763,13 +851,22 @@ describe("runAgentLoop auto-recall (DESIGN §5.4)", () => {
     expect(store.searches[0]!.limit).toBe(12);
     expect(store.searches[0]!.scope).toEqual(SCOPE);
 
-    // Audit-only event: the projection never renders it.
+    // Audit-only except `block`, which is the injected text verbatim — that is
+    // what the next wake's projection replays instead of searching again.
     expect(memoryEvents(h.db)).toEqual([
-      { type: "memory", op: "recall", ids: [recalled.id], text: "how do we handle provider retries?", count: 1 },
+      {
+        type: "memory",
+        op: "recall",
+        ids: [recalled.id],
+        text: "how do we handle provider retries?",
+        count: 1,
+        block: msgs[0]!.text,
+        scope: { includeUser: false, includePrivate: false },
+      },
     ]);
   });
 
-  test("no hits: nothing is injected and no memory event is journaled", async () => {
+  test("no hits: nothing is injected, but the recall is still journaled", async () => {
     const h = harness([turn({ text: "ok" })]);
     await h.store.append(THREAD, ingress("hello"));
     await h.run({ memory: memoryContext(new RecallStub({ hits: [] })) });
@@ -777,7 +874,43 @@ describe("runAgentLoop auto-recall (DESIGN §5.4)", () => {
     const msgs = h.provider.prompts[0]!.messages;
     expect(msgs).toHaveLength(1);
     expect(msgs[0]!.text).toContain("hello");
-    expect(memoryEvents(h.db)).toEqual([]);
+    // `block: ""` — nothing to show the model, but the window is now marked as
+    // recalled, which is what stops the NEXT wake from moving byte 0.
+    expect(memoryEvents(h.db)).toEqual([
+      {
+        type: "memory",
+        op: "recall",
+        ids: [],
+        text: "hello",
+        count: 0,
+        block: "",
+        scope: { includeUser: false, includePrivate: false },
+      },
+    ]);
+  });
+
+  test("an empty memory plane on wake 1 does not move byte 0 on wake 2", async () => {
+    // The reviewer's reproduction: wake 1 recalls into an empty plane, then
+    // something is retained. If the gate read "is there a block?" instead of
+    // "did auto-recall run?", wake 2 would search again, find the new row and
+    // unshift it at index 0 — invalidating the provider's prefix cache for the
+    // entire transcript on a thread that did nothing unusual (DESIGN §4.5).
+    const h = harness([turn({ text: "ok" }), turn({ text: "ok again" })]);
+    await h.store.append(THREAD, ingress("hello"));
+    const store = new RecallStub({ hitsByCall: [[], [memoryHit({ text: "retained since" })]] });
+
+    await h.run({ memory: memoryContext(store) });
+    const first = h.provider.prompts[0]!.messages;
+
+    await h.store.append(THREAD, ingress("second question"));
+    await h.run({ memory: memoryContext(store) });
+    const second = h.provider.prompts[1]!.messages;
+
+    expect(store.searches).toHaveLength(1); // no second search
+    expect(memoryEvents(h.db)).toHaveLength(1);
+    expect(second[0]!.text).toBe(first[0]!.text); // byte 0 unmoved
+    expect(second.slice(0, first.length)).toEqual(first); // a pure extension
+    expect(second.some((m) => m.text.includes("retained since"))).toBe(false);
   });
 
   test("autoRecall=false never touches the store", async () => {
@@ -790,6 +923,85 @@ describe("runAgentLoop auto-recall (DESIGN §5.4)", () => {
     });
     expect(store.searches).toHaveLength(0);
     expect(h.provider.prompts[0]!.messages).toHaveLength(1);
+  });
+
+  test("autoRecall=false strips a block the window already carries", async () => {
+    // Turning memory off has to work on an EXISTING window too. The journaled
+    // block is replayed by the projection, so honoring the setting means
+    // un-hoisting it — a deliberate prefix break the operator asked for.
+    const h = harness([turn({ text: "ok" }), turn({ text: "ok again" })]);
+    await h.store.append(THREAD, ingress("hello"));
+    const store = new RecallStub({ hits: [memoryHit({ text: "widgets cost $4" })] });
+
+    await h.run({ memory: memoryContext(store) });
+    expect(h.provider.prompts[0]!.messages[0]!.text).toContain("widgets cost $4");
+
+    await h.run({
+      memory: memoryContext(store),
+      settings: settings(undefined, { autoRecall: false }),
+    });
+    const second = h.provider.prompts[1]!.messages;
+    expect(second.some((m) => m.text.includes("widgets cost $4"))).toBe(false);
+    expect(second[0]!.text).toContain("hello");
+    expect(store.searches).toHaveLength(1); // stripped, not re-searched
+    expect(memoryEvents(h.db)).toHaveLength(1);
+  });
+
+  test("a run with no memory context at all strips it too", async () => {
+    const h = harness([turn({ text: "ok" }), turn({ text: "ok again" })]);
+    await h.store.append(THREAD, ingress("hello"));
+    const store = new RecallStub({ hits: [memoryHit({ text: "widgets cost $4" })] });
+
+    await h.run({ memory: memoryContext(store) });
+    await h.run(); // memory plane not wired on this surface
+    expect(h.provider.prompts[1]!.messages.some((m) => m.text.includes("widgets"))).toBe(false);
+  });
+
+  test("a NARROWER scope strips the replayed block and recalls again (DESIGN §5.1)", async () => {
+    // A default run opened this window with `includeUser`/`includePrivate`; a
+    // `--shared` run picks the same thread up. Replaying that block would put
+    // private rows into a shared context. Privacy wins over the prefix.
+    const h = harness([turn({ text: "ok" }), turn({ text: "ok again" })]);
+    await h.store.append(THREAD, ingress("hello"));
+    const store = new RecallStub({
+      hitsByCall: [
+        [memoryHit({ text: "a PRIVATE note" })],
+        [memoryHit({ text: "only SHARED rows" })],
+      ],
+    });
+
+    await h.run({ memory: memoryContext(store, undefined, WIDE_SCOPE) });
+    await h.run({ memory: memoryContext(store, undefined, SCOPE) });
+
+    expect(store.searches).toHaveLength(2);
+    expect(store.searches[1]!.scope).toEqual(SCOPE);
+    const second = h.provider.prompts[1]!.messages;
+    expect(second[0]!.text).toContain("only SHARED rows");
+    expect(second.some((m) => m.text.includes("a PRIVATE note"))).toBe(false);
+    // Both passes are journaled, each with the width it ran under.
+    const mem = memoryEvents(h.db);
+    expect(mem).toHaveLength(2);
+    expect(mem[0]!.scope).toEqual({ includeUser: true, includePrivate: true });
+    expect(mem[1]!.scope).toEqual({ includeUser: false, includePrivate: false });
+    // The projection keeps hoisting the FIRST, so the narrow surface pays this
+    // strip-and-recall on every wake until the window turns over. Documented
+    // trade: it only happens on a thread driven by two different surfaces.
+    expect(buildContext(h.db.events)[0]!.text).toContain("a PRIVATE note");
+  });
+
+  test("a WIDER scope replays the narrow block as-is", async () => {
+    // Nothing leaks in this direction: a trusted surface reading a block built
+    // for a shared one just sees fewer rows. No re-search, no moved byte 0.
+    const h = harness([turn({ text: "ok" }), turn({ text: "ok again" })]);
+    await h.store.append(THREAD, ingress("hello"));
+    const store = new RecallStub({ hits: [memoryHit({ text: "only SHARED rows" })] });
+
+    await h.run({ memory: memoryContext(store, undefined, SCOPE) });
+    await h.run({ memory: memoryContext(store, undefined, WIDE_SCOPE) });
+
+    expect(store.searches).toHaveLength(1);
+    expect(memoryEvents(h.db)).toHaveLength(1);
+    expect(h.provider.prompts[1]!.messages[0]!.text).toContain("only SHARED rows");
   });
 
   test("without a memory context the prompt is the bare projection", async () => {
@@ -1064,5 +1276,351 @@ describe("runAgentLoop restart economics (DESIGN §13)", () => {
     // Recall is part of what the fresh window costs, not something beside it.
     expect(restart!.tokensAfter).toBeGreaterThan(restart!.recallTokens);
     expect(restart!.messages).toBe(2); // <memories> block + the document
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Prompt-cache alignment (DESIGN §4.5 cache alignment, §9 "tool set masked not
+// mutated mid-window"). A provider cache is a PREFIX match over
+// tools -> system -> messages, so what the loop is allowed to vary per turn is
+// the tail and nothing else: the tool definitions stay put and forcing happens
+// through `tool_choice`, and the cache routing key is the thread, not the turn.
+// ---------------------------------------------------------------------------
+
+describe("runAgentLoop prompt-cache alignment (DESIGN §4.5/§9)", () => {
+  test("an unforced turn sends every tool and no toolChoice", async () => {
+    const h = harness(
+      [
+        turn({ text: "", toolCalls: [call("c1", "echo")], stopReason: "tool_calls" }),
+        turn({ text: "done" }),
+      ],
+      [echoTool, new ShedContextTool()],
+    );
+    await h.store.append(THREAD, ingress("hello"));
+
+    const result = await h.run();
+    expect(result.stopReason).toBe("completed");
+    for (const req of h.provider.prompts) {
+      expect(req.tools).toEqual(["echo", "shed_context"]);
+      expect(req.toolChoice).toBeUndefined(); // absent = the provider default
+    }
+  });
+
+  test("the first forced turn keeps the tool list AND the cache: no tool_choice", async () => {
+    const h = harness(
+      [
+        turn({ text: "", toolCalls: [call("s1", "shed_context", SHED_ARGS)], stopReason: "tool_calls" }),
+        turn({ text: "resumed" }),
+      ],
+      [echoTool, new ShedContextTool()],
+    );
+    // Over the hard rung (1100 tokens) on the first window, comfortably under
+    // it on the rebuilt one — so the forcing is on exactly one turn.
+    await h.store.append(THREAD, ingress("z".repeat(4400)));
+    const result = await h.run({
+      settings: settings({ advisoryFraction: 0.5, hardFraction: 0.55, approxWindowTokens: 2000 }),
+    });
+    expect(result).toEqual({ turns: 2, stopReason: "completed" });
+
+    const [forced, after] = h.provider.prompts as [Prompt, Prompt];
+    expect(forced.tools).toEqual(["echo", "shed_context"]);
+    // Neither tier is invalidated on the way into the most expensive window a
+    // thread ever has: the appended notice EXTENDS the prefix, while
+    // `tool_choice` would re-bill the whole transcript uncached.
+    expect(forced.toolChoice).toBeUndefined();
+    // Same definitions before and after; only the messages tier grew.
+    expect(after.tools).toEqual(forced.tools);
+    expect(after.toolChoice).toBeUndefined();
+    expect(after.system).toBe(forced.system);
+  });
+
+  test("only the RETRY pays for tool_choice", async () => {
+    // First attempt talks instead of shedding; the second gets the mask, which
+    // is the one moment the guarantee is worth an uncached re-read.
+    const h = harness(
+      [
+        turn({ text: "I would rather not" }),
+        turn({ text: "", toolCalls: [call("s1", "shed_context", SHED_ARGS)], stopReason: "tool_calls" }),
+        turn({ text: "resumed" }),
+      ],
+      [echoTool, new ShedContextTool()],
+    );
+    // Over the hard rung on the first window, under it on the rebuilt one.
+    await h.store.append(THREAD, ingress("z".repeat(4400)));
+    const result = await h.run({
+      settings: settings({ advisoryFraction: 0.5, hardFraction: 0.55, approxWindowTokens: 2000 }),
+    });
+    expect(result.stopReason).toBe("completed");
+
+    const [first, retry] = h.provider.prompts as [Prompt, Prompt];
+    expect(first.toolChoice).toBeUndefined();
+    expect(retry.toolChoice).toEqual({ type: "tool", name: "shed_context" });
+    // The tool LIST never moves, on either attempt.
+    expect(first.tools).toEqual(["echo", "shed_context"]);
+    expect(retry.tools).toEqual(["echo", "shed_context"]);
+    expect(notices(retry.messages).at(-1)).toContain("final attempt");
+  });
+
+  test("every turn carries the same thread-derived cacheKey, restart included", async () => {
+    const h = harness(
+      [
+        turn({ text: "", toolCalls: [call("e1", "echo")], stopReason: "tool_calls" }),
+        turn({ text: "", toolCalls: [call("s1", "shed_context", SHED_ARGS)], stopReason: "tool_calls" }),
+        turn({ text: "done" }),
+      ],
+      [echoTool, new ShedContextTool()],
+    );
+    await h.store.append(THREAD, ingress("hello"));
+
+    const result = await h.run();
+    expect(result.stopReason).toBe("completed");
+    // Identical on every call: a key that moved per turn would scatter one
+    // thread across cache shards, which is the opposite of the point.
+    expect(h.provider.prompts.map((p) => p.cacheKey)).toEqual([
+      "t1/c1/th1",
+      "t1/c1/th1",
+      "t1/c1/th1",
+    ]);
+  });
+
+  test("the cacheKey follows the thread, not the process", async () => {
+    const other: ThreadRef = { tenantId: "t2", channelId: "c9", threadId: "th9" };
+    const h = harness([turn({ text: "ok" })]);
+    await h.run({ thread: other });
+    expect(h.provider.prompts[0]!.cacheKey).toBe("t2/c9/th9");
+  });
+
+  test("a window the event cap truncated forces a shed on the next turn", async () => {
+    // The cap keeps the NEWEST events, so a truncated window's START rolls
+    // forward with every event appended — the prefix changes at the front on
+    // every turn and can never hit a cache again. Treat it as hard pressure:
+    // a shed installs a continuity boundary the cap no longer touches.
+    const h = harness(
+      [
+        turn({ text: "", toolCalls: [call("s1", "shed_context", SHED_ARGS)], stopReason: "tool_calls" }),
+        turn({ text: "resumed" }),
+      ],
+      [echoTool, new ShedContextTool()],
+    );
+    // One event past the cap, and all but the last are audit-only: the window
+    // loads truncated while the PROMPT stays tiny, so truncation is provably
+    // the rung that fired (the token fraction is nowhere near).
+    h.db.seed(THREAD, [
+      ...Array.from({ length: DEFAULT_CONTEXT_EVENT_CAP }, (_, i) => ({
+        type: "error" as const,
+        source: "seed",
+        message: `noise ${i}`,
+        count: 1,
+      })),
+      ingress("the newest question"),
+    ]);
+
+    const result = await h.run();
+    expect(result).toEqual({ turns: 2, stopReason: "completed" });
+
+    const forced = h.provider.prompts[0]!;
+    const tokens = estimateTokens([{ role: "system", text: "sys" }, ...forced.messages]);
+    expect(tokens).toBeLessThan(0.9 * 180_000); // the token rung never fired
+    expect(forced.toolChoice).toBeUndefined(); // first attempt: cache stays warm
+    expect(forced.tools).toEqual(["echo", "shed_context"]);
+    expect(notices(forced.messages)[0]).toContain("context limit reached");
+    // The capped window is still reported in the log (audit-only).
+    expect(
+      h.db.events.some((e) => e.data.type === "error" && e.data.source === "context"),
+    ).toBe(true);
+
+    // The rung re-arms off the rebuilt window: a fresh boundary is not capped.
+    const after = h.provider.prompts[1]!;
+    expect(after.toolChoice).toBeUndefined();
+    expect(notices(after.messages)).toHaveLength(0);
+    expect(h.db.events.some((e) => e.data.type === "continuity")).toBe(true);
+  });
+
+  test("a truncated window with no shed tool degrades to normal operation", async () => {
+    const h = harness([turn({ text: "fine" })], [echoTool]);
+    h.db.seed(THREAD, [
+      ...Array.from({ length: DEFAULT_CONTEXT_EVENT_CAP }, (_, i) => ({
+        type: "error" as const,
+        source: "seed",
+        message: `noise ${i}`,
+        count: 1,
+      })),
+      ingress("still answerable"),
+    ]);
+
+    const result = await h.run();
+    expect(result).toEqual({ turns: 1, stopReason: "completed" });
+    expect(h.provider.prompts[0]!.toolChoice).toBeUndefined();
+    expect(notices(h.provider.prompts[0]!.messages)).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reconstructable requests (DESIGN §3 "prompt = projection", §4.5 cache
+// alignment). A provider cache is a prefix match, so wake N+1's request has to
+// be a byte-EXTENSION of wake N's. That only holds if everything the loop put
+// in front of the model is in the log: the <memories> block and the pressure
+// notices used to live in the run's in-memory array alone, so the next wake
+// rebuilt a different conversation and missed the cache for the whole thread.
+// ---------------------------------------------------------------------------
+
+/**
+ * A run that does BOTH things the projection used to lose: an auto-recall
+ * block at index 0 and an advisory notice mid-conversation.
+ *
+ * window 20 -> advisory at 14, and the <memories> block alone clears that. No
+ * shed tool is registered, so the hard rung falls through to the advisory one.
+ */
+function recallHarness(): { h: Harness; store: RecallStub; opts: HarnessOverrides } {
+  const h = harness(
+    [
+      // Argument names in the model's own order, which is neither sorted nor
+      // jsonb's (length, bytes) — and `aa`/`b` make those two disagree, so the
+      // fixture catches a missing canonicalization at EITHER end.
+      turn({
+        text: "",
+        toolCalls: [call("c1", "echo", { zulu: 1, a: 2, mm: 3, aa: 4, b: 5 })],
+        stopReason: "tool_calls",
+      }),
+      turn({ text: "done" }),
+      turn({ text: "and again" }),
+    ],
+    [echoTool],
+  );
+  // Read back the way Postgres hands jsonb back, not the way JS stored it.
+  h.db.reorderJson = true;
+  const store = new RecallStub({ hits: [memoryHit({ text: "retries use jittered backoff" })] });
+  return {
+    h,
+    store,
+    opts: { memory: memoryContext(store), settings: settings({ approxWindowTokens: 20 }) },
+  };
+}
+
+describe("runAgentLoop reconstructable requests (DESIGN §3/§4.5)", () => {
+  test("the log projects back to exactly the request the provider received", async () => {
+    const { h, store, opts } = recallHarness();
+    await h.store.append(THREAD, ingress("how do we handle provider retries?"));
+
+    const result = await h.run(opts);
+    expect(result).toEqual({ turns: 2, stopReason: "completed" });
+
+    const sent = h.provider.prompts.at(-1)!.messages;
+    expect(sent[0]!.text.startsWith(RECALL_HEAD)).toBe(true); // the block
+    expect(sent.some((m) => m.text.includes("context pressure"))).toBe(true); // the notice
+    expect(store.searches).toHaveLength(1);
+
+    // The whole claim, in one assertion: replaying the log reproduces the last
+    // request byte for byte — plus the reply that request produced.
+    expect(buildContext(h.db.events)).toEqual([
+      ...sent,
+      { role: "assistant", text: "done" },
+    ]);
+  });
+
+  test("the next wake extends that request instead of rewriting it", async () => {
+    const { h, store, opts } = recallHarness();
+    await h.store.append(THREAD, ingress("how do we handle provider retries?"));
+    await h.run(opts);
+    // What the first run finished holding: its last request plus the reply.
+    const finished: LlmMessage[] = [
+      ...h.provider.prompts.at(-1)!.messages,
+      { role: "assistant", text: "done" },
+    ];
+
+    await h.store.append(THREAD, ingress("and what about timeouts?"));
+    await h.run(opts);
+
+    // (a) Recall is once per WINDOW, not once per wake (DESIGN §5.4). A second
+    // live search could return different hits or a different order and move
+    // byte 0 of the conversation.
+    expect(store.searches).toHaveLength(1);
+    expect(memoryEvents(h.db)).toHaveLength(1);
+
+    // (b) Everything the provider already cached comes back unchanged, in the
+    // same slots, with the new turn appended after it.
+    const next = h.provider.prompts.at(-1)!.messages;
+    expect(next.slice(0, finished.length)).toEqual(finished);
+    expect(next[0]!.text).toBe(finished[0]!.text); // byte 0 is the same block
+    expect(next[finished.length]!.text).toContain("and what about timeouts?");
+    // + the ingress, and nothing else: the advisory notice is already in the
+    // window from wake 1, so this wake replays it rather than appending a
+    // second copy (DESIGN §4.1 — once per WINDOW).
+    expect(next).toHaveLength(finished.length + 1);
+    expect(next.filter((m) => m.text.includes("context pressure"))).toHaveLength(1);
+
+    // (c) BYTES, not shapes. `args` is the one part of a tool call a provider
+    // serializes wholesale (Anthropic `input`, OpenAI `arguments`), and jsonb
+    // handed it back in a different key order than the model wrote it in — one
+    // byte's difference in a `tool_use` block breaks the prefix match from
+    // there to the end of the transcript. Both ends canonicalize, so wake 2
+    // re-serializes wake 1's call identically.
+    const argBytes = (msgs: LlmMessage[]): string[] =>
+      msgs.flatMap((m) => (m.toolCalls ?? []).map((c) => JSON.stringify(c.args)));
+    expect(argBytes(next.slice(0, finished.length))).toEqual(argBytes(finished));
+    expect(argBytes(finished)).toEqual(['{"a":2,"aa":4,"b":5,"mm":3,"zulu":1}']);
+  });
+
+  test("three wakes above the advisory line produce exactly ONE notice", async () => {
+    // The reviewer's reproduction. `advisoryArmed` used to start `true` every
+    // run, but notices are journaled and replayed — so each wake appended
+    // another identical one and the window walked toward the hard rung on
+    // harness text alone.
+    const h = harness(() => turn({ text: "still here" }), [echoTool]);
+    await h.store.append(THREAD, ingress("x".repeat(64))); // window 20 -> over 14
+    const opts = { settings: settings({ approxWindowTokens: 20 }) };
+
+    for (let wake = 0; wake < 3; wake++) {
+      await h.store.append(THREAD, ingress(`wake ${wake}`));
+      await h.run(opts);
+    }
+
+    expect(h.provider.prompts).toHaveLength(3);
+    for (const req of h.provider.prompts) expect(notices(req.messages)).toHaveLength(1);
+    expect(h.db.events.filter((e) => e.data.type === "notice")).toHaveLength(1);
+    // Same slot every time, which is the point: the notice is part of the
+    // prefix the provider cached on wake 1.
+    const slot = h.provider.prompts[0]!.messages.findIndex((m) => m.text.startsWith("[harness notice]"));
+    for (const req of h.provider.prompts) {
+      expect(req.messages.findIndex((m) => m.text.startsWith("[harness notice]"))).toBe(slot);
+    }
+  });
+
+  test("a shed opens a fresh window with its own block, and later wakes reuse it", async () => {
+    const h = harness(
+      [
+        turn({ text: "", toolCalls: [call("s1", "shed_context", SHED_ARGS)], stopReason: "tool_calls" }),
+        turn({ text: "resumed" }),
+        turn({ text: "still here" }),
+      ],
+      [echoTool, new ShedContextTool()],
+    );
+    await h.store.append(THREAD, ingress("widget pricing question"));
+    const store = new RecallStub({
+      hitsByCall: [
+        [memoryHit({ text: "the OLD window block" })],
+        [memoryHit({ text: "the FRESH window block" })],
+      ],
+    });
+
+    const result = await h.run({ memory: memoryContext(store) });
+    expect(result).toEqual({ turns: 2, stopReason: "completed" });
+
+    // Recall ran once per window: the initial one and the post-shed one.
+    const mem = memoryEvents(h.db);
+    expect(mem).toHaveLength(2);
+    expect(mem[0]!.block).toContain("the OLD window block");
+    expect(mem[1]!.block).toContain("the FRESH window block");
+
+    // The post-shed window opens with the FRESH block; the pre-boundary one is
+    // gone, exactly as the pre-boundary transcript is.
+    const projected = buildContext(h.db.events);
+    expect(projected[0]!.text).toBe(mem[1]!.block as string);
+    expect(projected.some((m) => m.text.includes("the OLD window block"))).toBe(false);
+
+    // A later wake on that window reproduces it from the log — no third search.
+    await h.run({ memory: memoryContext(store) });
+    expect(store.searches).toHaveLength(2);
+    expect(h.provider.prompts.at(-1)!.messages[0]!.text).toBe(mem[1]!.block as string);
   });
 });

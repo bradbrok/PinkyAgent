@@ -323,21 +323,81 @@ describe("autoRecall", () => {
   test("returns the block and journals a memory event when there are hits", async () => {
     const store = new StubStore({ hits: [hit({ text: "use jittered backoff", score: 0.9 })] });
     const rec = recorder();
-    const block = await run(context(store), rec);
+    const result = await run(context(store), rec);
 
-    expect(block).toContain("use jittered backoff");
+    expect(result).not.toBeNull();
+    expect(result!.block).toContain("use jittered backoff");
     expect(store.searches[0]).toMatchObject({ scope: SCOPE, query: "retry policy", limit: 12 });
     expect(store.searches[0]!.queryEmbedding).toBeUndefined();
+    // `block` is the injected text VERBATIM: the projection replays it on the
+    // next wake instead of re-searching, so it has to be byte-identical to
+    // what was returned here (DESIGN.md §3 prompt = projection, §4.5). `scope`
+    // records how wide the search was allowed to look (§5.1), because a later
+    // wake on a narrower surface must not inherit this block.
     expect(rec.events).toEqual([
-      { type: "memory", op: "recall", ids: ["m" + nextId], text: "retry policy", count: 1 },
+      {
+        type: "memory",
+        op: "recall",
+        ids: ["m" + nextId],
+        text: "retry policy",
+        count: 1,
+        block: result!.block,
+        scope: { includeUser: false, includePrivate: false },
+      },
     ]);
   });
 
-  test("no hits: no block, no event", async () => {
+  test("no hits: an empty block, and the event is journaled anyway", async () => {
+    // The event is the loop's RECEIPT that auto-recall ran in this window, not
+    // a log line about hits. Skipping it on an empty memory plane is what let
+    // the next wake — after one retain — unshift a block at index 0 and cold-
+    // start the provider's prefix cache for the whole thread (DESIGN.md §4.5).
     const store = new StubStore({ hits: [] });
     const rec = recorder();
-    expect(await run(context(store), rec)).toBeNull();
-    expect(rec.events).toEqual([]);
+    expect(await run(context(store), rec)).toEqual({ block: "" });
+
+    expect(rec.events).toEqual([
+      {
+        type: "memory",
+        op: "recall",
+        ids: [],
+        text: "retry policy",
+        count: 0,
+        block: "",
+        scope: { includeUser: false, includePrivate: false },
+      },
+    ]);
+  });
+
+  test("nothing injected: the `block` key is present and empty", async () => {
+    // Candidates existed but none fit the budget, so the prompt got nothing.
+    // The KEY must still be there: it is what the loop's once-per-window gate
+    // reads, and "ran, injected nothing" has to be distinguishable from "never
+    // ran" — which is the absence of any such event, not an absent key.
+    const store = new StubStore({ hits: [hit({ text: "x".repeat(400) })] });
+    const rec = recorder();
+    expect(await run(context(store), rec, { tokenBudget: 5 })).toEqual({ block: "" });
+
+    expect(rec.events).toHaveLength(1);
+    const ev = rec.events[0] as Extract<ThreadEventData, { type: "memory" }>;
+    expect(ev).toMatchObject({ type: "memory", op: "recall", ids: [], count: 1 });
+    expect(Object.keys(ev)).toContain("block");
+    expect(ev.block).toBe("");
+  });
+
+  test("the journaled scope mirrors the width the search ran under (§5.1)", async () => {
+    const store = new StubStore({ hits: [hit({ text: "a private note", score: 0.9 })] });
+    const rec = recorder();
+    const wide: MemoryContext = {
+      store: store as unknown as MemoryStore,
+      scope: { ...SCOPE, userId: "u1", includeUser: true, includePrivate: true },
+    };
+    await run(wide, rec);
+
+    const ev = rec.events[0] as Extract<ThreadEventData, { type: "memory" }>;
+    // Only the two width flags: agentId/channelId/userId are fixed by the
+    // thread and the agent, so they cannot differ between wakes.
+    expect(ev.scope).toEqual({ includeUser: true, includePrivate: true });
   });
 
   test("embeds the query only when the store supports vectors", async () => {
@@ -368,9 +428,9 @@ describe("autoRecall", () => {
     const embedder = new StubEmbedder(new Error("402 no credits"));
     const store = new StubStore({ vectors: true, hits: [hit({ text: "still recalled" })] });
     const rec = recorder();
-    const block = await run(context(store, embedder), rec);
+    const result = await run(context(store, embedder), rec);
 
-    expect(block).toContain("still recalled");
+    expect(result!.block).toContain("still recalled");
     expect(store.searches[0]!.queryEmbedding).toBeUndefined();
     const err = rec.events[0] as Extract<ThreadEventData, { type: "error" }>;
     expect(err).toMatchObject({ type: "error", source: "memory", count: 1 });
@@ -388,10 +448,15 @@ describe("autoRecall", () => {
     expect(rec.events[0]).toMatchObject({ type: "error", source: "memory" });
   });
 
-  test("store failure journals an error and returns null (never throws)", async () => {
+  test("store failure journals an error, no recall event, and returns null", async () => {
+    // The ONE path that leaves the window unclaimed: null and no `memory`
+    // event, so the next wake recalls again. A broken store is worth retrying
+    // even at the price of a moved byte 0 — the opposite trade from "recalled
+    // and found nothing", which is journaled and never retried.
     const store = new StubStore({ searchError: new Error("connection reset") });
     const rec = recorder();
     expect(await run(context(store), rec)).toBeNull();
+    expect(rec.events.some((e) => e.type === "memory")).toBe(false);
     expect(rec.events).toHaveLength(1);
     const err = rec.events[0] as Extract<ThreadEventData, { type: "error" }>;
     expect(err).toMatchObject({ type: "error", source: "memory", count: 1 });
@@ -404,9 +469,9 @@ describe("autoRecall", () => {
       hit({ text: `B ${"b".repeat(200)}`, score: 0.8 }),
     ];
     const rec = recorder();
-    const block = await run(context(new StubStore({ hits })), rec, { tokenBudget: 110 });
-    expect(block).toContain("A a");
-    expect(block).not.toContain("B b");
+    const result = await run(context(new StubStore({ hits })), rec, { tokenBudget: 110 });
+    expect(result!.block).toContain("A a");
+    expect(result!.block).not.toContain("B b");
     const ev = rec.events[0] as Extract<ThreadEventData, { type: "memory" }>;
     expect(ev.ids).toEqual([hits[0]!.id]);
     expect(ev.count).toBe(2);
@@ -422,14 +487,14 @@ describe("autoRecall", () => {
 
     // (1) the memory event on the happy path
     const ok = new StubStore({ hits: [hit({ text: "still returned", score: 0.9 })] });
-    const block = await autoRecall({
+    const result = await autoRecall({
       memory: context(ok),
       query: "retry policy",
       limit: 12,
       tokenBudget: 5_000,
       emit: dead,
     });
-    expect(block).toContain("still returned");
+    expect(result!.block).toContain("still returned");
 
     // (2) the error event on the store-failure path
     const broken = new StubStore({ searchError: new Error("connection reset") });
@@ -447,15 +512,14 @@ describe("autoRecall", () => {
     // retry still has to happen after it.
     const embedder = new StubEmbedder(new Error("402 no credits"));
     const degraded = new StubStore({ vectors: true, hits: [hit({ text: "fts only", score: 0.9 })] });
-    expect(
-      await autoRecall({
-        memory: context(degraded, embedder),
-        query: "retry policy",
-        limit: 12,
-        tokenBudget: 5_000,
-        emit: dead,
-      }),
-    ).toContain("fts only");
+    const fts = await autoRecall({
+      memory: context(degraded, embedder),
+      query: "retry policy",
+      limit: 12,
+      tokenBudget: 5_000,
+      emit: dead,
+    });
+    expect(fts!.block).toContain("fts only");
   });
 
   test("an aborted signal short-circuits without touching the store", async () => {

@@ -35,6 +35,15 @@ export interface ToolSpec {
   parameters: Record<string, unknown>;
 }
 
+/**
+ * Provider-side tool forcing. The tool LIST stays in the request either way:
+ * swapping the list invalidates every provider cache tier (tools render at
+ * position 0), while `tool_choice` invalidates only the messages tier — so the
+ * loop masks with this, never by sending a shorter `tools` (DESIGN.md §4.5/§9
+ * "tool set masked not mutated mid-window").
+ */
+export type ToolChoice = { type: "auto" } | { type: "none" } | { type: "tool"; name: string };
+
 export interface CompleteOptions {
   model: string; // bare model id (provider prefix stripped)
   system: string;
@@ -43,6 +52,14 @@ export interface CompleteOptions {
   maxTokens?: number;
   temperature?: number;
   signal?: AbortSignal;
+  /** Absent means the provider default ("auto"). */
+  toolChoice?: ToolChoice;
+  /**
+   * Stable per-thread key for providers that ROUTE prompt caches by key
+   * (OpenAI `prompt_cache_key`). Anthropic and DeepSeek key on the prefix
+   * bytes alone and ignore it. Never part of the prompt text.
+   */
+  cacheKey?: string;
 }
 
 export interface AssistantTurn {

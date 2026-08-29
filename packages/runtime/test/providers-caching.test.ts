@@ -83,9 +83,17 @@ describe("AnthropicProvider request shape", () => {
     const blocks = body.system as { text: string; cache_control?: unknown }[];
     expect(blocks[0]!.text).not.toContain("mid-conversation");
     expect(blocks[1]!.cache_control).toBeUndefined();
-    // Suffix text stays out of the messages array (it is system-role, not a turn).
+    // Suffix text stays out of the messages array (it is system-role, not a
+    // turn). The single message's last block carries the conversation
+    // breakpoint — see "AnthropicProvider conversation caching" below.
     expect(body.messages).toEqual([
-      { role: "user", content: [{ type: "text", text: "hi" }, { type: "text", text: "again" }] },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "hi" },
+          { type: "text", text: "again", cache_control: { type: "ephemeral" } },
+        ],
+      },
     ]);
   });
 
@@ -256,5 +264,451 @@ describe("createProvider fake route", () => {
 
   test("fake is listed as a supported provider", () => {
     expect(SUPPORTED_PROVIDERS).toContain("fake");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OpenAI-compatible prompt caching (automatic prefix caching).
+// Nothing is sent to opt in — only a byte-stable prefix and, on OpenAI, the
+// `prompt_cache_key` routing hint. The work is on the way back: these routes
+// count cached tokens INSIDE `prompt_tokens`, while `TokenUsage` is disjoint
+// (input + cacheRead + cacheCreation = total prompt), which is the convention
+// `pinky stats restarts` divides by.
+// ---------------------------------------------------------------------------
+describe("OpenAIProvider cache usage mapping", () => {
+  /** Drive one stream whose final chunk carries `usage`, return the turn's usage. */
+  async function usageFrom(usageJson: string) {
+    const stream =
+      'data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}\n\n' +
+      `data: {"choices":[],"usage":${usageJson}}\n\n` +
+      OPENAI_DONE;
+    const provider = new OpenAIProvider({
+      apiKey: "k",
+      baseUrl: "https://oai.test/v1",
+      fetchFn: (async () => sseResponse(stream)) as unknown as typeof fetch,
+    });
+    return (await provider.complete(OPTS)).usage;
+  }
+
+  test("OpenAI/OpenRouter: cached_tokens becomes cacheRead and leaves input uncached", async () => {
+    expect(
+      await usageFrom(
+        '{"prompt_tokens":1200,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":1000}}',
+      ),
+    ).toEqual({ input: 200, output: 20, cacheRead: 1000 });
+  });
+
+  test("DeepSeek: cacheRead is the hit count and input is exactly the miss count", async () => {
+    // prompt_tokens = hit + miss on this route, so the subtraction must
+    // reproduce prompt_cache_miss_tokens without ever reading that field.
+    expect(
+      await usageFrom(
+        '{"prompt_tokens":1000,"completion_tokens":7,"prompt_cache_hit_tokens":768,"prompt_cache_miss_tokens":232}',
+      ),
+    ).toEqual({ input: 232, output: 7, cacheRead: 768 });
+  });
+
+  test("OpenRouter Anthropic passthrough: cache_write_tokens becomes cacheCreation", async () => {
+    expect(
+      await usageFrom(
+        '{"prompt_tokens":1500,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":1000,"cache_write_tokens":300}}',
+      ),
+    ).toEqual({ input: 200, output: 9, cacheRead: 1000, cacheCreation: 300 });
+  });
+
+  test("a route reporting no cache counters leaves the KEYS ABSENT, not undefined", async () => {
+    // "nothing was cached" and "nobody counted" are different answers to the
+    // DESIGN §13 cost question — cacheWriteShare() in the CLI keys on null.
+    const usage = (await usageFrom('{"prompt_tokens":300,"completion_tokens":4}'))!;
+    expect(usage).toEqual({ input: 300, output: 4 });
+    expect("cacheRead" in usage).toBe(false);
+    expect("cacheCreation" in usage).toBe(false);
+  });
+
+  test("miscounting route cannot push input negative", async () => {
+    expect(
+      await usageFrom(
+        '{"prompt_tokens":100,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":900}}',
+      ),
+    ).toEqual({ input: 0, output: 1, cacheRead: 900 });
+  });
+});
+
+describe("OpenAIProvider prompt_cache_key", () => {
+  const provider = (fetchFn: typeof fetch, promptCacheKey?: boolean) =>
+    new OpenAIProvider({
+      apiKey: "k",
+      baseUrl: "https://oai.test/v1",
+      fetchFn,
+      ...(promptCacheKey === undefined ? {} : { promptCacheKey }),
+    });
+
+  test("sends the caller's cacheKey verbatim", async () => {
+    const { fetchFn, read } = capturing(OPENAI_DONE);
+    await provider(fetchFn).complete({ ...OPTS, cacheKey: "tenant/chan/thread" });
+    expect(read().prompt_cache_key).toBe("tenant/chan/thread");
+  });
+
+  test("omitted when the caller supplies none", async () => {
+    const { fetchFn, read } = capturing(OPENAI_DONE);
+    await provider(fetchFn).complete(OPTS);
+    expect(read()).not.toHaveProperty("prompt_cache_key");
+  });
+
+  test("promptCacheKey=false omits it even when supplied (endpoints that reject unknown fields)", async () => {
+    const { fetchFn, read } = capturing(OPENAI_DONE);
+    await provider(fetchFn, false).complete({ ...OPTS, cacheKey: "tenant/chan/thread" });
+    expect(read()).not.toHaveProperty("prompt_cache_key");
+  });
+});
+
+describe("OpenAIProvider tool_choice", () => {
+  const TOOLS = [{ name: "recall", description: "d", parameters: { type: "object" } }];
+  const withTools = { ...OPTS, tools: TOOLS };
+
+  async function bodyFor(opts: CompleteOptions): Promise<Record<string, unknown>> {
+    const { fetchFn, read } = capturing(OPENAI_DONE);
+    await new OpenAIProvider({ apiKey: "k", baseUrl: "https://oai.test/v1", fetchFn }).complete(opts);
+    return read();
+  }
+
+  test('{type:"auto"} → "auto"', async () => {
+    expect((await bodyFor({ ...withTools, toolChoice: { type: "auto" } })).tool_choice).toBe("auto");
+  });
+
+  test('{type:"none"} → "none"', async () => {
+    expect((await bodyFor({ ...withTools, toolChoice: { type: "none" } })).tool_choice).toBe("none");
+  });
+
+  test('{type:"tool"} → the OpenAI function shape', async () => {
+    const body = await bodyFor({ ...withTools, toolChoice: { type: "tool", name: "shed_context" } });
+    expect(body.tool_choice).toEqual({ type: "function", function: { name: "shed_context" } });
+    // The tool LIST is unchanged: masking must not invalidate the tools cache tier.
+    expect((body.tools as unknown[]).length).toBe(1);
+  });
+
+  test("omitted when the caller sets none, and when there are no tools to choose from", async () => {
+    expect(await bodyFor(withTools)).not.toHaveProperty("tool_choice");
+    expect(await bodyFor({ ...OPTS, toolChoice: { type: "none" } })).not.toHaveProperty("tool_choice");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Conversation cache breakpoints (the rolling two-message window), the ttl
+// knob, and tool_choice. Imports live here rather than at the head of the file
+// because this block was appended alongside another author's; ESM hoists them.
+// ---------------------------------------------------------------------------
+import {
+  applyMessageCacheBreakpoints,
+  cacheControl,
+  toAnthropicToolChoice,
+  type AnthropicMessage,
+} from "../src/providers/anthropic";
+import { anthropicCacheTtlFromEnv } from "../src/providers/index";
+
+/** Every cache_control anywhere in the request, however deeply nested. */
+function markers(value: unknown, found: Record<string, unknown>[] = []): Record<string, unknown>[] {
+  if (Array.isArray(value)) {
+    for (const item of value) markers(item, found);
+    return found;
+  }
+  if (value && typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    if (obj.cache_control) found.push(obj.cache_control as Record<string, unknown>);
+    for (const child of Object.values(obj)) markers(child, found);
+  }
+  return found;
+}
+
+const TOOL = { name: "t", description: "d", parameters: { type: "object" } };
+
+/** user "hi" / assistant text+tool_use / (tool_result + user) — 3 messages. */
+const CONVERSATION: CompleteOptions = {
+  ...OPTS,
+  tools: [TOOL],
+  messages: [
+    { role: "user", text: "hi" },
+    { role: "assistant", text: "sure", toolCalls: [{ id: "c1", name: "t", args: { a: 1 } }] },
+    { role: "tool", toolCallId: "c1", text: "ok" },
+    { role: "user", text: "next" },
+  ],
+};
+
+describe("applyMessageCacheBreakpoints", () => {
+  const msgs = (): AnthropicMessage[] => [
+    { role: "user", content: [{ type: "text", text: "one" }] },
+    { role: "assistant", content: [{ type: "text", text: "two" }] },
+    { role: "user", content: [{ type: "text", text: "three" }, { type: "text", text: "four" }] },
+  ];
+
+  test("marks the last content block of the last two messages", () => {
+    expect(applyMessageCacheBreakpoints(msgs())).toEqual([
+      { role: "user", content: [{ type: "text", text: "one" }] },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "two", cache_control: { type: "ephemeral" } }],
+      },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "three" },
+          { type: "text", text: "four", cache_control: { type: "ephemeral" } },
+        ],
+      },
+    ]);
+  });
+
+  test("a single-message conversation gets exactly one marker", () => {
+    const out = applyMessageCacheBreakpoints([
+      { role: "user", content: [{ type: "text", text: "only" }] },
+    ]);
+    expect(markers(out)).toEqual([{ type: "ephemeral" }]);
+  });
+
+  test("no messages, or cache off, means no markers", () => {
+    expect(applyMessageCacheBreakpoints([])).toEqual([]);
+    expect(markers(applyMessageCacheBreakpoints(msgs(), false))).toEqual([]);
+  });
+
+  test("skips content-less messages and keeps looking back", () => {
+    const out = applyMessageCacheBreakpoints([
+      { role: "user", content: [{ type: "text", text: "one" }] },
+      { role: "assistant", content: [{ type: "text", text: "two" }] },
+      { role: "user", content: [] },
+    ]);
+    expect(markers(out)).toHaveLength(2);
+    expect(out[0]!.content[0]!.cache_control).toEqual({ type: "ephemeral" });
+    expect(out[1]!.content[0]!.cache_control).toEqual({ type: "ephemeral" });
+  });
+
+  test("is pure: the caller's messages and blocks are never stamped", () => {
+    const input = msgs();
+    const snapshot = JSON.stringify(input);
+    applyMessageCacheBreakpoints(input, true, "1h");
+    expect(JSON.stringify(input)).toBe(snapshot);
+  });
+
+  test("the ttl reaches every marker (mixed TTLs are not a thing)", () => {
+    expect(markers(applyMessageCacheBreakpoints(msgs(), true, "1h"))).toEqual([
+      { type: "ephemeral", ttl: "1h" },
+      { type: "ephemeral", ttl: "1h" },
+    ]);
+    expect(cacheControl()).toEqual({ type: "ephemeral" });
+    expect(cacheControl("5m")).toEqual({ type: "ephemeral" });
+    expect(cacheControl("1h")).toEqual({ type: "ephemeral", ttl: "1h" });
+  });
+});
+
+describe("toAnthropicToolChoice", () => {
+  test("maps all three shapes and omits when absent", () => {
+    expect(toAnthropicToolChoice(undefined)).toBeUndefined();
+    expect(toAnthropicToolChoice({ type: "auto" })).toEqual({ type: "auto" });
+    expect(toAnthropicToolChoice({ type: "none" })).toEqual({ type: "none" });
+    expect(toAnthropicToolChoice({ type: "tool", name: "recall" })).toEqual({
+      type: "tool",
+      name: "recall",
+    });
+  });
+});
+
+describe("AnthropicProvider conversation caching", () => {
+  const provider = (opts: Record<string, unknown> = {}, fetchFn?: typeof fetch): AnthropicProvider =>
+    new AnthropicProvider({
+      apiKey: "k",
+      baseUrl: "https://api.test",
+      ...(fetchFn ? { fetchFn } : {}),
+      ...opts,
+    });
+
+  test("the request carries at most 3 markers: system + the last two messages", async () => {
+    const { fetchFn, read } = capturing(ANTHROPIC_DONE);
+    await provider({}, fetchFn).complete(CONVERSATION);
+    const body = read();
+    const all = markers(body);
+    expect(all).toHaveLength(3);
+    expect(all.length).toBeLessThanOrEqual(4); // the API's hard limit
+    expect(markers(body.system)).toHaveLength(1);
+    expect(markers(body.messages)).toHaveLength(2);
+    // ...on the LAST block of each of the last two messages, nowhere else.
+    const msgs = body.messages as AnthropicMessage[];
+    expect(markers(msgs[0])).toHaveLength(0);
+    expect(msgs[1]!.content.at(-1)!.cache_control).toEqual({ type: "ephemeral" });
+    expect(msgs[2]!.content.at(-1)!.cache_control).toEqual({ type: "ephemeral" });
+    expect(msgs[2]!.content[0]!.cache_control).toBeUndefined();
+  });
+
+  test("cache:false emits no marker anywhere (proxies that reject cache_control)", async () => {
+    const off = capturing(ANTHROPIC_DONE);
+    await provider({ cache: false }, off.fetchFn).complete(CONVERSATION);
+    expect(markers(off.read())).toEqual([]);
+
+    // `cacheSystem` is the legacy name and still gates the whole request.
+    const alias = capturing(ANTHROPIC_DONE);
+    await provider({ cacheSystem: false }, alias.fetchFn).complete(CONVERSATION);
+    expect(markers(alias.read())).toEqual([]);
+    expect(provider({ cacheSystem: false }).cache).toBe(false);
+    expect(provider({ cache: true, cacheSystem: false }).cache).toBe(true);
+    expect(provider().cache).toBe(true);
+  });
+
+  test("cacheTtl:1h stamps every marker; default is the bare 5m form", async () => {
+    const hour = capturing(ANTHROPIC_DONE);
+    await provider({ cacheTtl: "1h" }, hour.fetchFn).complete(CONVERSATION);
+    const stamped = markers(hour.read());
+    expect(stamped).toHaveLength(3);
+    expect(stamped).toEqual([
+      { type: "ephemeral", ttl: "1h" },
+      { type: "ephemeral", ttl: "1h" },
+      { type: "ephemeral", ttl: "1h" },
+    ]);
+    expect(provider().cacheTtl).toBe("5m");
+
+    const short = capturing(ANTHROPIC_DONE);
+    await provider({}, short.fetchFn).complete(CONVERSATION);
+    for (const marker of markers(short.read())) expect(marker).not.toHaveProperty("ttl");
+  });
+
+  test("tool_choice: mapped when tools are present, omitted otherwise", async () => {
+    for (const [choice, expected] of [
+      [{ type: "auto" }, { type: "auto" }],
+      [{ type: "none" }, { type: "none" }],
+      [{ type: "tool", name: "t" }, { type: "tool", name: "t" }],
+    ] as const) {
+      const { fetchFn, read } = capturing(ANTHROPIC_DONE);
+      await provider({}, fetchFn).complete({ ...CONVERSATION, toolChoice: choice });
+      expect(read().tool_choice).toEqual(expected);
+    }
+
+    // Absent -> field omitted (the provider default stands).
+    const bare = capturing(ANTHROPIC_DONE);
+    await provider({}, bare.fetchFn).complete(CONVERSATION);
+    expect(bare.read()).not.toHaveProperty("tool_choice");
+
+    // No tools -> omitted even when set: the API rejects the pairing.
+    const toolless = capturing(ANTHROPIC_DONE);
+    await provider({}, toolless.fetchFn).complete({
+      ...OPTS,
+      tools: [],
+      toolChoice: { type: "tool", name: "t" },
+    });
+    expect(toolless.read()).not.toHaveProperty("tool_choice");
+    expect(toolless.read()).not.toHaveProperty("tools");
+  });
+
+  test("payload snapshot: the exact bytes a tool-using turn posts", async () => {
+    const { fetchFn, read } = capturing(ANTHROPIC_DONE);
+    await provider({}, fetchFn).complete({ ...CONVERSATION, toolChoice: { type: "tool", name: "t" } });
+    expect(read()).toEqual({
+      model: "test-model",
+      max_tokens: 64_000,
+      stream: true,
+      system: [{ type: "text", text: "STABLE PREFIX", cache_control: { type: "ephemeral" } }],
+      tools: [{ name: "t", description: "d", input_schema: { type: "object" } }],
+      tool_choice: { type: "tool", name: "t" },
+      messages: [
+        { role: "user", content: [{ type: "text", text: "hi" }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "sure" },
+            {
+              type: "tool_use",
+              id: "c1",
+              name: "t",
+              input: { a: 1 },
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "c1", content: "ok" },
+            { type: "text", text: "next", cache_control: { type: "ephemeral" } },
+          ],
+        },
+      ],
+    });
+  });
+
+  test("tolerates the per-ttl cache_creation breakdown without inventing fields", async () => {
+    const stream =
+      'event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":7,"cache_read_input_tokens":800,"cache_creation_input_tokens":30,"cache_creation":{"ephemeral_5m_input_tokens":30,"ephemeral_1h_input_tokens":0}}}}\n\n' +
+      'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\n';
+    const turn = await provider(
+      {},
+      (async () => sseResponse(stream)) as unknown as typeof fetch,
+    ).complete(OPTS);
+    expect(turn.usage).toEqual({ input: 7, output: 2, cacheRead: 800, cacheCreation: 30 });
+  });
+});
+
+describe("PINKY_ANTHROPIC_CACHE_TTL", () => {
+  test("reaches the provider; anything but 5m/1h throws at construction", () => {
+    expect(anthropicCacheTtlFromEnv({})).toBeUndefined();
+    expect(anthropicCacheTtlFromEnv({ PINKY_ANTHROPIC_CACHE_TTL: "" })).toBeUndefined();
+    expect(anthropicCacheTtlFromEnv({ PINKY_ANTHROPIC_CACHE_TTL: " 1H " })).toBe("1h");
+
+    const env = { ANTHROPIC_API_KEY: "a", PINKY_ANTHROPIC_CACHE_TTL: "1h" };
+    expect((createProvider("anthropic/claude-opus-5", env) as AnthropicProvider).cacheTtl).toBe("1h");
+    expect(
+      (createProvider("anthropic/claude-opus-5", { ANTHROPIC_API_KEY: "a" }) as AnthropicProvider)
+        .cacheTtl,
+    ).toBe("5m");
+    expect(() =>
+      createProvider("anthropic/claude-opus-5", { PINKY_ANTHROPIC_CACHE_TTL: "2h" }),
+    ).toThrow(/PINKY_ANTHROPIC_CACHE_TTL must be "5m" or "1h"/);
+  });
+});
+
+describe("PINKY_LLM_PROMPT_CACHE_KEY", () => {
+  const OPENROUTER_MODEL = "openrouter/moonshotai/kimi-k2";
+
+  /** Drive a real route end to end: env -> createProvider -> posted body. */
+  async function bodyFrom(
+    model: string,
+    env: Record<string, string | undefined>,
+  ): Promise<Record<string, unknown>> {
+    const { fetchFn, read } = capturing(OPENAI_DONE);
+    const provider = createProvider(model, env) as OpenAIProvider;
+    // The factory owns baseUrl/headers; only the socket is swapped out.
+    (provider as unknown as { fetchFn: typeof fetch }).fetchFn = fetchFn;
+    await provider.complete({ ...OPTS, cacheKey: "tenant/chan/thread" });
+    return read();
+  }
+
+  const KEYS = { OPENAI_API_KEY: "o", OPENROUTER_API_KEY: "r" };
+  const LOCAL_BASE_URL = "http://localhost:8000/v1";
+
+  // `prompt_cache_key` is an OpenAI-native field, so the default follows the
+  // one route that is known to accept it: real api.openai.com.
+  test("defaults on for plain openai/, off for a custom base URL and for openrouter/", async () => {
+    expect((await bodyFrom("openai/gpt-4o", KEYS)).prompt_cache_key).toBe("tenant/chan/thread");
+
+    // A local vLLM / llama.cpp / LM Studio / Azure endpoint would 400 on the
+    // unknown top-level field, so an OPENAI_BASE_URL override turns it off.
+    expect(
+      await bodyFrom("openai/gpt-4o", { ...KEYS, OPENAI_BASE_URL: LOCAL_BASE_URL }),
+    ).not.toHaveProperty("prompt_cache_key");
+    expect(await bodyFrom(OPENROUTER_MODEL, KEYS)).not.toHaveProperty("prompt_cache_key");
+  });
+
+  test("the env var, when set, wins on every route", async () => {
+    const on = { ...KEYS, PINKY_LLM_PROMPT_CACHE_KEY: "true" };
+    expect((await bodyFrom(OPENROUTER_MODEL, on)).prompt_cache_key).toBe("tenant/chan/thread");
+    expect(
+      (await bodyFrom("openai/gpt-4o", { ...on, OPENAI_BASE_URL: LOCAL_BASE_URL }))
+        .prompt_cache_key,
+    ).toBe("tenant/chan/thread");
+
+    const off = { ...KEYS, PINKY_LLM_PROMPT_CACHE_KEY: "false" };
+    expect(await bodyFrom("openai/gpt-4o", off)).not.toHaveProperty("prompt_cache_key");
+    expect(await bodyFrom(OPENROUTER_MODEL, off)).not.toHaveProperty("prompt_cache_key");
+  });
+
+  test("anything but a boolean throws at construction", () => {
+    expect(() => createProvider("openai/gpt-4o", { PINKY_LLM_PROMPT_CACHE_KEY: "sometimes" })).toThrow(
+      /PINKY_LLM_PROMPT_CACHE_KEY must be a boolean/,
+    );
   });
 });

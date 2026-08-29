@@ -162,21 +162,45 @@ export interface AutoRecallOptions {
 }
 
 /**
+ * What one auto-recall pass produced. The OBJECT means "the pass ran and is
+ * journaled"; `block` is what to inject, `""` when there was nothing to inject.
+ * `null` from {@link autoRecall} means the pass did not journal anything and
+ * the window is still open for a retry on the next wake.
+ */
+export interface AutoRecallResult {
+  block: string;
+}
+
+/**
  * One recall for the loop, at context start and after each restart. Never
  * throws.
  *
  * Degradation ladder:
  * - embedder (or the vector-support probe) fails → `error` event, retry the
  *   search FTS-only. A dead embedding provider must not silence memory.
- * - the store fails → `error` event, return null. There is nothing to inject.
+ * - the store fails → `error` event, return null and journal NO recall event.
+ *   Nothing was injected and nothing claims the window, so the next wake tries
+ *   again: for a broken store, eventual recall beats prefix stability. That is
+ *   the ONLY path that returns null.
  *
- * Emits `{ type: "memory", op: "recall" }` whenever the search returned
- * candidates: `ids` are the hits that made it past the budget cut (what the
- * model actually saw) and `count` is the candidate total before it, so the log
- * shows when the budget was the binding constraint. `memory` events are
- * audit-only — buildContext never renders them (DESIGN.md §5.3).
+ * Every other outcome emits `{ type: "memory", op: "recall" }` — including zero
+ * hits and "candidates existed but none fit the budget". `ids` are the hits
+ * that made it past the budget cut (what the model actually saw), `count` is
+ * the candidate total before it (so the log shows when the budget was the
+ * binding constraint), `scope` is the §5.1 width the search ran under, and
+ * `block` is the rendered text verbatim, `""` when nothing was injected.
+ *
+ * The event is UNCONDITIONAL on this path because it is the loop's receipt, not
+ * a log line: the loop's "already recalled in this window?" gate reads the
+ * presence of `block`, so a wake that recalled into an empty memory plane and
+ * journaled nothing would leave the gate open, and the next wake — after one
+ * `retain` — would unshift a block at index 0 and invalidate the entire cached
+ * prefix (DESIGN.md §4.5). The projection replays the FIRST such event in a
+ * window at index 0 and skips the rest, which is what makes recall run once per
+ * WINDOW rather than once per wake (§5.4). Everything else about a `memory`
+ * event stays audit-only (§5.3).
  */
-export async function autoRecall(opts: AutoRecallOptions): Promise<string | null> {
+export async function autoRecall(opts: AutoRecallOptions): Promise<AutoRecallResult | null> {
   const { memory, query } = opts;
   if (opts.signal?.aborted) return null;
 
@@ -237,14 +261,27 @@ export async function autoRecall(opts: AutoRecallOptions): Promise<string | null
     return null;
   }
 
-  if (hits.length === 0) return null;
-  const block = renderMemoriesBlock(hits, opts.tokenBudget);
+  const rendered = renderMemoriesBlock(hits, opts.tokenBudget);
+  const block = rendered?.text ?? "";
   await emit({
     type: "memory",
     op: "recall",
-    ids: (block?.used ?? []).map((h) => h.id),
+    ids: (rendered?.used ?? []).map((h) => h.id),
     text: query,
     count: hits.length,
+    // The rendered text, verbatim — `""` when nothing was injected. ALWAYS
+    // present on this path: the key is the receipt the loop's once-per-window
+    // gate reads (DESIGN.md §3 prompt = projection, §4.5 cache alignment), so
+    // "recalled, found nothing" has to be journaled just as loudly as a hit.
+    // The agent-facing `recall` tool writes no key and stays audit-only.
+    block,
+    // How wide the search was allowed to look (DESIGN.md §5.1). Journaled with
+    // the block because the block is REPLAYED on later wakes, and a later wake
+    // on a narrower surface must not inherit rows it is not allowed to see.
+    scope: {
+      includeUser: memory.scope.includeUser,
+      includePrivate: memory.scope.includePrivate,
+    },
   });
-  return block?.text ?? null;
+  return { block };
 }

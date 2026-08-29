@@ -11,6 +11,7 @@
  *   pinky memory show <id-or-prefix>
  *   pinky memory forget <id-or-prefix> [--reason "..."]
  *   pinky stats restarts [--channel <id>] [--limit N]   what context restarts cost
+ *   pinky stats cache [--channel <id>] [--thread <id>] [--limit N]  prompt-cache hit rate
  *   pinky smoke                            end-to-end in-process smoke (FakeProvider, A2A, memory)
  *   pinky prompt "<text>"                  run one agent turn against a local cli thread
  *   pinky headless [--shell] [--a2a] [--shared]  long-lived JSONL service on stdin/stdout
@@ -694,10 +695,12 @@ const THREAD_COL = 40;
 const padRight = (s: string, n: number): string => (s.length >= n ? s : s + " ".repeat(n - s.length));
 const padLeft = (s: string, n: number): string => (s.length >= n ? s : " ".repeat(n - s.length) + s);
 
+/** Keep the TAIL: the distinguishing half of both a thread key and a model id. */
+const clip = (s: string, n: number): string => (s.length > n ? `…${s.slice(-(n - 1))}` : s);
+
 /** `<channel>/<thread>`, tail-clipped: the thread id is the distinguishing half. */
 function threadLabel(row: RestartRow): string {
-  const label = `${row.channel_id}/${row.thread_id}`;
-  return label.length > THREAD_COL ? `…${label.slice(-(THREAD_COL - 1))}` : label;
+  return clip(`${row.channel_id}/${row.thread_id}`, THREAD_COL);
 }
 
 const count = (n: number | null): string => (n === null ? "-" : String(n));
@@ -747,8 +750,11 @@ const mean = (xs: number[]): number | null =>
   xs.length === 0 ? null : xs.reduce((a, b) => a + b, 0) / xs.length;
 
 const STATS_USAGE =
-  "usage: pinky stats <restarts> ...\n" +
-  "  pinky stats restarts [--channel <id>] [--limit N]";
+  "usage: pinky stats <restarts|cache> ...\n" +
+  "  pinky stats restarts [--channel <id>] [--limit N]\n" +
+  "  pinky stats cache [--channel <id>] [--thread <id>] [--limit N]\n" +
+  "    --limit samples the newest N turns (default 50); warm -> cold\n" +
+  "    transitions are detected within that sampled window.";
 
 /**
  * `pinky stats restarts` — what context restarts cost this tenant.
@@ -762,9 +768,7 @@ const STATS_USAGE =
  *
  * Read-only, so it does not migrate (`migrate: false`) and takes no embedder.
  */
-async function cmdStats(args: string[]): Promise<void> {
-  const [sub, ...raw] = args;
-  if (sub !== "restarts") throw new Error(STATS_USAGE);
+async function cmdStatsRestarts(raw: string[]): Promise<void> {
   const { flags } = parseFlags(raw);
   const channel = stringFlag(flags, "channel");
   const limit = intFlag(flags, "limit", 20);
@@ -816,6 +820,381 @@ async function cmdStats(args: string[]): Promise<void> {
   }
 }
 
+// --- stats cache -----------------------------------------------------------
+//
+// `stats restarts` only looks at the FIRST turn after a boundary, which answers
+// "what did that restart cost" and nothing else. Prompt caching is a prefix
+// match over tools -> system -> messages, so the number that actually decides
+// $/task is the steady-state hit rate across every turn — and the moment it
+// falls off a cliff. Both are already in the log: the loop journals the
+// provider's `usage` on every assistant `message` event.
+
+/**
+ * One assistant turn that carried provider usage.
+ *
+ * `usage.input` is the UNCACHED prompt remainder, DISJOINT from `cacheRead`
+ * and `cacheCreation` (Anthropic reports it that way; the OpenAI-compatible
+ * route subtracts the cached count from `prompt_tokens` to match), so the
+ * billed prompt for a turn is the sum of the three. A `null` here means the
+ * provider did not report that counter — which is NOT the same as reporting
+ * zero, and the two must never be averaged together.
+ *
+ * Every count comes back through a `::int` cast (the jsonb accessors are
+ * text); `seq` is `bigint`, which postgres.js hands over as a STRING even
+ * cast, so it is coerced with `toSeqNumber` before it is ever compared.
+ */
+interface CacheRow {
+  channel_id: string;
+  thread_id: string;
+  seq: number | string;
+  ts: string;
+  model: string | null;
+  usage_input: number | null;
+  usage_output: number | null;
+  usage_cache_read: number | null;
+  usage_cache_creation: number | null;
+}
+
+const CACHE_SQL = `
+  select channel_id,
+         thread_id,
+         seq::int                               as seq,
+         ts,
+         data->>'model'                         as model,
+         (data->'usage'->>'input')::int         as usage_input,
+         (data->'usage'->>'output')::int        as usage_output,
+         (data->'usage'->>'cacheRead')::int     as usage_cache_read,
+         (data->'usage'->>'cacheCreation')::int as usage_cache_creation
+    from events
+   where tenant_id = $1
+     and type = 'message'
+     and jsonb_typeof(data->'usage') = 'object'
+     and ($2::text is null or channel_id = $2)
+     and ($3::text is null or thread_id = $3)
+   order by ts desc, seq desc
+   limit $4`;
+
+/** A turn's usage, provider-agnostic. `null` = the provider did not count it. */
+export interface CacheTurn {
+  channelId: string;
+  threadId: string;
+  seq: number;
+  model: string | null;
+  input: number | null;
+  output: number | null;
+  cacheRead: number | null;
+  cacheCreation: number | null;
+}
+
+/**
+ * `seq` is bigint -> string from postgres.js; never compare or sort it raw
+ * (core/event-store.ts `toSeq` says what a leaked string breaks). Shared by
+ * the cache rows below and by smoke's per-run mark.
+ */
+function toSeqNumber(value: number | string | null | undefined): number {
+  if (value === null || value === undefined) return 0;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function toCacheTurn(row: CacheRow): CacheTurn {
+  return {
+    channelId: row.channel_id,
+    threadId: row.thread_id,
+    seq: toSeqNumber(row.seq),
+    model: row.model,
+    input: row.usage_input,
+    output: row.usage_output,
+    cacheRead: row.usage_cache_read,
+    cacheCreation: row.usage_cache_creation,
+  };
+}
+
+/**
+ * Thread-major, seq-ascending — the order the transition analysis needs, done
+ * on the JS side on purpose. `order by <text>` is server-collation dependent
+ * (glibc en_US ignores hyphens at the first level, the alpine image's C locale
+ * does not), so a SQL sort over channel/thread ids disagrees with a JS one for
+ * some ids; keeping the comparison here makes the output identical on both.
+ */
+export function sortCacheTurns(turns: CacheTurn[]): CacheTurn[] {
+  return [...turns].sort((a, b) => {
+    if (a.channelId !== b.channelId) return a.channelId < b.channelId ? -1 : 1;
+    if (a.threadId !== b.threadId) return a.threadId < b.threadId ? -1 : 1;
+    return a.seq - b.seq;
+  });
+}
+
+/** Did the provider count the cache at all? (Absent on most plain routes.) */
+export function hasCacheCounters(turn: CacheTurn): boolean {
+  return turn.cacheRead !== null || turn.cacheCreation !== null;
+}
+
+/** The billed prompt: uncached remainder + cache reads + cache writes. */
+export function promptTokens(turn: CacheTurn): number {
+  return (turn.input ?? 0) + (turn.cacheRead ?? 0) + (turn.cacheCreation ?? 0);
+}
+
+/**
+ * Did the provider count cache WRITES specifically?
+ *
+ * Anthropic sends `cache_creation_input_tokens`; plain OpenAI and DeepSeek
+ * send a hit count and nothing else. Anything derived from the write counter
+ * therefore needs its own denominator — scoring a route that cannot report
+ * writes as "0% rewritten" is the 0-vs-n/a conflation this module refuses
+ * everywhere else.
+ */
+export function reportsCacheWrite(turn: CacheTurn): boolean {
+  return turn.cacheCreation !== null && promptTokens(turn) > 0;
+}
+
+/**
+ * Share of this turn's prompt served from cache — the headline number.
+ *
+ * Null (not 0) when the provider reported no cache counters: "nothing was
+ * cached" and "nobody counted" are different answers, and averaging the second
+ * in as a zero would report a cold agent that was merely unmeasured.
+ */
+export function cacheHitShare(turn: CacheTurn): number | null {
+  if (!hasCacheCounters(turn)) return null;
+  const total = promptTokens(turn);
+  if (total <= 0) return null;
+  return (turn.cacheRead ?? 0) / total;
+}
+
+/**
+ * Almost the whole prompt was re-written rather than read: the Anthropic docs'
+ * signature for "something upstream of the breakpoint changed" — a tool
+ * definition, the system prefix, or a mutated messages[0]. This is the
+ * actionable line in the summary, because every one of those causes is a bug
+ * in how the request is assembled, not a fact about the workload.
+ *
+ * Only ever true for a turn that REPORTS a write counter, and the summary
+ * scores it over exactly that set ({@link reportsCacheWrite}): on a route
+ * without one, the honest answer is `n/a`, not 0%.
+ */
+const PREFIX_REWRITE_SHARE = 0.8;
+
+export function isPrefixRewrite(turn: CacheTurn): boolean {
+  if (!reportsCacheWrite(turn)) return false;
+  return (turn.cacheCreation ?? 0) >= PREFIX_REWRITE_SHARE * promptTokens(turn);
+}
+
+/**
+ * A read this size means the entry really was hit (it clears the smallest
+ * cacheable prefix any current model has), so dropping to zero on the next
+ * turn is an invalidation and not a cold start. It doubles as the floor for
+ * the prompt that read nothing: below it there was nothing cacheable to lose.
+ */
+const COLD_READ_FLOOR = 1024;
+
+/**
+ * warm -> cold: the previous turn in this thread read a real cached prefix,
+ * and this one read none from a prompt that was big enough to have been
+ * cached. oh-my-pi's cache-invalidation marker.
+ *
+ * Deliberately conditioned on the READ counter alone. Requiring a cache WRITE
+ * (`cacheCreation > 0`) would make the marker — and the summary's
+ * `cold transitions` — structurally unreachable on plain OpenAI and DeepSeek,
+ * which report a hit count and no write count at all: a thread that went cold
+ * would print `cold transitions 0`, which reads as "no invalidations" and is
+ * really "not measurable". A turn that reports no counter at all after a
+ * demonstrably warm one still counts: the route counted a read one turn ago,
+ * so the absence now is the absence of the READ, not of the counter.
+ */
+export function isColdTransition(previous: CacheTurn | undefined, turn: CacheTurn): boolean {
+  if (previous === undefined) return false;
+  if ((previous.cacheRead ?? 0) < COLD_READ_FLOOR) return false;
+  if ((turn.cacheRead ?? 0) !== 0) return false;
+  return promptTokens(turn) > COLD_READ_FLOOR;
+}
+
+/** One turn with its derived numbers — what both the table and the summary read. */
+export interface CacheTurnStats {
+  turn: CacheTurn;
+  prompt: number;
+  hitShare: number | null;
+  rewritten: boolean;
+  cold: boolean;
+}
+
+/**
+ * Sort, then walk each thread forward carrying its previous turn.
+ *
+ * Transitions are detected WITHIN THE SAMPLED WINDOW: `--limit` takes the
+ * newest N turns across all threads, so the earliest turn of each thread in it
+ * has no predecessor here and is never marked cold. That is the conservative
+ * direction on both sides — a transition at the sample edge is missed rather
+ * than invented, and no turn is ever compared against one from another thread.
+ * Widen `--limit` (or narrow the scan with `--thread`) to see further back.
+ */
+export function analyzeCacheTurns(turns: CacheTurn[]): CacheTurnStats[] {
+  const ordered = sortCacheTurns(turns);
+  const previous = new Map<string, CacheTurn>();
+  return ordered.map((turn) => {
+    // NUL separator, written as an escape so this file stays plain text (a
+    // literal NUL makes grep treat it as binary): no id can contain one, so
+    // the two halves of the key can never run together into a collision.
+    const key = `${turn.channelId}\u0000${turn.threadId}`;
+    const stats: CacheTurnStats = {
+      turn,
+      prompt: promptTokens(turn),
+      hitShare: cacheHitShare(turn),
+      rewritten: isPrefixRewrite(turn),
+      cold: isColdTransition(previous.get(key), turn),
+    };
+    previous.set(key, turn);
+    return stats;
+  });
+}
+
+export interface CacheSummary {
+  /** Turns in the window (the `--limit` sample), measured or not. */
+  turns: number;
+  /**
+   * The ONE denominator: turns whose provider counted the cache over a
+   * non-empty prompt. `meanHitShare` and every token total below are computed
+   * over exactly this set — never over `turns`, which would average and sum
+   * unmeasured turns in as zeros.
+   */
+  measured: number;
+  /** Mean of the per-turn hit shares over the `measured` turns. */
+  meanHitShare: number | null;
+  /** Token totals over the `measured` turns only (see `measured`). */
+  read: number;
+  write: number;
+  uncached: number;
+  prompt: number;
+  coldTransitions: number;
+  /**
+   * Its own denominator: turns that reported a cache-WRITE counter. Plain
+   * OpenAI/DeepSeek turns report reads only, so they are `measured` for the
+   * hit rate and absent here.
+   */
+  writeMeasured: number;
+  rewritten: number;
+  /** `rewritten / writeMeasured` — null when no turn reported a write. */
+  rewrittenShare: number | null;
+}
+
+export function summarizeCache(stats: CacheTurnStats[]): CacheSummary {
+  // `hitShare` is non-null on exactly the turns that carry usable counters, so
+  // deriving the count, the mean and the totals from this one array is what
+  // keeps the printed denominator from drifting off the number beside it.
+  const measured = stats.filter(
+    (s): s is CacheTurnStats & { hitShare: number } => s.hitShare !== null,
+  );
+  const sum = (pick: (s: CacheTurnStats) => number): number =>
+    measured.reduce((a, s) => a + pick(s), 0);
+  const writeMeasured = stats.filter((s) => reportsCacheWrite(s.turn));
+  const rewritten = writeMeasured.filter((s) => s.rewritten).length;
+  return {
+    turns: stats.length,
+    measured: measured.length,
+    meanHitShare: mean(measured.map((s) => s.hitShare)),
+    read: sum((s) => s.turn.cacheRead ?? 0),
+    write: sum((s) => s.turn.cacheCreation ?? 0),
+    uncached: sum((s) => s.turn.input ?? 0),
+    prompt: sum((s) => s.prompt),
+    coldTransitions: stats.filter((s) => s.cold).length,
+    writeMeasured: writeMeasured.length,
+    rewritten,
+    rewrittenShare: writeMeasured.length === 0 ? null : rewritten / writeMeasured.length,
+  };
+}
+
+/** Width of the model column; a long `provider/vendor/model` id is tail-kept. */
+const MODEL_COL = 26;
+
+const pct = (share: number | null): string =>
+  share === null ? "n/a" : `${Math.round(share * 100)}%`;
+
+/**
+ * `pinky stats cache` — the steady-state prompt-cache hit rate.
+ *
+ * SAMPLING: `--limit` (default 50) takes the newest N turns across every
+ * thread the filters allow, and the analysis then runs per thread inside that
+ * sample. So a thread's first SAMPLED turn has no predecessor and is never
+ * marked `⊘ cold`, and a real invalidation that happened just before the
+ * window is not counted — widen `--limit`, or pin `--thread`, to see further
+ * back. Every summary number is scoped to the same sample.
+ */
+async function cmdStatsCache(raw: string[]): Promise<void> {
+  const { flags } = parseFlags(raw);
+  const channel = stringFlag(flags, "channel");
+  const thread = stringFlag(flags, "thread");
+  const limit = intFlag(flags, "limit", 50);
+
+  const boot = await bootstrap({ migrate: false, embedder: null });
+  try {
+    const rows = await boot.db.query<CacheRow>(CACHE_SQL, [
+      boot.settings.tenantId,
+      channel ?? null,
+      thread ?? null,
+      limit,
+    ]);
+    const stats = analyzeCacheTurns(rows.map(toCacheTurn));
+
+    // The value columns are self-labelled (`prompt N = read R + write W + …`),
+    // so the header just sits over the numbers: each width below is the label
+    // plus its padded count, exactly as the row below prints them.
+    console.log(
+      `${padRight("thread", THREAD_COL)}  ${padLeft("seq", 5)}  ${padRight("model", MODEL_COL)}  ` +
+        `${padLeft("prompt", 14)}${padLeft("read", 15)}${padLeft("write", 16)}` +
+        `${padLeft("uncached", 19)}${padLeft("hit", 10)}`,
+    );
+    for (const s of stats) {
+      const t = s.turn;
+      console.log(
+        `${padRight(clip(`${t.channelId}/${t.threadId}`, THREAD_COL), THREAD_COL)}  ` +
+          `${padLeft(String(t.seq), 5)}  ${padRight(clip(t.model ?? "-", MODEL_COL), MODEL_COL)}  ` +
+          `prompt ${padLeft(String(s.prompt), 7)} = read ${padLeft(count(t.cacheRead), 7)}` +
+          ` + write ${padLeft(count(t.cacheCreation), 7)}` +
+          ` + uncached ${padLeft(count(t.input), 7)}  ` +
+          `hit ${padLeft(pct(s.hitShare), 4)}` +
+          (s.cold ? "  ⊘ cold" : ""),
+      );
+    }
+    if (stats.length === 0) {
+      const where = [channel ? ` in channel ${channel}` : "", thread ? ` thread ${thread}` : ""].join("");
+      console.log(
+        `(no assistant turns with usage${where} for tenant ${boot.settings.tenantId})`,
+      );
+    }
+
+    // Three lines, each naming the set it is computed over: `measured` for the
+    // hit rate and the token totals, the write-reporting subset for the rewrite
+    // share. A number without its denominator is how "unmeasured" gets read as
+    // "zero".
+    const s = summarizeCache(stats);
+    console.log("");
+    console.log(
+      `turns ${s.turns}  with cache counters ${s.measured}  ` +
+        `mean hit ${pct(s.meanHitShare)}  cold transitions ${s.coldTransitions}`,
+    );
+    console.log(
+      `tokens over the ${s.measured} measured turns  ` +
+        `read ${s.read}  write ${s.write}  uncached ${s.uncached}  prompt ${s.prompt}`,
+    );
+    console.log(
+      `prefix rewritten (write >= ${Math.round(PREFIX_REWRITE_SHARE * 100)}% of prompt) ` +
+        (s.writeMeasured === 0
+          ? "n/a (no turn reported a cache-write counter)"
+          : `${s.rewritten}/${s.writeMeasured} turns reporting writes (${pct(s.rewrittenShare)})`),
+    );
+  } finally {
+    await boot.close();
+  }
+}
+
+/** `pinky stats <restarts|cache>` — the DESIGN.md §13 eval, as two queries. */
+async function cmdStats(args: string[]): Promise<void> {
+  const [sub, ...raw] = args;
+  if (sub === "restarts") return cmdStatsRestarts(raw);
+  if (sub === "cache") return cmdStatsCache(raw);
+  throw new Error(STATS_USAGE);
+}
+
 // ---------------------------------------------------------------------------
 // smoke
 // ---------------------------------------------------------------------------
@@ -829,6 +1208,33 @@ const SMOKE_MEMORY_AGENT = "smoke";
 /** Distinctive enough that the FTS voice can find it and nothing else. */
 const SMOKE_CANARY = "The smoke canary passphrase is zebra-quartz.";
 const SMOKE_QUERY = "smoke canary passphrase";
+
+/**
+ * Newest seq in a thread, or 0 when it has none — smoke's per-run mark.
+ *
+ * NOT `(await events.history(ref)).length`. `history()` is a FORWARD page
+ * capped at `DEFAULT_HISTORY_PAGE` (500) rows from the oldest event, so on a
+ * long-lived database the fixed `cli:smoke/*` threads outgrow one page and the
+ * length stops moving: the mark sticks at 500, `history(...).slice(500)` is
+ * empty, and every check reading this run's events fails on an empty slice
+ * (which is exactly how a red `bun run smoke` showed up on a dev DB while CI's
+ * fresh database hid it). A seq mark does not grow with the log, and
+ * `history(ref, { afterSeq })` pages forward from it.
+ *
+ * One query on the shared `Db` rather than a new EventStore seam: the store is
+ * append-and-read-forward on purpose, and smoke is the only caller that needs
+ * "where does the log end right now".
+ */
+async function latestSeq(db: Db, ref: ThreadRef): Promise<number> {
+  const row = await db.queryOne<{ seq: number | string }>(
+    `select seq from events
+      where (tenant_id, channel_id, thread_id) = ($1, $2, $3)
+      order by seq desc limit 1`,
+    [ref.tenantId, ref.channelId, ref.threadId],
+  );
+  // bigint -> string on the wire; a raw string would compare lexicographically.
+  return toSeqNumber(row?.seq);
+}
 
 async function cmdSmoke(): Promise<void> {
   // Deterministic, offline, and dimension-matched to the real column.
@@ -857,6 +1263,15 @@ async function cmdSmoke(): Promise<void> {
     `delete from a2a_messages where node_to = $1 and to_agent in ('alpha', 'beta')`,
     [env.nodeId],
   );
+
+  // Smoke reuses fixed thread ids, so the log carries every previous run.
+  // Everything asserted below is read from these marks FORWARD — otherwise a
+  // run that journaled nothing would still "pass" on yesterday's events.
+  const [markA, markB, markM] = await Promise.all([
+    latestSeq(db, threadA),
+    latestSeq(db, threadB),
+    latestSeq(db, threadM),
+  ]);
 
   const betaHeard: A2AEnvelope[] = [];
   messenger.onMessage("beta", (env2) => {
@@ -905,10 +1320,6 @@ async function cmdSmoke(): Promise<void> {
     includeUser: true,
     includePrivate: true,
   };
-  // Smoke reuses fixed thread ids, so the log carries every previous run.
-  // Everything asserted below is sliced from this mark forward — otherwise a
-  // run that retained nothing would still "pass" on yesterday's events.
-  const markM = (await events.history(threadM)).length;
   const memoryScript: AssistantTurn[] = [
     {
       text: "",
@@ -956,9 +1367,11 @@ async function cmdSmoke(): Promise<void> {
     scopeFor: () => ({ ...memoryScope, channelId: threadR.channelId }),
   })(threadR);
 
-  const historyA = await events.history(threadA);
-  const historyB = await events.history(threadB);
-  const historyM = (await events.history(threadM)).slice(markM);
+  // From this run's marks forward: one forward page each, which is orders of
+  // magnitude more than a run appends.
+  const historyA = await events.history(threadA, { afterSeq: markA });
+  const historyB = await events.history(threadB, { afterSeq: markB });
+  const historyM = await events.history(threadM, { afterSeq: markM });
   const recallResult = historyM.find(
     (e) => e.data.type === "tool_result" && e.data.name === "recall",
   );
@@ -986,7 +1399,7 @@ async function cmdSmoke(): Promise<void> {
     ["a consumed message cannot be claimed twice", claimedAfterReceipt === false],
     ["alpha thread logged assistant message", historyA.some((e) => e.data.type === "message")],
     ["alpha thread logged tool_result", historyA.some((e) => e.data.type === "tool_result")],
-    ["beta thread untouched (mailbox, not thread)", historyB.length === 0],
+    ["beta thread untouched this run (mailbox, not thread)", historyB.length === 0],
     ["thread keys distinct", threadKey(threadA) !== threadKey(threadB)],
     ["memory run completed", runM.stopReason === "completed"],
     [

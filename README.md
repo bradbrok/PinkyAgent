@@ -116,6 +116,17 @@ stdout: a client that closes the pipe ends the session like `exit --abort`
 {"type":"exiting"}
 ```
 
+The `event` lines carry a stored `ThreadEvent`, so their `event.data.type` is
+the log's own vocabulary — `message`, `tool_result`, `egress`, `memory`,
+`continuity`, `restart`, and **`notice`**, the harness's own turn: the
+context-pressure notes the loop injects (`[harness notice] …`) are journaled
+before they are pushed into the prompt, so a client sees them on the stream in
+the same order the model did.
+
+```jsonc
+{"type":"event","threadId":"main","channelId":"jsonl:local","event":{"id":"…","seq":42,"data":{"type":"notice","text":"[harness notice] context pressure: …"}}}
+```
+
 `ready.defaultModel` is the bootstrap snapshot and nothing more: every run
 re-resolves the model from `channel:<id>` + `agent:pinky` settings, so a
 particular run may use another one — read the run's `event` lines if you need
@@ -186,12 +197,27 @@ bun run packages/cli/src/index.ts <command>
 | `memory show <id-or-prefix>` | One memory in full: scope, importance, validity, embedder, meta |
 | `memory forget <id-or-prefix> [--reason "…"]` | Invalidate it — memories are retired, never deleted |
 | `stats restarts [--channel <id>] [--limit N]` | What context restarts cost: `tokensBefore → tokensAfter` per boundary, the successor's first-turn cache split, and the total rebuild bill |
+| `stats cache [--channel <id>] [--thread <id>] [--limit N]` | The steady-state prompt-cache hit rate over the newest N turns (default 50): per turn `prompt = read + write + uncached` with a `hit` share, `⊘ cold` on a warm→cold transition, then the mean and totals over the measured turns and the "prefix rewritten" count |
 | `headless [--shell] [--a2a] [--shared]` | The JSONL service on stdin/stdout, plus [wake-on-message](#wake-on-message) from the A2A mailbox. `--shell` grants `bash`; `--a2a` also opens the relay port (inbound from another *node*); `--shared` drops the trusted-local recall scope |
 | `smoke` | In-process end-to-end check: migrate, agent loop, local A2A, memory round trip, event log |
 | `prompt "<text>"` | One agent turn on the local `cli:local/main` thread |
 
 `memory`, `smoke`, `prompt` and `headless` auto-migrate at startup on a
 short-lived privileged connection; `config` and `stats` do not.
+
+In `stats cache`, `hit n/a` means the route reported no cache counters at all —
+not a 0% hit rate — so those turns are counted separately and never averaged in
+as zeroes. There is one denominator: the turns with a computable hit share
+(`with cache counters N`) carry the mean *and* the token totals, printed as
+`tokens over the N measured turns …`. `⊘ cold` is read-counter-only (the
+previous turn in that thread read a real cached prefix and this one read
+nothing from a prompt big enough to have been cached), so it also fires on
+routes that report hits and no writes, like OpenAI and DeepSeek; "prefix
+rewritten" needs the write counter and prints `n/a (no turn reported a
+cache-write counter)` where nobody counted. `--limit` samples the newest N
+turns and transitions are found inside that sample, so a thread's first sampled
+turn is never marked cold — widen `--limit`, or pin `--thread`, to see further
+back.
 
 `headless` runs as a **trusted local surface** by default: `user`- and
 `private`-visibility memories are recallable, and the subject user is whatever
@@ -215,6 +241,8 @@ which documents every variable:
 | `DATABASE_ADMIN_URL` | Superuser, migrations only (DDL + `CREATE ROLE`). Defaults to `DATABASE_URL` |
 | `OPENROUTER_API_KEY` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | Model credentials, plus optional `*_BASE_URL` overrides. The OpenAI and OpenRouter keys also pay for **embeddings** |
 | `PINKY_LLM_MAX_RETRIES` / `PINKY_LLM_TIMEOUT_MS` / `PINKY_LLM_INCLUDE_USAGE` | LLM transport hardening (not agent behavior, hence env) |
+| `PINKY_ANTHROPIC_CACHE_TTL` | `5m` (default) or `1h`: the lifetime stamped on every `cache_control` breakpoint. `1h` writes cost ~2× an input token instead of ~1.25×, so it pays off exactly when start-to-start wake gaps land in the 5–60 minute band — often enough to reuse the prefix, too rare for the 5m entry to survive |
+| `PINKY_LLM_PROMPT_CACHE_KEY` | Boolean: send `prompt_cache_key` (the thread's identity) on the OpenAI-compatible routes so a thread keeps landing on one cache shard. The default is route-dependent, because the field is OpenAI-*native*: on for `openai/` against real api.openai.com, off for `openrouter/` and for any `openai/` with an `OPENAI_BASE_URL` override (vLLM, llama.cpp, LM Studio, Azure — strict servers reject an unknown top-level field). Set it and it wins on every route; a non-boolean throws at startup. It is a routing hint, so losing it costs hit rate, never correctness |
 | `PINKY_EMBED_TIMEOUT_MS` / `PINKY_EMBED_MAX_RETRIES` / `PINKY_EMBED_DIMENSIONS` | Embedding transport: a short budget (15s × 2) so a hung endpoint degrades recall to FTS-only instead of stalling wakes; dimensions pinned to the `vector(1536)` column (0 = omit the field) |
 | `PINKY_NODE_ID` / `PINKY_PEERS` / `A2A_SECRET` / `PORT` | A2A identity, peer routing table, shared HMAC key, relay port |
 | `PINKY_INTEGRATION` | Set to `1` to un-skip the integration tests |
@@ -311,8 +339,20 @@ under `packages/{core,runtime,cli}/test/integration/`, gated on
 | `core/test/integration/migrate.test.ts` | Migrations into a throwaway database, then re-run as a no-op |
 | `core/test/integration/memory.test.ts` | Scope predicate, FTS, one-transaction `update()`, RLS, and the `::vector` voice |
 | `runtime/test/integration/messenger.test.ts` | Two nodes, one HMAC-signed socket, replay, offline retry, and `bun run smoke` |
+| `runtime/test/integration/providers-cache.test.ts` | That prompt caching actually *works* against the live Anthropic API: two byte-identical requests, the second must read the prefix the first wrote |
 | `cli/test/integration/headless.test.ts` | `pinky headless` as a real child process: the JSONL contract, and that *nothing* but the protocol reached stdout |
-| `cli/test/integration/stats.test.ts` | `pinky stats restarts` as a real child process: the lateral join from each restart to the turn that paid for it |
+| `cli/test/integration/stats.test.ts` | `pinky stats restarts` and `stats cache` as real child processes: the lateral join from each restart to the turn that paid for it, and the per-turn hit shares, cold transitions and uncounted-turn handling |
+
+One of those is gated twice over: `providers-cache.test.ts` runs only when
+`ANTHROPIC_API_KEY` is set as well as `PINKY_INTEGRATION=1`, because it spends
+real money — about **$0.02 a run**: two calls on the cheapest model
+(`claude-haiku-4-5`, override with `PINKY_CACHE_TEST_MODEL`) that answer in 16
+tokens but must send a system prompt padded to ≈13–15k tokens, because a prefix
+under the model's minimum cacheable size (4096 on Haiku 4.5) simply never
+caches and the failure would look like a bug in the provider. No key is a clean
+skip, never a red suite. It is the only check that a cache *hit* happened rather than that the
+request looked right, which is what catches a byte that moved in the prefix or
+a proxy quietly dropping `cache_control`.
 
 The vector half of recall needs pgvector, which the default alpine server does
 not have, so it runs against a second server on 5545:
@@ -364,6 +404,20 @@ cli:local/main                                3      1092 ->     425      -667 (
 
 restarts 1  mean tokensAfter 425  mean cache-write share 87% (1/1 turns reported cache usage)  est. rebuild cost 425 tokens
 ```
+
+That is half the instrument: it prices the *first* turn of a window. What
+decides $/task over a whole thread is the steady state between restarts, so
+`pinky stats cache` reads the same journaled `usage` across every assistant
+turn — `prompt = read + write + uncached` per turn with its `hit` share, `⊘
+cold` where a thread that was reading a real cached prefix suddenly read
+nothing at all, and a "prefix rewritten" count for turns whose write was ≥80%
+of the prompt. The cold marker reads the hit counter alone, so it works on
+routes that never report writes; the rewrite count is scored only over the
+turns that do, and says `n/a` where none did. A cold transition or a rewrite is
+a bug in how the request was
+assembled (a tool definition changed, the system prefix moved, `messages[0]`
+was re-rendered), not a fact about the workload — which is why both are called
+out by name rather than averaged away.
 
 ## Fixed defects (now regression-tested)
 

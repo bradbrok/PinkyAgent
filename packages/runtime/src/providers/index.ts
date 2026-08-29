@@ -3,14 +3,40 @@
  * The bare model id (only the routing prefix stripped) is what callers pass
  * as CompleteOptions.model — e.g. "openrouter/moonshotai/kimi-k2" yields the
  * model id "moonshotai/kimi-k2".
+ *
+ * Transport-class env knobs, all read here and nowhere else (they describe how
+ * this deployment talks to a route, not what the agent does — hence env and not
+ * the settings table):
+ *   PINKY_LLM_MAX_RETRIES / PINKY_LLM_TIMEOUT_MS  retry budget, per-attempt deadline
+ *   PINKY_LLM_INCLUDE_USAGE   stream_options.include_usage (OpenAI-compatible)
+ *   PINKY_LLM_PROMPT_CACHE_KEY  send `prompt_cache_key` (an OpenAI-NATIVE field).
+ *     Set, it wins on every route; unset it defaults true ONLY for `openai/`
+ *     against real api.openai.com (no OPENAI_BASE_URL), false otherwise.
+ *   PINKY_ANTHROPIC_CACHE_TTL   "5m" | "1h" on every cache_control breakpoint
+ * Each parses loudly: a typo is a throw at construction, never a silent default.
  */
 import type { Provider } from "../types";
-import { AnthropicProvider } from "./anthropic";
+import { AnthropicProvider, type CacheTtl } from "./anthropic";
 import { createFakeProvider } from "./fake";
 import { OpenAIProvider, OPENROUTER_DEFAULTS } from "./openai";
 
-export { AnthropicProvider, DEFAULT_ANTHROPIC_MAX_TOKENS, buildSystemBlocks } from "./anthropic";
-export type { AnthropicProviderOptions, AnthropicUsage, SystemTextBlock } from "./anthropic";
+export {
+  AnthropicProvider,
+  DEFAULT_ANTHROPIC_MAX_TOKENS,
+  applyMessageCacheBreakpoints,
+  buildSystemBlocks,
+  cacheControl,
+  toAnthropicToolChoice,
+} from "./anthropic";
+export type {
+  AnthropicMessage,
+  AnthropicProviderOptions,
+  AnthropicUsage,
+  CacheControl,
+  CacheTtl,
+  ContentBlock,
+  SystemTextBlock,
+} from "./anthropic";
 export { OpenAIProvider, OPENROUTER_DEFAULTS } from "./openai";
 export type { OpenAIProviderOptions } from "./openai";
 export {
@@ -67,6 +93,26 @@ function envBool(env: Record<string, string | undefined>, key: string): boolean 
   throw new Error(`${key} must be a boolean (true/false), got ${JSON.stringify(raw)}`);
 }
 
+/**
+ * PINKY_ANTHROPIC_CACHE_TTL = "5m" (default) | "1h" — the lifetime stamped on
+ * every `cache_control` breakpoint of an Anthropic request (system block +
+ * the rolling two-message window; see providers/anthropic.ts). Transport-class,
+ * not agent behavior: it trades a pricier cache write (~2x an input token
+ * instead of ~1.25x) for a prefix that survives a wake hours later, which is a
+ * property of how this *deployment* is driven, not of what the agent decides.
+ * Unset/empty means the provider default. Anything else throws at construction.
+ */
+export function anthropicCacheTtlFromEnv(
+  env: Record<string, string | undefined>,
+): CacheTtl | undefined {
+  const key = "PINKY_ANTHROPIC_CACHE_TTL";
+  const raw = env[key];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  const value = raw.trim().toLowerCase();
+  if (value === "5m" || value === "1h") return value;
+  throw new Error(`${key} must be "5m" or "1h", got ${JSON.stringify(raw)}`);
+}
+
 /** Transport options shared by every route, read once per createProvider call. */
 export function transportOptionsFromEnv(env: Record<string, string | undefined>): {
   maxRetries: number | undefined;
@@ -96,14 +142,28 @@ export function createProvider(
   // stream_options.include_usage is rejected by some OpenAI-compatible
   // endpoints; operators turn it off with PINKY_LLM_INCLUDE_USAGE=false.
   const includeUsage = envBool(env, "PINKY_LLM_INCLUDE_USAGE") ?? true;
+  // `prompt_cache_key` is a cache-SHARD routing hint, not prompt content, so
+  // dropping it costs hit rate and never correctness — but it is an OpenAI-NATIVE
+  // body field, and a strict OpenAI-*compatible* server (vLLM, llama.cpp,
+  // LM Studio, Azure) 400s an unknown top-level field on EVERY request. So it is
+  // opt-out where it is known to work and opt-IN everywhere else: the env var,
+  // when set, wins on every route; unset, the default is true only on `openai/`
+  // with no OPENAI_BASE_URL override (i.e. real api.openai.com) and false on
+  // `openrouter/` and on any `openai/` route pointed at a custom base URL.
+  const promptCacheKeyEnv = envBool(env, "PINKY_LLM_PROMPT_CACHE_KEY");
+  const customOpenAiBaseUrl = (env.OPENAI_BASE_URL ?? "").trim() !== "";
+  // Parsed on every route, like the knobs above: a typo in a bootstrap env var
+  // fails loudly at construction rather than silently on the one route it feeds.
+  const cacheTtl = anthropicCacheTtlFromEnv(env);
   switch (provider) {
     case "anthropic":
-      return new AnthropicProvider({ apiKey: env.ANTHROPIC_API_KEY, ...transport });
+      return new AnthropicProvider({ apiKey: env.ANTHROPIC_API_KEY, cacheTtl, ...transport });
     case "openai":
       return new OpenAIProvider({
         apiKey: env.OPENAI_API_KEY,
         baseUrl: env.OPENAI_BASE_URL,
         includeUsage,
+        promptCacheKey: promptCacheKeyEnv ?? !customOpenAiBaseUrl,
         ...transport,
       });
     case "openrouter":
@@ -115,6 +175,9 @@ export function createProvider(
           "X-Title": env.OPENROUTER_TITLE ?? OPENROUTER_DEFAULTS.title,
         },
         includeUsage,
+        // OpenRouter is not OpenAI: the field is unknown to the router itself,
+        // so it ships off unless an operator turns it on for a route they know.
+        promptCacheKey: promptCacheKeyEnv ?? false,
         ...transport,
       });
     // Keyless, offline, scripted — tests and smoke only (see fake.ts).

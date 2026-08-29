@@ -86,9 +86,12 @@ type ThreadEvent =
 Rules:
 
 - **Prompt = projection.** `buildContext(events, continuityBoundary)` walks back from the
-  tail to the latest `continuity` event and renders: continuity doc → recalled memories →
-  post-boundary events. Pre-boundary events are never sent to the model; they remain for
-  audit, replay, and memory extraction.
+  tail to the latest `continuity` event and renders: recalled memories → continuity doc →
+  post-boundary events. The `<memories>` block goes first, at index 0, ahead of the
+  document — it *is* the context start (§5.4), and it is journaled on its recall event so
+  every later wake in the window replays the same bytes in the same slot (§4.5).
+  Pre-boundary events are never sent to the model; they remain for audit, replay, and
+  memory extraction.
 - **No in-place mutation.** We never rewrite a stored tool result; an `elide` pointer
   event is recorded and the projection renders around it. The log stays append-only,
   which makes replay and cross-replica sync trivial.
@@ -112,9 +115,10 @@ is **deliberate**: the agent decides the moment and authors its own successor st
 
 1. **Agent-initiated (preferred).** A `shed_context` tool the agent calls at a natural
    boundary: task phase done, plan checkpoint reached, about to switch sub-problems.
-2. **Advisory pressure.** At ~70% of the window, inject a system notice: *"context
+2. **Advisory pressure.** At ~70% of the window, inject a harness notice: *"context
    pressure — evacuate what matters to memory or prepare continuity"* (MemGPT's warning
-   token count; Anthropic's context-editing warning).
+   token count; Anthropic's context-editing warning). It rides in a `user` turn, is
+   journaled, and is armed from the log — once per **window**, not once per wake.
 3. **Hard boundary.** At ~90%, continuity writing is forced as the next action. Never
    mid-tool-loop; only at a safe turn boundary.
 
@@ -180,11 +184,18 @@ lesson without the 4k-token stack trace.
   is pulled into the kept region.
 - **File-op tracking**: cumulative read/write sets feed `workingSet.files` automatically;
   the agent edits, doesn't reconstruct from memory.
-- **Cache alignment**: the continuity write is a normal turn against the live prefix (a
-  trailing user message, `toolChoice: none`, on the same cache key); the *next* context
-  starts a new cache prefix by design — restarts trade cache warmth for cleanliness,
-  which is correct at agent-loop ratios (~100:1 input:output) only because the new window
-  is small.
+- **Cache alignment**: the continuity write is a normal turn against the live prefix — a
+  trailing user message on the same cache key, the full tool list unchanged. Never a
+  shortened `tools` array: tool definitions render ahead of system and messages, so
+  changing them invalidates *every* cache tier. `tool_choice` is cheaper but not free —
+  it invalidates the messages tier, i.e. one uncached re-read of the whole transcript at
+  exactly its largest — so the forced turn is **two-step**: the first attempt appends the
+  hard notice and sends *no* `tool_choice` (appending extends the prefix and stays warm;
+  the notice plus the harness guard, which errors every non-shed call, hold the boundary),
+  and only the retry, after an attempt has already failed, buys the guarantee with
+  `tool_choice: shed_context`. The *next* context starts a new cache prefix by design —
+  restarts trade cache warmth for cleanliness, which is correct at agent-loop ratios
+  (~100:1 input:output) only because the new window is small.
 - **Speculative arming** (later): arm a continuity result in the pre-threshold band so a
   restart can commit instantly at a turn boundary.
 
@@ -214,6 +225,14 @@ visibility filters. A missing `WHERE` cannot leak (Oracle pattern; pgvector+RLS 
 Tiger Data). Recall in a shared channel sees `tenant + channel + global` scopes;
 DMs additionally see `user` scope; the agent's private scratch (`private`) is never
 projected into shared-channel context.
+
+A recalled block is journaled with the width it was searched under (`includeUser` /
+`includePrivate`) because later wakes replay it (§5.4). A wake on a **narrower** surface
+— `pinky headless --shared` picking up a window a default run opened — strips the
+replayed block and re-recalls under its own scope rather than inheriting rows it is not
+allowed to see; the wider direction replays unchanged, since a wide reader seeing a
+narrow block leaks nothing. Privacy costs one cache-prefix break per narrow wake, and
+only on a thread someone drives both ways.
 
 ### 5.2 Memory types (LangMem taxonomy)
 
@@ -256,7 +275,18 @@ Hybrid, fused, cheap:
   voice is a later addition).
 - **Budgeted injection**: token-capped `<memories>` block at context start and after each
   restart (~5k tokens). Memory is injected as **background context, not instructions**;
-  current messages and tool output win conflicts.
+  current messages and tool output win conflicts. The rendered block is journaled on the
+  `memory` recall event and replayed from there by the projection, so the search runs once
+  per **window** — its first wake, and again right after each restart — not once per wake:
+  a live re-search would re-render byte 0 whenever a retention landed or a score moved,
+  and a moved byte 0 misses the prefix cache for the whole thread (§4.5). The gate is the
+  **presence of the `block` key**, not its text: a pass that found nothing journals
+  `block: ""` and still claims the window (only a non-empty block is injected), while a
+  pass whose store failed journals nothing and is retried on the next wake — for a broken
+  store, eventual recall beats prefix stability. The agent's own `recall` tool writes no
+  key, so it cannot claim a window or move byte 0. Two things override a journaled block,
+  both deliberate prefix breaks: memory turned off for the run, and a scope narrower than
+  the block was built under (§5.1), which strips it and re-recalls.
 - **Latency target**: p95 search < 300ms (Mem0 reports 0.2s; Zep 155–162ms) — achievable
   with pgvector HNSW at memory-plane scale.
 
@@ -379,7 +409,7 @@ disposable tool-execution environments:
 | Error accumulation | non-Markovian compounding across stages | Lesson extraction at restarts; error counters in durable state; human escalation at 3 |
 | Distractor confusion | Breunig: sharded prompts −39% | One coordinator per conversation; subagent outputs arrive as single curated artifacts |
 | Few-shot mimicry loops | Manus: uniform patterns induce mimicry | Structured variation in event serialization; timestamps only in log, not prompt prefix (cache + mimicry) |
-| KV-cache thrash | Manus: 10× cost delta cached vs not | Stable system prefix; append-only within a window; tool set masked not mutated mid-window |
+| KV-cache thrash | Manus: 10× cost delta cached vs not | Stable system prefix; append-only within a window; tool set masked not mutated mid-window, and the mask itself deferred to the forced retry (§4.5); conversation breakpoints on the last two messages; notices and the recall block journaled, and tool-call arguments canonicalized on both sides of the log so jsonb key order cannot move a byte — wake N+1 is a byte-extension of wake N |
 | Destructive memory edits | Mem0 2026: UPDATE/DELETE degrade quality | Invalidation-not-deletion; sleep-worker-only consolidation; hot edits limited to append + annotate |
 
 ---
@@ -449,4 +479,6 @@ disposable tool-execution environments:
 - **Procedural memory promotion**: when does a repeated lesson become a system-prompt
   rule? Dangerous if automatic — start human-approved.
 - **Cost model**: restarts discard cache warmth; measure $/task vs a compaction baseline
-  early (pillar P2's main economic risk).
+  early (pillar P2's main economic risk). Instrumented rather than deferred: `pinky stats
+  restarts` prices each rebuild's first turn, `pinky stats cache` the steady-state hit
+  rate between them (cold transitions and prefix rewrites named, not averaged away).

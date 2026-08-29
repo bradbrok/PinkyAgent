@@ -28,7 +28,14 @@ export interface ContextWindow {
   events: ThreadEvent[];
   /** Seq of the continuity event at the boundary, or 0 when there is none. */
   boundarySeq: number;
-  /** True when the safety cap dropped the OLDEST events of the window. */
+  /**
+   * True when the safety cap dropped the OLDEST events of the window.
+   *
+   * The loop treats this as hard context pressure and forces a shed
+   * (runtime/loop.ts): the cap keeps the NEWEST events, so a truncated
+   * window's start rolls forward with every append and a prefix whose first
+   * bytes move each turn can never hit a provider cache (DESIGN.md §4.5).
+   */
   truncated: boolean;
 }
 

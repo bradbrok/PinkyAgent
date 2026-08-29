@@ -4,6 +4,10 @@
  * Events are append-only; the continuity event is the boundary. Anything
  * before the latest continuity is dropped from context. Everything after it
  * renders in a stable, serialized form so prompts are cache-friendly.
+ *
+ * Model-visible: `continuity`, `ingress`, `a2a`, `message`, `tool_result`.
+ * Everything else (`decision`, `egress`, `error`, `memory`, `config`, …) is
+ * audit-only and never costs context.
  */
 import type { ContinuityDoc, ThreadEvent, ToolCall } from "./events";
 
@@ -108,6 +112,15 @@ export function buildContext(events: ThreadEvent[]): ProjectedMessage[] {
       case "ingress": {
         const author = `[${d.author.platform} ${d.author.displayName ?? d.author.userId}]`;
         msgs.push({ role: "user", text: `${author}: ${d.text}` });
+        break;
+      }
+      case "a2a": {
+        // A peer's message is ingress from another agent, so it renders as a
+        // `user` turn like any other arrival (DESIGN.md §7 wake-on-message):
+        // a run woken by A2A must SEE what woke it, and the journaled event is
+        // the only record — the mailbox row is not part of the projection.
+        // The address is spelled out so the model can reply to it by name.
+        msgs.push({ role: "user", text: `[a2a ${d.kind} from ${d.from}]: ${d.text}` });
         break;
       }
       case "message": {

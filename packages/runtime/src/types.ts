@@ -186,6 +186,39 @@ export interface Messenger {
    * at-least-once-per-retry.
    */
   receive(env: A2AEnvelope): Promise<boolean>;
+  /**
+   * Recovery for the CONSUMPTION edge (issue #4). Re-fires the subscribers for
+   * every message addressed to `agentId` on this node that carries no receipt
+   * yet — `read_at is null`, regardless of delivered_at — oldest first, and
+   * returns how many were fired.
+   *
+   * Two markers, two different claims:
+   *   - `delivered_at` = the NODE accepted the message. Bookkeeping: it makes
+   *     the relay idempotent and nothing more. A crash between the claim and
+   *     the agent's turn leaves a row that is "delivered" forever and was
+   *     never acted on — a wake lost with zero recovery.
+   *   - `read_at` = an AGENT consumed it. THE RECEIPT, stamped by the consumer
+   *     inside the same transaction as the work (see claimConsumption), so it
+   *     exists if and only if the work was journaled.
+   *   - recovery = re-fire everything unread.
+   *
+   * Safe to call as often as you like — at startup, on a timer, after a
+   * reconnect — BECAUSE consumers claim the receipt transactionally: a second
+   * fire finds the receipt already stamped and does nothing.
+   */
+  redeliverUnconsumed(agentId: string): Promise<number>;
+  /**
+   * Stamp the consumption receipt for one message, returning true only for the
+   * caller that stamped it (so the winner does the work and everyone else
+   * drops it).
+   *
+   * `tx` is the point of the method: the receipt belongs in the CONSUMER's
+   * transaction, next to the events consuming it produced. Both commit or
+   * neither does — a turn whose transaction rolls back leaves the message
+   * unread and the next redeliverUnconsumed() fires it again. Never mark a
+   * message consumed from the scheduling side.
+   */
+  claimConsumption(id: string, tx?: Db): Promise<boolean>;
 }
 
 // ---------------------------------------------------------------------------

@@ -102,6 +102,14 @@ export function makeFakeMessenger(opts: {
       received.add(env.id);
       return Promise.resolve(fresh);
     },
+    // Consumption edge (issue #4): the surface consumes, not the tools, so the
+    // double only has to satisfy Messenger.
+    redeliverUnconsumed() {
+      return Promise.resolve(0);
+    },
+    claimConsumption() {
+      return Promise.resolve(false);
+    },
   };
   return Object.assign(base, { sent, get idSeq() { return sent.length; } });
 }

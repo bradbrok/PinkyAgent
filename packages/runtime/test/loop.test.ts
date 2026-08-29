@@ -6,7 +6,7 @@
  * cut-point safety).
  */
 import { describe, expect, test } from "bun:test";
-import { EventStore, threadKey } from "@pinky/core";
+import { EventStore, estimateTokens, threadKey } from "@pinky/core";
 import type { Db, SettingsSnapshot, ThreadEvent, ThreadEventData, ThreadRef, ToolCall } from "@pinky/core";
 import type { MemoryHit, MemoryStore, RecallScope, SearchInput } from "@pinky/core";
 import { runAgentLoop } from "../src/loop";
@@ -498,7 +498,15 @@ describe("runAgentLoop context pressure ladder (DESIGN §4.1)", () => {
     expect(notice).toContain("context limit reached");
     expect(req.messages.find((m) => m.text === notice)!.role).toBe("user");
 
-    expect(eventTypes(h.db)).toEqual(["ingress", "message", "continuity", "tool_result"]);
+    // `restart` closes the sequence: the rebuild happens even on the way out,
+    // so the successor wake is not billed twice (DESIGN §13).
+    expect(eventTypes(h.db)).toEqual([
+      "ingress",
+      "message",
+      "continuity",
+      "tool_result",
+      "restart",
+    ]);
     const cont = h.db.events[2]!.data as Extract<ThreadEventData, { type: "continuity" }>;
     expect(cont.document.goal).toBe("finish the continuity engine");
     expect(cont.tokensBefore).toBeGreaterThan(0); // loop's per-turn estimate
@@ -574,12 +582,14 @@ describe("runAgentLoop restart cycle (DESIGN §4.3)", () => {
     expect(result).toEqual({ turns: 2, stopReason: "completed" });
     expect(h.delivered).toEqual(["resumed from the document"]);
 
-    // Event order: assistant message -> continuity (during execution) -> tool_result.
+    // Event order: assistant message -> continuity (during execution) ->
+    // tool_result -> restart (the rebuild's cost, DESIGN §13).
     expect(eventTypes(h.db)).toEqual([
       "ingress",
       "message",
       "continuity",
       "tool_result",
+      "restart",
       "message",
       "egress",
     ]);
@@ -617,6 +627,7 @@ describe("runAgentLoop restart cycle (DESIGN §4.3)", () => {
       "tool_result", // echo
       "continuity", // boundary lands at the very end of the turn
       "tool_result", // shed
+      "restart", // what the rebuild cost
       "message",
       "egress",
     ]);
@@ -943,5 +954,115 @@ describe("runAgentLoop tool context", () => {
     expect(seen).toHaveLength(1);
     expect(seen[0]).toBe(snapshot);
     expect(seen[0]!.context.advisoryFraction).toBe(0.55);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Restart economics (DESIGN §13 cost model, issue #5): every restart is
+// journaled with what it cost, so "restarts vs a compaction baseline" is a
+// query over the log rather than a study. Audit-only — the model never sees it.
+// ---------------------------------------------------------------------------
+
+const restarts = (db: FakeDb): Extract<ThreadEventData, { type: "restart" }>[] =>
+  db.events
+    .map((e) => e.data)
+    .filter((d): d is Extract<ThreadEventData, { type: "restart" }> => d.type === "restart");
+
+/** A boundary written by a previous run, exactly as the shed tool writes one. */
+const continuityEvent = (tokensBefore: number): ThreadEventData => ({
+  type: "continuity",
+  document: {
+    goal: "carry on",
+    plan: { done: ["shed"], now: "resume from the document", next: [] },
+    workingSet: {},
+    decisions: [],
+    openLoops: [],
+    lessons: [],
+    memoryHints: [],
+  },
+  tokensBefore,
+});
+
+describe("runAgentLoop restart economics (DESIGN §13)", () => {
+  test("a shed journals what the rebuild cost", async () => {
+    const h = harness(
+      [
+        turn({ text: "", toolCalls: [call("s1", "shed_context", SHED_ARGS)], stopReason: "tool_calls" }),
+        turn({ text: "resumed from the document" }),
+      ],
+      [echoTool, new ShedContextTool()],
+    );
+    await h.store.append(THREAD, ingress("a long conversation about widgets".repeat(40)));
+
+    const result = await h.run();
+    expect(result.stopReason).toBe("completed");
+
+    const cont = h.db.events.find((e) => e.data.type === "continuity")!;
+    const before = (cont.data as Extract<ThreadEventData, { type: "continuity" }>).tokensBefore;
+    // The fresh window as the provider actually received it, system prompt
+    // included: the cached prefix is re-paid as a cache WRITE after a restart.
+    const fresh = h.provider.prompts[1]!.messages;
+    const expected = estimateTokens([{ role: "system", text: "sys" }, ...fresh]);
+
+    expect(restarts(h.db)).toEqual([
+      {
+        type: "restart",
+        boundarySeq: cont.seq,
+        tokensBefore: before,
+        tokensAfter: expected,
+        recallTokens: 0, // no memory plane on this run
+        messages: 1, // the continuity document alone
+      },
+    ]);
+    // The whole point of the restart: the successor window is far smaller.
+    expect(expected).toBeLessThan(before);
+  });
+
+  test("a plain fresh thread journals no restart", async () => {
+    const h = harness([turn({ text: "ok" })]);
+    await h.store.append(THREAD, ingress("first message ever"));
+    await h.run();
+    expect(restarts(h.db)).toEqual([]);
+  });
+
+  test("a successor wake on an unbilled boundary backfills one, and only one", async () => {
+    // The shedding run stopped with `shed` before it could take a turn (or
+    // died on the way out): the rebuild is paid for HERE, on the next wake.
+    const h = harness([turn({ text: "ok" }), turn({ text: "ok again" })]);
+    await h.store.append(THREAD, ingress("ancient business"));
+    const boundary = await h.store.append(THREAD, continuityEvent(9_000));
+    await h.store.append(THREAD, ingress("fresh question"));
+
+    await h.run();
+    const first = restarts(h.db);
+    expect(first).toHaveLength(1);
+    expect(first[0]!.boundarySeq).toBe(boundary.seq);
+    expect(first[0]!.tokensBefore).toBe(9_000); // mirrors the continuity event
+    expect(first[0]!.messages).toBe(2); // document + the fresh question
+    expect(first[0]!.tokensAfter).toBeGreaterThan(0);
+    expect(first[0]!.tokensAfter).toBeLessThan(9_000);
+    // The restart event lands inside the window it describes, so the next wake
+    // on the same boundary finds it and does not bill it again.
+    expect(h.db.events.some((e) => e.data.type === "restart" && e.seq > boundary.seq)).toBe(true);
+
+    await h.run();
+    expect(restarts(h.db)).toHaveLength(1);
+  });
+
+  test("the injected <memories> block is counted in recallTokens", async () => {
+    const h = harness([turn({ text: "ok" })]);
+    await h.store.append(THREAD, continuityEvent(7_000));
+    const store = new RecallStub({ hits: [memoryHit({ text: "widgets cost $4" })] });
+
+    await h.run({ memory: memoryContext(store) });
+
+    const block = h.provider.prompts[0]!.messages[0]!;
+    expect(block.text.startsWith(RECALL_HEAD)).toBe(true);
+    const [restart] = restarts(h.db);
+    expect(restart!.recallTokens).toBe(estimateTokens([{ role: "user", text: block.text }]));
+    expect(restart!.recallTokens).toBeGreaterThan(0);
+    // Recall is part of what the fresh window costs, not something beside it.
+    expect(restart!.tokensAfter).toBeGreaterThan(restart!.recallTokens);
+    expect(restart!.messages).toBe(2); // <memories> block + the document
   });
 });

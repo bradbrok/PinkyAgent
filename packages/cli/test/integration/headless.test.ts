@@ -33,6 +33,15 @@ const RUN = `headless-test-${crypto.randomUUID().slice(0, 8)}`;
 const CHANNEL = `jsonl:${RUN}`;
 const SCOPE = `channel:${CHANNEL}`;
 
+/** The A2A wake path (issue #4): a peer that "sent" this agent a message
+ *  before the process existed. Its channel is derived from the sender's
+ *  address, so it needs its own keyless model row. */
+const PEER = `peer-${RUN}`;
+const PEER_ADDRESS = `${PEER}@${ENV.nodeId}`;
+const A2A_CHANNEL = `a2a:${PEER_ADDRESS}`;
+const A2A_SCOPE = `channel:${A2A_CHANNEL}`;
+const A2A_THREAD = "wake";
+
 /** A hung child must fail the test, not block the suite. macOS has no
  *  `timeout(1)`, so the deadline is a timer that kills the process; the pipes
  *  then close and the assertions run against whatever was produced. */
@@ -99,15 +108,19 @@ suite("pinky headless (live process, live db)", () => {
     // The headless agent id is fixed ("pinky"), so the model is pinned on the
     // CHANNEL scope instead — this run's threads get fake/echo, nothing else
     // in the dev database changes.
-    await new SettingsStore(db).set(SCOPE, "model", "fake/echo");
+    const settings = new SettingsStore(db);
+    await settings.set(SCOPE, "model", "fake/echo");
+    // The wake lands on the peer's own channel, so pin that one too.
+    await settings.set(A2A_SCOPE, "model", "fake/echo");
   });
 
   afterAll(async () => {
     if (!db) return;
-    await db.query(`delete from events where channel_id = $1`, [CHANNEL]);
-    await db.query(`delete from threads where channel_id = $1`, [CHANNEL]);
+    await db.query(`delete from events where channel_id = any($1)`, [[CHANNEL, A2A_CHANNEL]]);
+    await db.query(`delete from threads where channel_id = any($1)`, [[CHANNEL, A2A_CHANNEL]]);
     await db.query(`delete from ingress_dedup where external_id like $1`, [`${RUN}%`]);
-    await db.query(`delete from settings where scope = $1`, [SCOPE]);
+    await db.query(`delete from settings where scope = any($1)`, [[SCOPE, A2A_SCOPE]]);
+    await db.query(`delete from a2a_messages where from_agent = $1`, [PEER]);
     await db.close();
   });
 
@@ -281,6 +294,71 @@ suite("pinky headless (live process, live db)", () => {
           // stdin is already closed with the process.
         }
       }
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  it(
+    "wakes on an unconsumed A2A message with no prompt, and stamps the receipt",
+    async () => {
+      // Issue #4, end to end. The row below is what a crashed process leaves
+      // behind: DELIVERED (this node took custody) and never consumed. Under
+      // the old code nothing in production subscribed to the mailbox, so it
+      // would sit there until the agent happened to call `a2a_inbox` — the
+      // wake was lost with no way to recover it.
+      const msgId = `${RUN}:a2a-1`;
+      await db.query(
+        `insert into a2a_messages
+           (id, from_agent, to_agent, node_from, node_to, kind, text, thread_hint, delivered_at)
+         values ($1, $2, 'pinky', $3, $3, 'request', $4, $5, now())`,
+        [msgId, PEER, ENV.nodeId, "what is the forecast?", A2A_THREAD],
+      );
+
+      // Not one prompt on stdin: the only thing this session is asked to do is
+      // exit, and it still answers the peer.
+      const session = await headless([JSON.stringify({ type: "exit" })]);
+
+      expect(session.garbage).toEqual([]);
+      expect(session.exitCode).toBe(0);
+
+      const started = session.lines.find((l) => l.type === "run_started");
+      expect(started).toBeDefined();
+      expect(started).toMatchObject({
+        cause: "a2a",
+        channelId: A2A_CHANNEL,
+        threadId: A2A_THREAD,
+      });
+
+      // fake/echo replies with the last projected user message, so the reply
+      // proves the `a2a` event was journaled AND rendered into the prompt —
+      // a woken run that could not see what woke it would be useless.
+      const reply = first(session, "reply")!;
+      expect(reply.channelId).toBe(A2A_CHANNEL);
+      expect(String(reply.text)).toContain(`[a2a request from ${PEER_ADDRESS}]`);
+      expect(String(reply.text)).toContain("what is the forecast?");
+      expect(first(session, "run_finished")!.stopReason).toBe("completed");
+      expect(types(session).at(-1)).toBe("exiting");
+
+      // The receipt is stamped, and it was stamped in the same transaction as
+      // the event — so exactly one `a2a` event exists for this message and the
+      // next sweep will not wake anyone for it again.
+      const row = await db.queryOne<{ read_at: Date | null }>(
+        `select read_at from a2a_messages where id = $1`,
+        [msgId],
+      );
+      expect(row?.read_at).not.toBeNull();
+
+      const journaled = await db.query<{ n: string }>(
+        `select count(*) as n from events
+         where channel_id = $1 and type = 'a2a' and data->>'msgId' = $2`,
+        [A2A_CHANNEL, msgId],
+      );
+      expect(Number(journaled[0]!.n)).toBe(1);
+
+      // A second session has nothing left to consume: no wake, no run at all.
+      const again = await headless([JSON.stringify({ type: "exit" })]);
+      expect(again.garbage).toEqual([]);
+      expect(types(again)).toEqual(["ready", "exiting"]);
     },
     TEST_TIMEOUT_MS,
   );

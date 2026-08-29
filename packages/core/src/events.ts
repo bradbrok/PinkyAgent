@@ -83,6 +83,33 @@ export type ThreadEventData =
   | { type: "egress"; target: EgressTarget; text: string }
   | { type: "decision"; action: DecisionAction; reason: string }
   | { type: "continuity"; document: ContinuityDoc; tokensBefore: number }
+  | {
+      /**
+       * What one context restart cost, journaled at the moment the loop
+       * rebuilt its window from a continuity boundary (DESIGN.md §13 cost
+       * model: "restarts discard cache warmth; measure $/task vs a compaction
+       * baseline early"). Audit-only — the projection never renders it, so
+       * measuring a restart does not itself cost context.
+       *
+       * One of these per boundary: the loop writes it right after the rebuild
+       * that follows a successful shed, and a successor wake that finds a
+       * boundary with no `restart` recorded yet backfills one. Together with
+       * the `usage` on the next `message` event (the successor's first turn,
+       * which is where the cache-write bill lands) this is the whole §13 eval
+       * query — see `pinky stats restarts`.
+       */
+      type: "restart";
+      /** seq of the continuity event this window was rebuilt from. */
+      boundarySeq: number;
+      /** The loop's estimate at the turn that shed (mirrors continuity.tokensBefore). */
+      tokensBefore: number;
+      /** Estimate of the fresh window right after rebuild: system prompt + projection + <memories> block. */
+      tokensAfter: number;
+      /** Tokens of the injected <memories> block (0 when none). */
+      recallTokens: number;
+      /** Number of projected messages in the fresh window. */
+      messages: number;
+    }
   | { type: "subagent_spawn"; agent: string; task: string; outputRef?: string }
   | {
       type: "human_request";

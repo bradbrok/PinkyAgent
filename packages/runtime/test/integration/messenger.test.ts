@@ -296,3 +296,133 @@ suite("cross-node A2A (live postgres + live HTTP)", () => {
     60_000,
   );
 });
+
+/**
+ * The consumption edge (issue #4), against the real table.
+ *
+ * Its own node partition and its own messenger so the ordered cross-node suite
+ * above is untouched. Everything here is about ONE claim: `read_at` is stamped
+ * by the consumer, in the consumer's transaction, and nothing else may say a
+ * message was acted on.
+ */
+suite("A2A consumption receipts (live postgres)", () => {
+  const NODE_C = `itC-${RUN}`;
+  const AGENT = `consumer-${RUN}`;
+  let db: Db;
+  let m: LocalMessenger;
+  const heard: A2AEnvelope[] = [];
+
+  beforeAll(async () => {
+    db = createDb(DB_URL, { max: 4 });
+    await migrate(db, SCHEMA_DIR);
+    await db.query(`delete from a2a_messages where node_to = $1 or node_from = $1`, [NODE_C]);
+    m = new LocalMessenger(db, { nodeId: NODE_C, peers: {}, a2aSecret: SECRET });
+    m.onMessage(AGENT, (env) => heard.push(env));
+  });
+
+  afterAll(async () => {
+    if (!db) return;
+    await db.query(`delete from a2a_messages where node_to = $1 or node_from = $1`, [NODE_C]);
+    await db.close();
+  });
+
+  /** Deliver one message to AGENT on this node and return its id. */
+  async function arrive(text: string): Promise<string> {
+    const id = await m.send({ from: `peer@${NODE_C}`, to: `${AGENT}@${NODE_C}`, kind: "message", text });
+    // send() marks the local row delivered fire-and-forget.
+    await until(async () => (await marks(id))?.delivered_at != null);
+    return id;
+  }
+
+  function marks(id: string): Promise<{ delivered_at: Date | null; read_at: Date | null } | null> {
+    return db.queryOne<{ delivered_at: Date | null; read_at: Date | null }>(
+      `select delivered_at, read_at from a2a_messages where id = $1`,
+      [id],
+    );
+  }
+
+  it("DEFECT: a delivered-but-unconsumed row is redelivered until something consumes it", async () => {
+    // The failure this guards, and the reason the issue was filed: the ONLY
+    // thing `delivered_at` proves is that this node took custody of the row.
+    // Nothing subscribed in production (`pinky headless` never called
+    // onMessage), so every arrival was marked delivered and then sat there
+    // until the agent happened to poll `a2a_inbox` — and a handler that threw,
+    // or a process that died right after the claim, left a row that says
+    // "delivered" forever and was never acted on. Zero recovery, and nothing
+    // in the data to even notice it.
+    //
+    // THE FIX: the receipt is `read_at`, stamped by the CONSUMER, and recovery
+    // is "re-fire everything unread". Redelivery is safe because the claim is
+    // transactional, so a duplicate fire produces no second turn.
+    const id = await arrive("work that was never done");
+    const row = await marks(id);
+    expect(row?.delivered_at).not.toBeNull();
+    expect(row?.read_at).toBeNull(); // delivered, unconsumed: the orphan
+
+    const before = heard.length;
+    expect(await m.redeliverUnconsumed(AGENT)).toBe(1);
+    expect(heard.length).toBe(before + 1);
+    expect(heard.at(-1)!.text).toBe("work that was never done");
+    // Still unconsumed, so still redelivered — the sweep does not lose it.
+    expect(await m.redeliverUnconsumed(AGENT)).toBe(1);
+    expect(heard.length).toBe(before + 2);
+
+    // A consumer claims it inside its own transaction, as the wake path does.
+    const claimed = await db.tx((tx) => m.claimConsumption(id, tx));
+    expect(claimed).toBe(true);
+    expect((await marks(id))?.read_at).not.toBeNull();
+
+    // ...and the second delivery is now a no-op at the consumer.
+    expect(await m.redeliverUnconsumed(AGENT)).toBe(0);
+    expect(heard.length).toBe(before + 2);
+    expect(await db.tx((tx) => m.claimConsumption(id, tx))).toBe(false);
+  });
+
+  it("a consumer whose transaction rolls back leaves the message unconsumed", async () => {
+    // The receipt is atomic with the work: claim it, fail to journal the turn,
+    // and the message must come back — otherwise "consumed" would be a lie the
+    // log cannot contradict.
+    const id = await arrive("rolled back");
+    const before = heard.length;
+
+    await expect(
+      db.tx(async (tx) => {
+        expect(await m.claimConsumption(id, tx)).toBe(true);
+        throw new Error("the turn blew up after the claim");
+      }),
+    ).rejects.toThrow("the turn blew up after the claim");
+
+    expect((await marks(id))?.read_at).toBeNull();
+    expect(await m.redeliverUnconsumed(AGENT)).toBe(1);
+    expect(heard.length).toBe(before + 1);
+    // Consumed for real this time.
+    expect(await db.tx((tx) => m.claimConsumption(id, tx))).toBe(true);
+    expect(await m.redeliverUnconsumed(AGENT)).toBe(0);
+  });
+
+  it("inbox() and claimConsumption stamp the same receipt: one consumes, the other sees nothing", async () => {
+    const pollFirst = await arrive("read by the tool");
+    const claimFirst = await arrive("read by a woken run");
+
+    // The a2a_inbox tool takes both (it drains what is unread).
+    const polled = await m.inbox(AGENT);
+    expect(polled.map((e) => e.id).sort()).toEqual([pollFirst, claimFirst].sort());
+    // ...so a woken run cannot claim either of them, and nothing is redelivered.
+    expect(await db.tx((tx) => m.claimConsumption(claimFirst, tx))).toBe(false);
+    expect(await m.redeliverUnconsumed(AGENT)).toBe(0);
+
+    // The other direction: a run consumes first, and the tool sees nothing.
+    const consumed = await arrive("claimed before the poll");
+    expect(await db.tx((tx) => m.claimConsumption(consumed, tx))).toBe(true);
+    expect(await m.inbox(AGENT)).toHaveLength(0);
+  });
+
+  it("the receipt is node-scoped: another node's row is not ours to consume", async () => {
+    const other = new LocalMessenger(db, { nodeId: `${NODE_C}-x`, peers: {}, a2aSecret: SECRET });
+    const id = await arrive("ours");
+    // Same row, wrong node: the claim is scoped to node_to, like the delivery
+    // claim, so two nodes on one database cannot consume each other's mail.
+    expect(await other.claimConsumption(id)).toBe(false);
+    expect(await m.claimConsumption(id)).toBe(true);
+  });
+});

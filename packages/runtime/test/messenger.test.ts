@@ -100,9 +100,29 @@ class FakeDb implements Db {
       }
       return Promise.resolve([] as T[]);
     }
+    // claimRead(id): the consumption RECEIPT, node-scoped and only while
+    // unread. Matched BEFORE the inbox sweep — same prefix, different shape.
+    if (/update a2a_messages set read_at = now\(\) where id = \$1 and node_to = \$2/.test(s)) {
+      const row = this.rows.find(
+        (r) => r.id === p[0] && r.node_to === p[1] && r.read_at === null,
+      );
+      if (!row) return Promise.resolve([] as T[]);
+      row.read_at = `r${++this.clock}`;
+      return Promise.resolve([{ id: row.id }] as T[]);
+    }
     if (/update a2a_messages set read_at = now\(\)/.test(s)) {
       for (const r of this.unread(p[0] as string, p[1] as string)) r.read_at = `r${++this.clock}`;
       return Promise.resolve([] as T[]);
+    }
+    // unconsumedFor(agent): unread, whatever delivered_at says.
+    if (/read_at is null\s+order by created_at asc/.test(s)) {
+      const limit = (p[2] as number) ?? 100;
+      return Promise.resolve(
+        this.forAgent(p[0] as string, p[1] as string)
+          .filter((r) => r.read_at === null)
+          .slice(0, limit)
+          .map((r) => this.toRecord(r)) as T[],
+      );
     }
     if (/delivered_at is not null and read_at is null/.test(s)) {
       const limit = (p[2] as number) ?? 50;
@@ -486,6 +506,100 @@ describe("LocalMessenger.receive", () => {
     await m.receive({ ...relayed, id: "b-1", to: "broadcast" });
     expect(star).toHaveLength(1);
     expect(db.rows[0]).toMatchObject({ to_agent: "broadcast", node_to: "node2" });
+  });
+});
+
+describe("LocalMessenger consumption receipts (issue #4)", () => {
+  test("re-fires everything unread, delivered or not, and reports the count", async () => {
+    const db = new FakeDb();
+    const m = new LocalMessenger(db, { nodeId: "local" });
+    // Sent with nobody subscribed: the rows are DELIVERED (local send marks
+    // them) and unconsumed — the exact state a crash between the delivery
+    // claim and the agent's turn leaves behind.
+    await m.send(envelope("planner", "first"));
+    await m.send(envelope("planner", "second"));
+    await flushMicrotasks();
+    expect(db.rows.every((r) => r.delivered_at !== null)).toBe(true);
+
+    const heard: A2AEnvelope[] = [];
+    m.onMessage("planner", (env) => heard.push(env));
+    expect(await m.redeliverUnconsumed("planner")).toBe(2);
+    // Oldest first: a peer's messages reach the agent in the order they were sent.
+    expect(heard.map((e) => e.text)).toEqual(["first", "second"]);
+  });
+
+  test("a receipt ends redelivery; without one it fires again", async () => {
+    const db = new FakeDb();
+    const m = new LocalMessenger(db, { nodeId: "local" });
+    const id = await m.send(envelope("planner", "work"));
+    await flushMicrotasks();
+    const heard: A2AEnvelope[] = [];
+    m.onMessage("planner", (env) => heard.push(env));
+
+    // Nothing consumed it yet, so it is fired every time it is asked for —
+    // which is safe precisely because the consumer claims the receipt.
+    expect(await m.redeliverUnconsumed("planner")).toBe(1);
+    expect(await m.redeliverUnconsumed("planner")).toBe(1);
+    expect(heard).toHaveLength(2);
+
+    // The consumer claims it: exactly one caller wins.
+    expect(await m.claimConsumption(id)).toBe(true);
+    expect(await m.claimConsumption(id)).toBe(false);
+    expect(await m.redeliverUnconsumed("planner")).toBe(0);
+    expect(heard).toHaveLength(2);
+  });
+
+  test("claimConsumption runs on the caller's transaction handle when given one", async () => {
+    const db = new FakeDb();
+    const m = new LocalMessenger(db, { nodeId: "local" });
+    const id = await m.send(envelope("planner", "work"));
+    await flushMicrotasks();
+    // db.tx hands the callback a handle; the receipt must be stamped through
+    // THAT handle, so it commits with the events the consumer appends.
+    const claimed = await db.tx((tx) => m.claimConsumption(id, tx));
+    expect(claimed).toBe(true);
+    expect(db.rows[0]!.read_at).not.toBeNull();
+  });
+
+  test("inbox() and claimConsumption stamp the same receipt", async () => {
+    const db = new FakeDb();
+    const m = new LocalMessenger(db, { nodeId: "local" });
+    const id = await m.send(envelope("planner", "work"));
+    await flushMicrotasks();
+
+    expect(await m.inbox("planner")).toHaveLength(1); // marks read_at
+    // The a2a_inbox tool and a woken run cannot both consume one message.
+    expect(await m.claimConsumption(id)).toBe(false);
+    expect(await m.redeliverUnconsumed("planner")).toBe(0);
+  });
+
+  test("a message for another node is never redelivered here", async () => {
+    const db = new FakeDb();
+    const m = new LocalMessenger(db, { nodeId: "local", peers: {} });
+    await withCapturedWarnings(async () => {
+      await m.send(envelope("planner@node2", "outbound")); // no route: stays pending
+      await flushMicrotasks();
+    });
+    // Outbound rows belong to the peer's partition: consuming them here would
+    // be someone else's receipt.
+    expect(await m.redeliverUnconsumed("planner")).toBe(0);
+  });
+
+  test("a broadcast is redelivered on the same keys as a live one", async () => {
+    const db = new FakeDb();
+    const m = new LocalMessenger(db, { nodeId: "local" });
+    await m.send(envelope("broadcast", "all hands"));
+    await flushMicrotasks();
+    const star: A2AEnvelope[] = [];
+    const direct: A2AEnvelope[] = [];
+    m.onMessage("*", (env) => star.push(env));
+    m.onMessage("planner", (env) => direct.push(env));
+    // unconsumedFor picks broadcast rows up for every agent, and they fire on
+    // `broadcast`/`*` exactly as send() fires them — recovery does not invent
+    // a delivery the live path would not have made.
+    expect(await m.redeliverUnconsumed("planner")).toBe(1);
+    expect(star).toHaveLength(1);
+    expect(direct).toHaveLength(0);
   });
 });
 

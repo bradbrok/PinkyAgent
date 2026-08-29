@@ -10,6 +10,7 @@
  *   pinky memory search "<query>" [--limit N]
  *   pinky memory show <id-or-prefix>
  *   pinky memory forget <id-or-prefix> [--reason "..."]
+ *   pinky stats restarts [--channel <id>] [--limit N]   what context restarts cost
  *   pinky smoke                            end-to-end in-process smoke (FakeProvider, A2A, memory)
  *   pinky prompt "<text>"                  run one agent turn against a local cli thread
  *   pinky headless [--shell] [--a2a] [--shared]  long-lived JSONL service on stdin/stdout
@@ -41,6 +42,7 @@ import {
   MemoryStore,
   SettingsStore,
   assertScope,
+  parseA2AAddress,
   threadKey,
   type Db,
   type EnvConfig,
@@ -60,6 +62,7 @@ import {
   runAgentLoop,
   buildSystemPrompt,
   ShedContextTool,
+  type A2AEnvelope,
   type AgentRunResult,
   type AssistantTurn,
   type Embedder,
@@ -69,7 +72,7 @@ import {
   type RunAgentLoopOptions,
   type Tool,
 } from "@pinky/runtime";
-import { runHeadless, startGateway, type RawIngress } from "@pinky/gateway";
+import { runHeadless, startGateway, type RawIngress, type WakeEnqueue } from "@pinky/gateway";
 import { createTools } from "@pinky/tools";
 
 const SCHEMA_DIR = new URL("../../core/schema", import.meta.url).pathname;
@@ -297,14 +300,25 @@ export function makeRunAgent(boot: Bootstrap, opts: RunAgentOptions): RunAgent {
 }
 
 /**
- * Sender half of A2A at-least-once (DESIGN.md §7): rows a peer refused (or was
- * down for) stay pending, and only a sweep clears them. Once now, then on a
- * timer; unref'd so it never keeps the process alive by itself. Logs to
- * STDERR — a JSONL service owns stdout. Returns a stop function.
+ * Both halves of A2A at-least-once on one timer (DESIGN.md §7, issue #4).
+ * Once now, then every {@link A2A_SWEEP_MS}; unref'd so it never keeps the
+ * process alive by itself. Logs to STDERR — a JSONL service owns stdout.
+ * Returns a stop function.
+ *
+ *  - SENDER side: rows a peer refused (or was down for) stay pending, and only
+ *    a sweep clears them. No peers configured => flushPending() is a no-op.
+ *  - CONSUMER side (`redeliverFor`): every row addressed to this agent with no
+ *    consumption receipt is re-fired, so a wake lost to a crashed handler, a
+ *    process that died between the delivery claim and the turn, or a peer that
+ *    delivered while nothing was subscribed is picked up within one sweep
+ *    instead of waiting for the agent to poll `a2a_inbox`. Bounded by the
+ *    receipt, not by scheduler state: a re-fire whose message was already
+ *    consumed loses the claim and does nothing.
  */
 export function startA2ASweep(
   messenger: LocalMessenger,
   log: (msg: string) => void = (msg) => console.error(msg),
+  opts: { redeliverFor?: string } = {},
 ): () => void {
   const sweep = async (): Promise<void> => {
     try {
@@ -312,6 +326,13 @@ export function startA2ASweep(
       if (attempted > 0) log(`[a2a] retry sweep: ${delivered}/${attempted} delivered`);
     } catch (err) {
       log(`[a2a] retry sweep failed: ${errorMessage(err)}`);
+    }
+    if (opts.redeliverFor === undefined) return;
+    try {
+      const fired = await messenger.redeliverUnconsumed(opts.redeliverFor);
+      if (fired > 0) log(`[a2a] redelivered ${fired} unconsumed message(s)`);
+    } catch (err) {
+      log(`[a2a] redelivery sweep failed: ${errorMessage(err)}`);
     }
   };
   void sweep();
@@ -605,6 +626,197 @@ async function cmdMemory(args: string[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// stats — the DESIGN.md §13 eval, as a query rather than a study
+// ---------------------------------------------------------------------------
+
+/**
+ * One `restart` event joined to the assistant turn that paid for it.
+ *
+ * The successor's FIRST turn is where a restart actually costs money: the
+ * fresh window has no cache warmth, so the whole prefix is re-billed as cache
+ * *creation* (~1.25x an input token) before anything is read back cheaply.
+ * That is why the join reaches forward for the next `message` in the same
+ * thread rather than reporting the restart's own numbers alone.
+ *
+ * Every count comes back through a `::int` cast — `seq` is `bigint`, which
+ * postgres.js hands over as a STRING, and the jsonb accessors are text.
+ */
+interface RestartRow {
+  channel_id: string;
+  thread_id: string;
+  seq: number | string;
+  ts: string;
+  boundary_seq: number | null;
+  tokens_before: number | null;
+  tokens_after: number | null;
+  recall_tokens: number | null;
+  messages: number | null;
+  /** null when the provider reported no usage (most OpenAI-compatible routes). */
+  usage_input: number | null;
+  usage_cache_read: number | null;
+  usage_cache_creation: number | null;
+  usage_output: number | null;
+}
+
+const RESTART_SQL = `
+  select r.channel_id,
+         r.thread_id,
+         r.seq::int                               as seq,
+         r.ts,
+         (r.data->>'boundarySeq')::int            as boundary_seq,
+         (r.data->>'tokensBefore')::int           as tokens_before,
+         (r.data->>'tokensAfter')::int            as tokens_after,
+         (r.data->>'recallTokens')::int           as recall_tokens,
+         (r.data->>'messages')::int               as messages,
+         (m.data->'usage'->>'input')::int         as usage_input,
+         (m.data->'usage'->>'cacheRead')::int     as usage_cache_read,
+         (m.data->'usage'->>'cacheCreation')::int as usage_cache_creation,
+         (m.data->'usage'->>'output')::int        as usage_output
+    from events r
+    left join lateral (
+      select n.data
+        from events n
+       where (n.tenant_id, n.channel_id, n.thread_id) = (r.tenant_id, r.channel_id, r.thread_id)
+         and n.seq > r.seq
+         and n.type = 'message'
+       order by n.seq asc
+       limit 1
+    ) m on true
+   where r.tenant_id = $1
+     and r.type = 'restart'
+     and ($2::text is null or r.channel_id = $2)
+   order by r.ts desc, r.seq desc
+   limit $3`;
+
+/** Width of the `channel/thread` column; longer labels are clipped at the head. */
+const THREAD_COL = 40;
+
+const padRight = (s: string, n: number): string => (s.length >= n ? s : s + " ".repeat(n - s.length));
+const padLeft = (s: string, n: number): string => (s.length >= n ? s : " ".repeat(n - s.length) + s);
+
+/** `<channel>/<thread>`, tail-clipped: the thread id is the distinguishing half. */
+function threadLabel(row: RestartRow): string {
+  const label = `${row.channel_id}/${row.thread_id}`;
+  return label.length > THREAD_COL ? `…${label.slice(-(THREAD_COL - 1))}` : label;
+}
+
+const count = (n: number | null): string => (n === null ? "-" : String(n));
+
+/** `-16110 (-93%)` — how much smaller the fresh window is than what it replaced. */
+function change(before: number | null, after: number | null): string {
+  if (before === null || after === null) return "-";
+  const delta = after - before;
+  const sign = delta > 0 ? "+" : "";
+  if (before <= 0) return `${sign}${delta}`;
+  return `${sign}${delta} (${sign}${Math.round((delta / before) * 100)}%)`;
+}
+
+/** The successor's first turn, or `n/a` when the provider reported no usage. */
+function firstTurn(row: RestartRow): string {
+  if (row.usage_input === null && row.usage_output === null) return "n/a";
+  return [
+    `in ${count(row.usage_input)}`,
+    `read ${count(row.usage_cache_read)}`,
+    `write ${count(row.usage_cache_creation)}`,
+    `out ${count(row.usage_output)}`,
+  ].join(" ");
+}
+
+/**
+ * Share of the successor's first-turn input that was a cache WRITE — the
+ * number issue #5 is really about. 1.0 means the restart threw away every byte
+ * of warmth and paid the premium to re-create it; a low number means the
+ * stable prefix (DESIGN.md §4.5/§9) survived and was read back cheaply.
+ *
+ * Null when the provider reported no cache counters at all (most
+ * OpenAI-compatible routes) rather than 0: "nothing was written" and "nobody
+ * counted" are different answers, and averaging the second in as a zero would
+ * quietly report a cheap restart that was never measured.
+ */
+function cacheWriteShare(row: RestartRow): number | null {
+  if (row.usage_cache_read === null && row.usage_cache_creation === null) return null;
+  const input = row.usage_input ?? 0;
+  const read = row.usage_cache_read ?? 0;
+  const write = row.usage_cache_creation ?? 0;
+  const total = input + read + write;
+  if (total <= 0) return null;
+  return write / total;
+}
+
+const mean = (xs: number[]): number | null =>
+  xs.length === 0 ? null : xs.reduce((a, b) => a + b, 0) / xs.length;
+
+const STATS_USAGE =
+  "usage: pinky stats <restarts> ...\n" +
+  "  pinky stats restarts [--channel <id>] [--limit N]";
+
+/**
+ * `pinky stats restarts` — what context restarts cost this tenant.
+ *
+ * DESIGN.md §13 lists "restarts discard cache warmth; measure $/task vs a
+ * compaction baseline" as an open question. Because the loop journals a
+ * `restart` event per boundary and the provider's `usage` on every assistant
+ * turn, answering it is one read of the log: no sampling, no instrumentation
+ * to switch on, and the time series is already there for a threshold change to
+ * be judged against.
+ *
+ * Read-only, so it does not migrate (`migrate: false`) and takes no embedder.
+ */
+async function cmdStats(args: string[]): Promise<void> {
+  const [sub, ...raw] = args;
+  if (sub !== "restarts") throw new Error(STATS_USAGE);
+  const { flags } = parseFlags(raw);
+  const channel = stringFlag(flags, "channel");
+  const limit = intFlag(flags, "limit", 20);
+
+  const boot = await bootstrap({ migrate: false, embedder: null });
+  try {
+    const rows = await boot.db.query<RestartRow>(RESTART_SQL, [
+      boot.settings.tenantId,
+      channel ?? null,
+      limit,
+    ]);
+
+    console.log(
+      `${padRight("thread", THREAD_COL)}  ${padLeft("bnd", 5)}  ${padLeft("before", 8)}    ` +
+        `${padLeft("after", 7)}  ${padLeft("change", 15)}  ${padLeft("recall", 7)}  ` +
+        `${padLeft("msgs", 4)}  first turn`,
+    );
+    for (const row of rows) {
+      console.log(
+        `${padRight(threadLabel(row), THREAD_COL)}  ` +
+          `${padLeft(count(row.boundary_seq), 5)}  ` +
+          `${padLeft(count(row.tokens_before), 8)} -> ${padLeft(count(row.tokens_after), 7)}  ` +
+          `${padLeft(change(row.tokens_before, row.tokens_after), 15)}  ` +
+          `${padLeft(count(row.recall_tokens), 7)}  ${padLeft(count(row.messages), 4)}  ` +
+          firstTurn(row),
+      );
+    }
+    if (rows.length === 0) {
+      console.log(
+        `(no restart events${channel ? ` in channel ${channel}` : ""} for tenant ${boot.settings.tenantId})`,
+      );
+    }
+
+    const after = rows.map((r) => r.tokens_after).filter((n): n is number => n !== null);
+    const shares = rows.map(cacheWriteShare).filter((n): n is number => n !== null);
+    const meanAfter = mean(after);
+    const meanShare = mean(shares);
+    const rebuildCost = after.reduce((a, b) => a + b, 0);
+    console.log("");
+    console.log(
+      `restarts ${rows.length}  ` +
+        `mean tokensAfter ${meanAfter === null ? "n/a" : Math.round(meanAfter)}  ` +
+        `mean cache-write share ${meanShare === null ? "n/a" : `${Math.round(meanShare * 100)}%`}` +
+        ` (${shares.length}/${rows.length} turns reported cache usage)  ` +
+        `est. rebuild cost ${rebuildCost} tokens`,
+    );
+  } finally {
+    await boot.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // smoke
 // ---------------------------------------------------------------------------
 
@@ -638,9 +850,17 @@ async function cmdSmoke(): Promise<void> {
   const threadM: ThreadRef = { tenantId: settings.tenantId, channelId: "cli:smoke", threadId: "memory" };
   const threadR: ThreadRef = { tenantId: settings.tenantId, channelId: "cli:smoke", threadId: "memory-recall" };
 
-  const betaInbox: string[] = [];
+  // `alpha` and `beta` are smoke's own addresses on this node, and the receipt
+  // counts below are exact counts — so anything an interrupted earlier run
+  // left in this node's partition is cleared first.
+  await db.query(
+    `delete from a2a_messages where node_to = $1 and to_agent in ('alpha', 'beta')`,
+    [env.nodeId],
+  );
+
+  const betaHeard: A2AEnvelope[] = [];
   messenger.onMessage("beta", (env2) => {
-    betaInbox.push(`${env2.from}: ${env2.text}`);
+    betaHeard.push(env2);
   });
 
   // --- 1. A2A round trip -------------------------------------------------
@@ -660,6 +880,22 @@ async function cmdSmoke(): Promise<void> {
     provider: new FakeProvider(alphaScript),
     settingsFor: () => Promise.resolve(smokeSettings),
   })(threadA);
+
+  // --- 1b. the consumption receipt (issue #4) ----------------------------
+  // The row alpha just sent is DELIVERED (local send marks it) but nothing has
+  // consumed it: the subscriber above only appended to an array. That is
+  // exactly the state a crash between the delivery claim and the agent's turn
+  // leaves behind, and `delivered_at` cannot tell the two apart — so recovery
+  // keys on the receipt (`read_at`) instead and re-fires everything unread.
+  const heardAfterSend = betaHeard.length;
+  const firedUnread = await messenger.redeliverUnconsumed("beta");
+  const heardAfterRedeliver = betaHeard.length;
+  // inbox() stamps the receipt (same column claimConsumption writes), so the
+  // very next redelivery has nothing left to fire.
+  const inbox = await messenger.inbox("beta");
+  const firedAfterReceipt = await messenger.redeliverUnconsumed("beta");
+  const claimedAfterReceipt =
+    betaHeard[0] !== undefined && (await messenger.claimConsumption(betaHeard[0].id));
 
   // --- 2. retain -> recall round trip through the tools ------------------
   const memoryScope: RecallScope = {
@@ -720,7 +956,6 @@ async function cmdSmoke(): Promise<void> {
     scopeFor: () => ({ ...memoryScope, channelId: threadR.channelId }),
   })(threadR);
 
-  const inbox = await messenger.inbox("beta");
   const historyA = await events.history(threadA);
   const historyB = await events.history(threadB);
   const historyM = (await events.history(threadM)).slice(markM);
@@ -739,7 +974,16 @@ async function cmdSmoke(): Promise<void> {
   const checks: [string, boolean][] = [
     ["alpha ran to completion", runA.stopReason === "completed"],
     ["a2a message delivered to beta", inbox.length === 1 && inbox[0]!.text === "what is 2+2?"],
-    ["live subscriber saw the message", betaInbox.length === 1],
+    ["live subscriber saw the message", heardAfterSend === 1],
+    [
+      "delivered-but-unconsumed is re-fired (crash recovery)",
+      firedUnread === 1 && heardAfterRedeliver === heardAfterSend + 1,
+    ],
+    [
+      "the receipt stops redelivery",
+      firedAfterReceipt === 0 && betaHeard.length === heardAfterRedeliver,
+    ],
+    ["a consumed message cannot be claimed twice", claimedAfterReceipt === false],
     ["alpha thread logged assistant message", historyA.some((e) => e.data.type === "message")],
     ["alpha thread logged tool_result", historyA.some((e) => e.data.type === "tool_result")],
     ["beta thread untouched (mailbox, not thread)", historyB.length === 0],
@@ -847,6 +1091,127 @@ function logStderr(msg: string): void {
 }
 
 /**
+ * Where a peer's message lands in the log.
+ *
+ * `channelId` is `a2a:<agentId@nodeId>` — the SENDER's normalized address, so
+ * every peer gets its own channel: settings (model, thresholds, `selfConfig`)
+ * are per-channel, which means a peer can be given a different model or budget
+ * than the human pipe without a new config layer, and one chatty peer cannot
+ * crowd another out of a shared thread.
+ *
+ * `threadId` is the sender's `threadHint` (a2a_send sets it to the thread the
+ * sending agent was working in) and `main` when it names none. Namespaced by
+ * the sender's channel, that gives one conversation per (peer, their thread) —
+ * a request and its response project into the same window, which is what makes
+ * a reply intelligible to the model, while an unrelated peer conversation
+ * never contaminates it.
+ */
+function a2aThreadFor(
+  tenantId: string,
+  env: A2AEnvelope,
+  nodeId: string,
+): { thread: ThreadRef; from: string } {
+  const addr = parseA2AAddress(env.from, nodeId);
+  // Normalized once, here: a locally-fired envelope may carry a bare `alpha`
+  // while the same row read back from the mailbox says `alpha@local`, and one
+  // peer must not end up with two channels.
+  const from = `${addr.agentId}@${addr.nodeId}`;
+  return {
+    thread: { tenantId, channelId: `a2a:${from}`, threadId: env.threadHint ?? "main" },
+    from,
+  };
+}
+
+/**
+ * A2A as a headless WAKE SOURCE (DESIGN.md §7 wake-on-message, §8.1 "one
+ * wake(thread_id, cause) entry point"; issue #4).
+ *
+ * Until this existed, a message that arrived while `pinky headless` was
+ * running only reached the agent if it happened to call the `a2a_inbox` tool:
+ * `LocalMessenger` fired subscribers and nothing in production subscribed. The
+ * mailbox row said `delivered_at`, which is scheduler bookkeeping — proof that
+ * this node took custody, not that anyone acted.
+ *
+ * So the consumer, and only the consumer, decides a message is done:
+ *
+ *   1. ONE transaction claims the receipt (`read_at`) and appends the `a2a`
+ *      event. Both commit or neither does — there is no state where a message
+ *      is marked consumed with nothing in the log to show for it, and none
+ *      where the event exists twice.
+ *   2. Only the transaction that won the claim enqueues the run. The batch is
+ *      just the author hint; the run reads the event log, where step 1 put the
+ *      message (core/projection.ts renders `a2a` as a user turn).
+ *   3. Recovery is `redeliverUnconsumed` — at startup, before the session
+ *      accepts input, and again on the 30s sweep. Re-firing is free: a message
+ *      already consumed loses the claim in step 1 and enqueues nothing.
+ *
+ * A handler that throws leaves the row unread, so the next sweep retries it.
+ * Everything logs to stderr; stdout is the protocol.
+ */
+function a2aWakeSource(
+  boot: Bootstrap,
+  log: (msg: string) => void,
+): (enqueue: WakeEnqueue) => Promise<() => void> {
+  const { tenantId } = boot.settings;
+  const { nodeId } = boot.env;
+
+  const consume = async (env: A2AEnvelope, enqueue: WakeEnqueue): Promise<void> => {
+    const { thread, from } = a2aThreadFor(tenantId, env, nodeId);
+    // Normalized like `from`: a live fire carries whatever the sender typed
+    // (`pinky`), a redelivered row carries the stored form (`pinky@local`),
+    // and the journaled event should read the same either way.
+    const toAddr = parseA2AAddress(env.to, nodeId);
+    const to = `${toAddr.agentId}@${toAddr.nodeId}`;
+    const consumed = await boot.db.tx(async (tx) => {
+      // The receipt is the idempotency hinge: lose the claim and another
+      // consumer (or an earlier delivery of the same row) already has this.
+      if (!(await boot.messenger.claimConsumption(env.id, tx))) return false;
+      await EventStore.appendTx(tx, thread, [
+        {
+          type: "a2a",
+          from,
+          to,
+          kind: env.kind,
+          text: env.text,
+          msgId: env.id,
+        },
+      ]);
+      return true;
+    });
+    if (!consumed) return;
+    enqueue(
+      thread,
+      [{ text: env.text, author: { platform: "a2a", userId: from }, externalId: env.id }],
+      "a2a",
+    );
+  };
+
+  return async (enqueue) => {
+    // Handlers are fired synchronously but finish asynchronously, so the
+    // startup drain below has to wait for the turns it started, not just for
+    // the fires: the session reads its first command only after this resolves.
+    const inFlight = new Set<Promise<void>>();
+    const unsubscribe = boot.messenger.onMessage(AGENT_ID, (env) => {
+      const done = consume(env, enqueue).catch((err) => {
+        log(`[a2a] wake for ${env.id} failed (left unconsumed for the sweep): ${errorMessage(err)}`);
+      });
+      inFlight.add(done);
+      void done.finally(() => inFlight.delete(done));
+    });
+    try {
+      const fired = await boot.messenger.redeliverUnconsumed(AGENT_ID);
+      await Promise.all([...inFlight]);
+      if (fired > 0) log(`[a2a] startup recovery: re-fired ${fired} unconsumed message(s)`);
+    } catch (err) {
+      // Recovery failing is not a reason to refuse the session: the sweep
+      // retries in 30s and stdin works meanwhile.
+      log(`[a2a] startup recovery failed: ${errorMessage(err)}`);
+    }
+    return unsubscribe;
+  };
+}
+
+/**
  * `pinky headless [--shell] [--a2a]` — one command object per stdin line, one
  * event object per stdout line, for as long as the caller keeps the pipe open.
  *
@@ -860,8 +1225,14 @@ function logStderr(msg: string): void {
  *    why `ready` reports `defaultModel`: the bootstrap snapshot, not a promise
  *    about what any particular run will use.
  * 3. No HTTP listener unless `--a2a`. The protocol needs no socket; only
- *    inbound A2A does. Outbound A2A retries need no listener, so the sweep
- *    runs whenever peers are configured either way.
+ *    inbound A2A from another MACHINE does. The sweep runs either way: its
+ *    sender half is idle without peers, but its consumer half (redelivering
+ *    unconsumed messages) matters on a single node too.
+ *
+ * Wake-on-message is wired here and nowhere else: `wakes` (a2aWakeSource)
+ * subscribes this process to its own mailbox, so a peer's message journals an
+ * `a2a` event and wakes a run on that peer's thread — `run_started` carries
+ * `"cause":"a2a"` — instead of waiting for the agent to poll `a2a_inbox`.
  *
  * The recall scope is the trusted-local one by default (`user` + `private`
  * visible, DESIGN.md §5.1): the process reads its commands from a pipe its
@@ -952,8 +1323,10 @@ async function cmdHeadless(args: string[]): Promise<void> {
         logStderr(`[a2a] listening on :${server.port} (POST /a2a/deliver, GET /healthz)`);
       }
     }
-    const peers = Object.keys(started.env.peers);
-    stopSweep = peers.length > 0 ? startA2ASweep(started.messenger, logStderr) : undefined;
+    // Always swept, peers or not: the sender-side retry has nothing to do
+    // without peers, but the consumer-side redelivery does — an unconsumed
+    // message is a single-node failure mode too (issue #4).
+    stopSweep = startA2ASweep(started.messenger, logStderr, { redeliverFor: AGENT_ID });
 
     await runHeadless({
       tenantId: started.settings.tenantId,
@@ -967,6 +1340,9 @@ async function cmdHeadless(args: string[]): Promise<void> {
           { deliver: hooks.deliver, signal: hooks.signal, onEvent: hooks.onEvent },
           batch,
         ),
+      // stdin is not the only way to reach this agent: a peer's message wakes
+      // a run through the same lane (DESIGN.md §7, §8.1).
+      wakes: a2aWakeSource(started, logStderr),
       stdin: Bun.stdin.stream(),
       write,
       log: logStderr,
@@ -1001,6 +1377,9 @@ try {
     case "memory":
       await cmdMemory(rest);
       break;
+    case "stats":
+      await cmdStats(rest);
+      break;
     case "smoke":
       await cmdSmoke();
       break;
@@ -1012,7 +1391,7 @@ try {
       await cmdHeadless(rest);
       break;
     default:
-      console.error("usage: pinky <migrate|config|memory|smoke|prompt|headless>");
+      console.error("usage: pinky <migrate|config|memory|stats|smoke|prompt|headless>");
       process.exit(cmd ? 1 : 0);
   }
 } catch (err) {

@@ -991,7 +991,7 @@ const COLD_READ_FLOOR = 1024;
 /**
  * warm -> cold: the previous turn in this thread read a real cached prefix,
  * and this one read none from a prompt that was big enough to have been
- * cached. oh-my-pi's cache-invalidation marker.
+ * cached. the warm→cold "cache-invalidation marker" pattern.
  *
  * Deliberately conditioned on the READ counter alone. Requiring a cache WRITE
  * (`cacheCreation > 0`) would make the marker — and the summary's

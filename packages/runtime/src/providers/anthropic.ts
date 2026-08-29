@@ -227,7 +227,7 @@ export function buildSystemBlocks(
 
 /**
  * The conversation half of the layout: a marker on the LAST content block of
- * the last two messages (oh-my-pi's rolling window). Pure — it returns a new
+ * the last two messages (a rolling two-message window). Pure — it returns a new
  * array and clones only the blocks it stamps, so the caller's messages are
  * never mutated and an unmarked request is byte-identical to its input.
  *

@@ -1,0 +1,64 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+PinkyAgent is a headless, event-sourced agent runtime (Bun 1.4 + TypeScript workspace, Postgres 16). **DESIGN.md is the spec**; code comments cite it by section (`DESIGN.md §4.1`). README.md covers status, quickstart, CLI, and env vars — don't duplicate those here. Read DESIGN.md §1 (pillars) before changing anything structural.
+
+## Commands
+
+```sh
+bun install                      # hoisted linker (bunfig.toml) — needed for @pinky/* resolution
+bun run typecheck                # tsc --noEmit over src + test; strict, noUncheckedIndexedAccess, exactOptionalPropertyTypes
+bun test                         # unit suite: all fakes, no DB/network, ~1.3s
+bun test packages/core/test/settings.test.ts      # one file
+bun test -t "scoped load"                          # by test name pattern
+bun run db:up                    # docker postgres:16-alpine on localhost:5544 (5432 is taken by other projects)
+bun run db:up:vector             # SECOND server, pgvector/pgvector:pg16 on 5545 (compose profile "vector")
+bun run migrate                  # apply packages/core/schema/*.sql (uses DATABASE_ADMIN_URL ?? DATABASE_URL)
+bun run test:integration         # PINKY_INTEGRATION=1 against the live DB — requires db:up + migrate
+bun run test:integration:vector  # same suite pinned at 5545 — the only local run of the vector voice
+bun run smoke                    # fastest whole-stack check (fake provider+embedder, real DB, local A2A, memory)
+PINKY_NODE_ID=node2 bun run smoke                  # same, with a non-default node id (cross-node mailbox path)
+bun run headless                 # the JSONL service on stdin/stdout (`pinky headless [--shell] [--a2a]`)
+echo '{"type":"prompt","text":"hi"}' | bun run headless             # one round trip, then EOF == exit
+bun run packages/cli/src/index.ts <migrate|config|memory|smoke|prompt|headless>   # the `pinky` CLI; no installed binary
+bun run packages/cli/src/index.ts memory <list|search|show|forget>  # human read/retire surface over the memory plane
+```
+
+No linter/formatter is configured. `.env` is optional for local dev — `loadEnvConfig()` defaults point at the compose DB. `prompt`/`headless` need an LLM key unless the model is `fake/echo` or `fake/retain-recall` (keyless scripted route, `runtime/providers/fake.ts`); embeddings need `OPENAI_API_KEY`/`OPENROUTER_API_KEY` and degrade to FTS-only without one; nothing else needs a secret.
+
+## Architecture — the invariants that span packages
+
+Dependency direction: `core ← runtime ← tools, gateway ← cli`. `packages/runtime/src/types.ts` is the cross-package contract (`Provider`, `Tool`/`ToolContext`, `Messenger`, `AgentLoopOptions`); change it deliberately.
+
+**1. The event log is the state; the prompt is a projection.** Every thread `(tenantId, channelId, threadId)` is an append-only `events` row sequence (`seq` per thread, assigned under a `threads` row lock). `runAgentLoop` (runtime/loop.ts) loads `EventStore.contextEvents()` — events from the latest `continuity` event onward, newest-kept if over the cap — and `buildContext()` (core/projection.ts) renders only `ingress`/`message`/`tool_result`/`continuity`; everything else (`decision`, `egress`, `error`, …) is audit-only. Never mutate stored events; append. `seq` is `bigint` and postgres.js returns it as a string — coerce with `toSeq()` at the store boundary, never compare raw.
+
+**2. Context restarts, not compaction (DESIGN §4).** `ShedContextTool` (runtime/continuity.ts, deliberately *not* in `createTools()`) validates a `ContinuityDoc` and emits a `continuity` event; the loop then rebuilds messages from the new boundary and continues. The pressure ladder in loop.ts injects `[harness notice]` messages as **user** role — never `role: "system"` mid-conversation and never by rewriting `opts.systemPrompt` — because the system prompt is the cached prefix (§4.5/§9). The projection drops `tool_result`s whose call isn't rendered (a shed leaves one orphan by construction).
+
+**3. Two config layers; one human write path, one gated agent write path (P8, revised).** `loadEnvConfig()` = bootstrap only (DB URLs, secrets, node id, port). Everything behavioral (`model`, context thresholds, `memory.*`, `selfConfig.*`, `tenantId`) is the `settings` table, read via `SettingsStore.load({ scopes })` with overlay `global < channel:<id> < agent:<id>` and run through `validateSettings()`. Long-lived surfaces reload per run with `["channel:<thread.channelId>", "agent:<id>"]` (`makeRunAgent`'s `settingsFor`), which is what makes a write visible on the *next* run. **Config never lives in a file** — that is the point: a bad value can't stop a boot. The human CLI (`pinky config set`) is the default write path. The *only* agent write path is the `settings_set` tool (tools/settings.ts): gated on `selfConfig.enabled` + `selfConfig.allowedKeys`, scoped to `agent:<self>` or `channel:<current>` (never `global`), with `tenantId` and `selfConfig.*` hard-denied even by `"*"`, validated by `SettingsStore.set` **before** the insert (a bad value is a tool error, never a broken table), and journaled as an audit-only `config` event. Don't add a second agent write path, and never a file-based one.
+
+**4. Db contract (core/pg.ts header).** Positional `$n` params. **jsonb params take plain values — never `JSON.stringify` them** (postgres.js serializes once; double encoding stores a jsonb *string*; `0004_jsonb_repair.rerun.sql` exists to undo exactly that). Bare booleans/Dates/bigints go through `jsonbParam()`. `withTenant(db, tenantId)` wraps a `Db` so every tx opens with `set_config('pinky.tenant_id', …, true)` — that GUC is what the `memories` RLS policy keys on; RLS only bites under the `pinky_app` role (superuser bypasses). Migrations: `NNNN_name.sql` runs once and is recorded (unguarded DDL — it must fail loudly, not record itself as applied); `NNNN_name.rerun.sql` runs on every migrate, must be idempotent, and DO-block-guards `insufficient_privilege` because `memory`/`smoke`/`prompt`/`headless` auto-migrate at startup via `bootstrap()` (`config` does not).
+
+**5. Headless JSONL pipeline (gateway/headless.ts, DESIGN §11 gateways).** Slack is gone; the primary ingress is a stdio protocol: one command object per stdin line, one event object per stdout line. `parseCommand` (a rejection is a value, not a throw) → `EventSink.ingest(thread, externalId, [ingress])` writes the dedup claim + the `ingress` in **one transaction** (`null` return = already seen ⇒ no run) → enqueue on a per-`(channelId, threadId)` promise chain → **one** `runAgent(thread, batch, hooks)` per prompt, serialized per lane, concurrent across lanes. The loop streams every event it appends through `AgentLoopOptions.onEvent` (fire-and-forget; a throwing observer can't kill a journaled run) and every `deliver()` becomes a `reply` line. Ordering is guaranteed **per thread**: `run_started → (event | reply)* → run_finished`; a thrown run gets `error` instead of `run_finished`. Every prompt is addressed to the agent, so there is no reply gate on this path. **stdout is protocol-only** — `opts.write` is the single output path, everything human goes to stderr (that includes Postgres notices, `core/pg.ts` `onnotice` → `console.warn`). `gateway/server.ts` is now A2A relay only (`GET /healthz`, `POST /a2a/deliver`), started only by `pinky headless --a2a`.
+
+**6. A2A (DESIGN §7).** Addresses are `agentId@nodeId`; `Mailbox` is bound to its node and normalizes unqualified / `@<self>` addresses to itself. `LocalMessenger.send()` persists first (at-least-once), then fires local subscribers or POSTs an HMAC-signed envelope to a peer. **Idempotency hinges on the delivery claim, not row existence**: `receive()` = insert-if-absent, then `claimDelivery()` (`update … where delivered_at is null returning id`), firing only on a successful claim — this is what makes separate-DB nodes, shared-DB nodes, and replays one code path. `flushPending()` re-sends undelivered rows (re-stamping `sentAt` for the 300s freshness window); `startA2ASweep()` (cli) runs it on a 30s timer whenever peers are configured, logging to **stderr**.
+
+**7. Providers (runtime/providers).** `retry.ts` is shared: retries 408/409/429/5xx/network with jittered backoff and `retry-after`, per-attempt timeout, and **never after the stream has yielded**. Anthropic sends `system` as `[stable block w/ cache_control, …suffix blocks without]`. Model ids are `provider/model-id` (`openrouter/moonshotai/kimi-k2` → OpenAI-compatible route); `splitModel` splits on the first `/`.
+
+**8. Tools (packages/tools).** Path tools go through `sandboxResolve` (lexical containment under `ctx.cwd`). `bash` spawns with an explicit env allowlist and is excluded from `createTools()` unless `{ shell: true }` — `pinky prompt` opts in (a human at their own terminal); `pinky headless` does not unless `--shell`, because it is driven by another program. `recall`/`retain`/`memory_edit` and `settings_get`/`settings_set` are always registered and degrade to a clean `isError` when the runtime hands them no `ctx.memory` / `ctx.settings` — same pattern as the a2a tools without a messenger.
+
+**9. Memory plane (packages/core/src/memory.ts, DESIGN §5).** `new MemoryStore(db, tenantId)` takes the **withTenant-wrapped** db *and* the tenantId: RLS keys on the `pinky.tenant_id` GUC but is bypassed by a superuser (which a dev checkout is), so the store also writes `tenant_id` and repeats it in every WHERE. Every read goes through `scopePredicate()` (§5.1) — never a filter applied afterwards. **Invalidate, never delete**: nothing here issues a DELETE; `update()` stamps `valid_to` and inserts the replacement in one transaction. Retrieval is two voices (pgvector cosine + Postgres FTS on the generated `tsv`) fused by `fuseHits()` (RRF k=60, then recency/importance rescore); either voice may be absent and both absent degrades to a newest-first listing. **Vector params are the pgvector text form** `'[0.1,0.2]'` (`vectorLiteral()`) with an explicit `::vector` cast — a JS `number[]` binds a `float8[]` postgres refuses to coerce. Embeddings are optional *everywhere*: `supportsVectors()` (one cached probe for `memories.embedding`) gates both the embedding on `retain` and the vector voice on `search`, and a missing API key means `createEmbedder` throws an `embeddings disabled:` error the caller catches, warns once, and runs FTS-only — so build every embedder/embedding field with a conditional spread. Auto-recall (`runtime/memory-recall.ts`) injects the `<memories>` block as a **`user` message at index 0**, at context start and after each restart, budgeted by `memory.recallTokenBudget` — never the system prompt (§4.5/§9 cache prefix). `memory` and `config` events are audit-only; the projection skips both.
+
+## Testing conventions
+
+- Unit tests use hand-rolled fakes: a `FakeDb` that records SQL/params (assert on SQL fragments and `params`, and on `txLog` for "one transaction" claims) and `FakeProvider` (scripted `AssistantTurn[]` or a function). Snapshot prompts passed to the provider — the loop mutates the array it hands over.
+- Integration tests live in `packages/{core,runtime,cli}/test/integration/`, gated on `process.env.PINKY_INTEGRATION === "1"`, read the DB URL from `loadEnvConfig()` (CI uses port 5432, local 5544), use unique ids per run, and delete only what they created. Tests named `DEFECT: …` are regression guards for bugs the unit suite missed — the SQL is only exercised here, so a green `bun test` is not evidence for anything that touches Postgres or the wire.
+- `cli/test/integration/headless.test.ts` spawns `pinky headless` as a **real child process** with the channel's model set to `fake/echo`, and asserts every stdout line parses as JSON. It is the only test that can catch something on the startup path printing to stdout; `gateway/test/headless.test.ts` injects `write`, so a stray `console.log` is structurally invisible there.
+- The vector voice runs only where pgvector exists: CI (`.github/workflows/ci.yml`, `pgvector/pgvector:pg16`) and locally on 5545 via `db:up:vector` + `test:integration:vector`. On the default alpine server `memories.embedding` never exists, so `supportsVectors()` is false and the FTS-only branch is what gets executed — both branches matter, run both.
+- `bun run smoke` now covers the memory plane too (retain → recall through the tools, plus auto-recall injecting `<memories>` at `messages[0]` on a fresh thread) with a `FakeEmbedder` at 1536 dimensions so it matches the real column in CI.
+
+## TypeScript notes
+
+`exactOptionalPropertyTypes` is on: build optional fields with conditional spreads (`...(x ? { x } : {})`), not `x: undefined`. `verbatimModuleSyntax` is on: `import type` for types. The repo has exactly one runtime dependency (`postgres`); don't add more without a reason.

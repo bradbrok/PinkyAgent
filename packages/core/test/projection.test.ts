@@ -150,6 +150,42 @@ describe("buildContext", () => {
     expect(msgs).toHaveLength(1);
     expect(msgs[0]!.text).toBe("[cli u1]: hi");
   });
+
+  // DESIGN.md §5.3: memory writes/recalls are journaled for audit, but the
+  // model sees recalled memories only via the injected <memories> block the
+  // loop builds — never as a replayed event. A `memory` event rendering here
+  // would duplicate that block on every later turn.
+  // DESIGN.md P8 (revised): a settings change the agent made through
+  // `settings_set` is journaled for audit, but it is not conversation. It also
+  // must not read back as an instruction on a later turn — the new value
+  // reaches the agent as the next run's snapshot, not as a message.
+  it("skips config events (audit-only, DESIGN.md P8 revised)", () => {
+    nextSeq = 0;
+    const msgs = buildContext([
+      ingress("turn your advisory threshold down"),
+      ev({
+        type: "config",
+        scope: "agent:pinky",
+        key: "context.advisoryFraction",
+        value: 0.6,
+        previous: 0.7,
+        by: "pinky",
+      }),
+    ]);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]!.text).toBe("[cli u1]: turn your advisory threshold down");
+  });
+
+  it("skips memory events (audit-only, DESIGN.md §5.3)", () => {
+    nextSeq = 0;
+    const msgs = buildContext([
+      ingress("what do you know about me?"),
+      ev({ type: "memory", op: "recall", ids: ["m1", "m2"], text: "about me", count: 2 }),
+      ev({ type: "memory", op: "retain", ids: ["m3"], text: "Brad prefers terse answers" }),
+    ]);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]!.text).toBe("[cli u1]: what do you know about me?");
+  });
 });
 
 describe("estimateTokens", () => {

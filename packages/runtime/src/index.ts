@@ -4,3 +4,5 @@ export * from "./continuity";
 export * from "./messenger";
 export * from "./system-prompt";
 export * from "./providers/index";
+export * from "./embeddings";
+export * from "./memory-recall";

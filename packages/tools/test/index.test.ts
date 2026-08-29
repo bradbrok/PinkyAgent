@@ -2,7 +2,23 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createTools } from "../src/index";
 import { makeCtx, makeTmpDir } from "./helpers";
 
-const BASE_TOOLS = ["read", "write", "edit", "glob", "grep", "a2a_send", "a2a_inbox"];
+const BASE_TOOLS = [
+  "read",
+  "write",
+  "edit",
+  "glob",
+  "grep",
+  "a2a_send",
+  "a2a_inbox",
+  "recall",
+  "retain",
+  "memory_edit",
+  // Always registered, like the memory tools: without a settings snapshot in
+  // context they answer with a clean error, and `settings_set` is inert until
+  // a human turns selfConfig on (DESIGN.md P8, revised).
+  "settings_get",
+  "settings_set",
+];
 
 describe("createTools", () => {
   test("omits bash by default (Slack-reachable surfaces get no shell)", () => {

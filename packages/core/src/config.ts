@@ -5,7 +5,11 @@
  *   Never read by the agent loop directly.
  * - SettingsSnapshot — all *behavioral* config, loaded from the `settings`
  *   table by the human-owned CLI / gateway startup. The agent runtime receives
- *   a snapshot; it has no write path (no self-reconfiguration).
+ *   a snapshot; the only write path it has is the `settings_set` tool, and
+ *   only for the keys a human allow-listed under `selfConfig` (DESIGN.md P8 as
+ *   revised: "human-granted self-configuration"). Config never lives in a
+ *   file, so a malformed value can never stop the process from starting — a
+ *   rejected write is a tool error the agent reads and retries.
  */
 
 export interface EnvConfig {
@@ -23,7 +27,6 @@ export interface EnvConfig {
   peers: Record<string, string>;
   /** HMAC secret shared by all A2A nodes. */
   a2aSecret: string;
-  slack: { botToken: string; signingSecret: string };
   port: number;
 }
 
@@ -43,28 +46,27 @@ export function loadEnvConfig(env: Record<string, string | undefined> = process.
     nodeId: env.PINKY_NODE_ID ?? "local",
     peers,
     a2aSecret: env.A2A_SECRET ?? "",
-    slack: {
-      botToken: env.SLACK_BOT_TOKEN ?? "",
-      signingSecret: env.SLACK_SIGNING_SECRET ?? "",
-    },
     port: Number(env.PORT ?? 3000),
   };
 }
 
 /**
- * Fail fast when a gateway secret is missing.
+ * Fail fast when a process that can talk to A2A peers has no HMAC key.
  *
- * Both signature checks the gateway performs are HMACs, and an HMAC over an
- * EMPTY key is still a perfectly valid HMAC: `verifySlackRequest("", ...)` and
- * the A2A check both accept anything an attacker can compute for themselves.
- * An unset secret is therefore not "auth disabled", it is "auth forged", so a
- * gateway that would listen on a public port refuses to start instead.
+ * The A2A signature check is an HMAC, and an HMAC over an EMPTY key is still a
+ * perfectly valid HMAC: it accepts anything an attacker can compute for
+ * themselves. An unset secret is therefore not "auth disabled", it is "auth
+ * forged", so a process that would exchange envelopes with a peer refuses to
+ * start instead.
  *
- * Rules:
- *  - SLACK_SIGNING_SECRET and SLACK_BOT_TOKEN are always required (the gateway
- *    exists to verify and answer Slack).
- *  - A2A_SECRET is required only when PINKY_PEERS names at least one peer;
- *    with no peers the relay is disabled outright (server.ts answers 503).
+ * One rule, and it only bites when it can: A2A_SECRET is required as soon as
+ * PINKY_PEERS names at least one peer. With no peers there is nothing to
+ * forge — the relay is disabled outright (server.ts answers 503) — so a
+ * single-node dev box needs no secret at all.
+ *
+ * Called at startup by every process that opens a messenger: the headless
+ * service (which is where PINKY_PEERS actually matters), `pinky prompt`, and
+ * `pinky smoke` (which zeroes its peers, so it never trips).
  *
  * Exported from core rather than inlined in the CLI so it is unit-testable.
  * Throws one Error listing every problem; returns void when the env is usable.
@@ -73,12 +75,6 @@ export function assertGatewaySecrets(env: EnvConfig): void {
   const missing: string[] = [];
   const blank = (v: string): boolean => v.trim() === "";
 
-  if (blank(env.slack.signingSecret)) {
-    missing.push("SLACK_SIGNING_SECRET (an empty signing key verifies every forged request)");
-  }
-  if (blank(env.slack.botToken)) {
-    missing.push("SLACK_BOT_TOKEN (needed for auth.test and chat.postMessage)");
-  }
   const peers = Object.keys(env.peers);
   if (peers.length > 0 && blank(env.a2aSecret)) {
     missing.push(
@@ -88,7 +84,7 @@ export function assertGatewaySecrets(env: EnvConfig): void {
 
   if (missing.length > 0) {
     throw new Error(
-      `refusing to start the gateway — missing required secret(s):\n  - ${missing.join("\n  - ")}\n` +
+      `refusing to start — missing required secret(s):\n  - ${missing.join("\n  - ")}\n` +
         `Set them in .env (see .env.example) and try again.`,
     );
   }
@@ -113,6 +109,52 @@ export interface SettingsSnapshot {
     /** enable the LLM classifier after the deterministic cascade (later slice). */
     classifierEnabled: boolean;
   };
+  /** Memory plane (DESIGN.md §5). Behavioral, so it lives here and not in
+   *  EnvConfig — the embedder's *credentials* stay in the env, but which
+   *  embedder to use is a setting. Agent-writable only through `settings_set`
+   *  when a human allow-lists the key (P8). */
+  memory: {
+    /**
+     * Embedder id as "provider/model-id", e.g. "openai/text-embedding-3-small",
+     * or the literal "none" for FTS-only recall (no vector voice, and retained
+     * rows are stored without an embedding). Same provider-prefix rule as
+     * `model`; the runtime's createEmbedder() splits it the same way.
+     */
+    embeddingModel: string;
+    /** Inject the `<memories>` block at context start on every wake (§5.4). */
+    autoRecall: boolean;
+    /** Candidates auto-recall asks for, before the token-budget cut. */
+    recallLimit: number;
+    /** Approx. token ceiling for the injected block (§5.4: ~5k). */
+    recallTokenBudget: number;
+  };
+  /**
+   * Human-granted self-configuration (DESIGN.md P8, revised).
+   *
+   * P8 used to read "agents cannot write settings, full stop". It now reads:
+   * config lives ONLY in the settings table, the human CLI is the default
+   * write path, and an agent may write a setting ONLY through the validated
+   * `settings_set` tool, ONLY for keys a human put in `allowedKeys`, and every
+   * such write is journaled as a `config` event. Nothing here is editable by
+   * a config *file*, which is the point: a bad value is rejected before it
+   * lands (SettingsStore.set validates first), so the agent gets a tool error
+   * it can read and correct instead of a process that will not boot.
+   *
+   * This sub-tree is itself never agent-writable — an agent that could widen
+   * its own allow-list would have no allow-list. Neither is `tenantId`.
+   */
+  selfConfig: {
+    /** Master switch. Default false: only a human (`pinky config set`) flips it. */
+    enabled: boolean;
+    /**
+     * Keys the agent may write, as exact dotted keys ("model",
+     * "context.advisoryFraction"), subtree patterns ("context.*" = every key
+     * *under* context but not the whole sub-tree at once), or "*" (everything
+     * except the immutables). Default []: enabling self-configuration without
+     * naming a key grants nothing.
+     */
+    allowedKeys: string[];
+  };
 }
 
 /** Base of every snapshot, and the source of truth for which keys exist. */
@@ -121,4 +163,12 @@ export const DEFAULT_SETTINGS: SettingsSnapshot = {
   model: "openrouter/moonshotai/kimi-k2",
   context: { advisoryFraction: 0.7, hardFraction: 0.9, approxWindowTokens: 180_000 },
   replyGate: { classifierEnabled: false },
+  memory: {
+    embeddingModel: "openai/text-embedding-3-small",
+    autoRecall: true,
+    recallLimit: 12,
+    recallTokenBudget: 5_000,
+  },
+  // Off, and empty, until a human says otherwise.
+  selfConfig: { enabled: false, allowedKeys: [] },
 };

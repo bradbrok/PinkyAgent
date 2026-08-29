@@ -101,6 +101,38 @@ export type ThreadEventData =
       kind: "message" | "request" | "response";
       text: string;
       msgId: string;
+    }
+  | {
+      type: "memory";
+      /** Audit-only: the projection never renders it (DESIGN.md §5.3). */
+      op: "recall" | "retain" | "update" | "invalidate";
+      /** Ids touched (retain/update/invalidate: the row(s); recall: the hits, in rank order). */
+      ids: string[];
+      /** recall: the query text; retain/update: the stored text; invalidate: the reason. */
+      text: string;
+      /** recall: number of candidates before the token budget cut. */
+      count?: number;
+    }
+  | {
+      /**
+       * A settings write the agent made through the `settings_set` tool
+       * (DESIGN.md P8, revised: human-granted self-configuration). Audit-only:
+       * the projection never renders it, so a self-config write costs no
+       * context — but the log always answers "who changed this, from what, to
+       * what, and when". Human writes go through the CLI and are not
+       * journaled here.
+       */
+      type: "config";
+      /** Settings scope written: "agent:<id>" or "channel:<id>". */
+      scope: string;
+      /** Dotted settings key, e.g. "context.advisoryFraction". */
+      key: string;
+      /** The value now stored (as passed to SettingsStore.set). */
+      value: unknown;
+      /** What the run's snapshot had at that key; undefined if unset. */
+      previous: unknown;
+      /** agentId that made the change. */
+      by: string;
     };
 
 export interface ThreadEvent extends ThreadRef {

@@ -6,14 +6,21 @@
  */
 import type { Provider } from "../types";
 import { AnthropicProvider } from "./anthropic";
+import { createFakeProvider } from "./fake";
 import { OpenAIProvider, OPENROUTER_DEFAULTS } from "./openai";
 
 export { AnthropicProvider, DEFAULT_ANTHROPIC_MAX_TOKENS, buildSystemBlocks } from "./anthropic";
 export type { AnthropicProviderOptions, AnthropicUsage, SystemTextBlock } from "./anthropic";
 export { OpenAIProvider, OPENROUTER_DEFAULTS } from "./openai";
 export type { OpenAIProviderOptions } from "./openai";
-export { FakeProvider } from "./fake";
-export type { FakeScript } from "./fake";
+export {
+  FakeProvider,
+  createFakeProvider,
+  FAKE_BEHAVIORS,
+  FAKE_CANARY,
+  FAKE_CANARY_QUERY,
+} from "./fake";
+export type { FakeBehavior, FakeScript } from "./fake";
 export { iterateSse, sseStreamFromText } from "./sse";
 export type { SseEvent } from "./sse";
 export {
@@ -25,7 +32,7 @@ export {
 } from "./retry";
 export type { RetryConfig, SleepFn } from "./retry";
 
-export const SUPPORTED_PROVIDERS = ["anthropic", "openai", "openrouter"] as const;
+export const SUPPORTED_PROVIDERS = ["anthropic", "openai", "openrouter", "fake"] as const;
 
 /** Split "provider/model-id" on the first "/" — the model id may itself contain "/". */
 export function splitModel(model: string): { provider: string; modelId: string } {
@@ -71,11 +78,20 @@ export function transportOptionsFromEnv(env: Record<string, string | undefined>)
   };
 }
 
+/**
+ * "provider/model-id" -> Provider.
+ *
+ * `fake/*` is a real route, not a test seam: `fake/echo` and
+ * `fake/retain-recall` need no API key and no network, so `pinky headless`,
+ * `pinky smoke` and the integration suite can drive the whole stack on a bare
+ * machine. It is for tests and smoke ONLY — it answers from a script, never a
+ * model. See providers/fake.ts for the behavior list.
+ */
 export function createProvider(
   model: string,
   env: Record<string, string | undefined> = process.env,
 ): Provider {
-  const { provider } = splitModel(model);
+  const { provider, modelId } = splitModel(model);
   const transport = transportOptionsFromEnv(env);
   // stream_options.include_usage is rejected by some OpenAI-compatible
   // endpoints; operators turn it off with PINKY_LLM_INCLUDE_USAGE=false.
@@ -101,6 +117,9 @@ export function createProvider(
         includeUsage,
         ...transport,
       });
+    // Keyless, offline, scripted — tests and smoke only (see fake.ts).
+    case "fake":
+      return createFakeProvider(modelId);
     default:
       throw new Error(
         `Unknown provider ${JSON.stringify(provider)} in model ${JSON.stringify(model)}. ` +

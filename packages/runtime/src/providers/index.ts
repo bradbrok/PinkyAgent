@@ -45,6 +45,8 @@ export {
   FAKE_BEHAVIORS,
   FAKE_CANARY,
   FAKE_CANARY_QUERY,
+  FAKE_DEFERRED_QUERY,
+  FAKE_DEFERRED_MARKER,
 } from "./fake";
 export type { FakeBehavior, FakeScript } from "./fake";
 export { iterateSse, sseStreamFromText } from "./sse";
@@ -127,8 +129,8 @@ export function transportOptionsFromEnv(env: Record<string, string | undefined>)
 /**
  * "provider/model-id" -> Provider.
  *
- * `fake/*` is a real route, not a test seam: `fake/echo` and
- * `fake/retain-recall` need no API key and no network, so `pinky headless`,
+ * `fake/*` is a real route, not a test seam: `fake/echo`,
+ * `fake/retain-recall` and `fake/deferred` need no API key and no network, so `pinky headless`,
  * `pinky smoke` and the integration suite can drive the whole stack on a bare
  * machine. It is for tests and smoke ONLY — it answers from a script, never a
  * model. See providers/fake.ts for the behavior list.

@@ -5,9 +5,15 @@
 import { describe, expect, test } from "bun:test";
 import { AnthropicProvider, buildSystemBlocks, type AnthropicUsage } from "../src/providers/anthropic";
 import { OpenAIProvider } from "../src/providers/openai";
-import { createProvider, SUPPORTED_PROVIDERS, transportOptionsFromEnv } from "../src/providers/index";
+import {
+  createProvider,
+  FAKE_DEFERRED_MARKER,
+  FAKE_DEFERRED_QUERY,
+  SUPPORTED_PROVIDERS,
+  transportOptionsFromEnv,
+} from "../src/providers/index";
 import { sseStreamFromText } from "../src/providers/sse";
-import type { CompleteOptions } from "../src/types";
+import type { AssistantTurn, CompleteOptions, LlmMessage } from "../src/types";
 
 const OPTS: CompleteOptions = {
   model: "test-model",
@@ -258,8 +264,112 @@ describe("createProvider fake route", () => {
     expect(third.stopReason).toBe("stop");
   });
 
+  // The deferred-tool round trip (slice 9), driven the way the loop drives it:
+  // the provider is handed the WHOLE projected window every turn and reads its
+  // own position out of it, so the script is replayable rather than a counter.
+  test("fake/deferred scripts search -> describe -> call -> final answer", async () => {
+    const provider = createProvider("fake/deferred", NO_ENV);
+    const messages: LlmMessage[] = [{ role: "user", text: "[jsonl local]: please echo me" }];
+    const advance = async (): Promise<AssistantTurn> => {
+      const turn = await provider.complete({ ...OPTS, messages: [...messages] });
+      if (turn.toolCalls.length > 0) {
+        messages.push({ role: "assistant", text: turn.text, toolCalls: turn.toolCalls });
+      }
+      return turn;
+    };
+    const answer = (callId: string, text: string): void => {
+      messages.push({ role: "tool", toolCallId: callId, text });
+    };
+
+    // 1. search for the fixed query.
+    const search = await advance();
+    expect(search.toolCalls.map((c) => c.name)).toEqual(["tool_search"]);
+    expect(search.toolCalls[0]!.args).toEqual({ query: FAKE_DEFERRED_QUERY });
+    answer(
+      search.toolCalls[0]!.id,
+      "1. read — read a file\n2. mcp__fixture__echo_nested — Echo a nested payload back as text\n",
+    );
+
+    // 2. describe the first mcp__ name in that listing (never the built-in).
+    const describe_ = await advance();
+    expect(describe_.toolCalls.map((c) => c.name)).toEqual(["tool_describe"]);
+    expect(describe_.toolCalls[0]!.args).toEqual({ name: "mcp__fixture__echo_nested" });
+    answer(
+      describe_.toolCalls[0]!.id,
+      "mcp__fixture__echo_nested (mcp server: fixture)\nEcho a nested payload back as text\n\n" +
+        "```json\n" +
+        JSON.stringify({
+          type: "object",
+          properties: {
+            outer: {
+              type: "object",
+              properties: { inner: { type: "string" }, count: { type: "integer" } },
+              required: ["inner"],
+            },
+            flag: { type: "boolean" },
+          },
+          required: ["outer"],
+        }) +
+        "\n```\n",
+    );
+
+    // 3. call it with arguments BUILT FROM THAT SCHEMA: required only, nested,
+    //    the user's own text in the string slot.
+    const call = await advance();
+    expect(call.toolCalls.map((c) => c.name)).toEqual(["tool_call"]);
+    expect(call.toolCalls[0]!.args).toEqual({
+      name: "mcp__fixture__echo_nested",
+      args: { outer: { inner: "[jsonl local]: please echo me" } },
+    });
+    answer(call.toolCalls[0]!.id, "echo:[jsonl local]: please echo me:0");
+
+    // 4. the result verbatim plus the marker — the proof all four turns ran.
+    const final = await advance();
+    expect(final.toolCalls).toEqual([]);
+    expect(final.stopReason).toBe("stop");
+    expect(final.text).toBe(`echo:[jsonl local]: please echo me:0\n${FAKE_DEFERRED_MARKER}`);
+  });
+
+  // The window a SECOND prompt sees in a long-lived thread: a whole finished
+  // script, then the new user turn. Resuming that at step 4 would answer with
+  // the previous run's tool result, which is how a green smoke check goes red
+  // on its second run.
+  test("fake/deferred starts over after a completed script in the same window", async () => {
+    const provider = createProvider("fake/deferred", NO_ENV);
+    const turn = await provider.complete({
+      ...OPTS,
+      messages: [
+        { role: "user", text: "[jsonl local]: first ask" },
+        { role: "assistant", text: "", toolCalls: [{ id: "d3", name: "tool_call", args: {} }] },
+        { role: "tool", toolCallId: "d3", text: "echo:first ask:0" },
+        { role: "assistant", text: `echo:first ask:0\n${FAKE_DEFERRED_MARKER}` },
+        { role: "user", text: "[jsonl local]: second ask" },
+      ],
+    });
+    expect(turn.toolCalls.map((c) => c.name)).toEqual(["tool_search"]);
+  });
+
+  test("fake/deferred ends with a diagnosis when the catalog has no mcp tool", async () => {
+    const provider = createProvider("fake/deferred", NO_ENV);
+    const search = await provider.complete(OPTS);
+    const turn = await provider.complete({
+      ...OPTS,
+      messages: [
+        { role: "user", text: "hi" },
+        { role: "assistant", text: "", toolCalls: search.toolCalls },
+        { role: "tool", toolCallId: search.toolCalls[0]!.id, text: "no matches for \"echo\"." },
+      ],
+    });
+    expect(turn.toolCalls).toEqual([]);
+    expect(turn.text).toContain("no mcp__ tool matched");
+    // Not the done marker: an unfinished script must never look finished.
+    expect(turn.text).not.toContain(FAKE_DEFERRED_MARKER);
+  });
+
   test("an unknown fake behavior names the supported ones", () => {
-    expect(() => createProvider("fake/nope", NO_ENV)).toThrow(/Supported: echo, retain-recall/);
+    expect(() => createProvider("fake/nope", NO_ENV)).toThrow(
+      /Supported: echo, retain-recall, deferred/,
+    );
   });
 
   test("fake is listed as a supported provider", () => {

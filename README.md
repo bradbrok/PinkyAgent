@@ -14,15 +14,16 @@ The architecture, and the reasoning behind it, is in **[DESIGN.md](./DESIGN.md)*
 ## Status
 
 Early. Slices 1 and 2 of the [build order](./DESIGN.md#12-build-order-mvp-slices),
-parts of slice 3 (the continuity engine), and the revised P8 (human-granted
-self-configuration):
+parts of slice 3 (the continuity engine), slice 9 (MCP + deferred tools), and
+the revised P8 (human-granted self-configuration):
 
 | Built | Not built yet |
 | --- | --- |
 | Event log, projection, per-thread seq | **Multi-party ingress** — the stdio pipe is the only front door; no Slack, Discord or webhook gateway |
 | JSONL headless service: ingest + dedup in one transaction → one serialized run per thread → every event streamed | **Reply gating** — nothing to gate yet: every prompt on the pipe is addressed to the agent, so the rule cascade and classifier are unbuilt |
 | Memory plane v1: scopes, hybrid FTS + pgvector recall, auto-recall at context start, invalidate-never-delete | **Subagents** — no spawn, no fan-out, no depth caps |
-| Agent loop with tools: read, write, edit, glob, grep, bash, a2a, recall/retain/memory_edit, settings_get/set | **Sleep-time worker** — no extraction, consolidation, or reflection |
+| Agent loop with tools: read, write, edit, glob, grep, bash, a2a, recall/retain/memory_edit, settings_get/set, tool_search/describe/call | **Sleep-time worker** — no extraction, consolidation, or reflection |
+| MCP servers + a deferred-tool catalog: header/catalog partition, the three meta-tools, `pinky mcp`, `pinky tools` | **Native tool deferral** — phase 2 (a provider's own `defer_loading` / `tool_reference`) would ride the same catalog; today every route goes through the meta-tools |
 | A2A mailbox + cross-node HTTP relay, at-least-once both ways, wake-on-message with consumption receipts | **HITL** — the `human_request` event type exists; nothing raises or resumes it |
 | Settings table, `config` + `memory` CLI, allow-listed self-configuration, RLS on `memories`, migrations | **Cross-tenant `global` memories** — `global` visibility is still fenced by `tenant_id` in v1 |
 | Continuity events + `shed_context` | **Sandboxing** — `bash` strips the environment but is not filesystem-confined |
@@ -198,12 +199,29 @@ bun run packages/cli/src/index.ts <command>
 | `memory forget <id-or-prefix> [--reason "…"]` | Invalidate it — memories are retired, never deleted |
 | `stats restarts [--channel <id>] [--limit N]` | What context restarts cost: `tokensBefore → tokensAfter` per boundary, the successor's first-turn cache split, and the total rebuild bill |
 | `stats cache [--channel <id>] [--thread <id>] [--limit N]` | The steady-state prompt-cache hit rate over the newest N turns (default 50): per turn `prompt = read + write + uncached` with a `hit` share, `⊘ cold` on a warm→cold transition, then the mean and totals over the measured turns and the "prefix rewritten" count |
+| `mcp list` | Every configured MCP server: status, protocol era, negotiated version, server name, live tool count, last error. Never waits for a connection |
+| `mcp sync [<server>...] [--timeout-ms N]` | Connect, wait (15s default), and print what each server published to the catalog. Exits 1 if any named server did not connect, so it works as a deployment step |
+| `tools list [--scope <scope>]...` | The header/catalog split as a run would compute it: the catalog's rows through the same `partitionTools` and the same settings overlay. `--scope` repeats (an overlay is a list) |
 | `headless [--shell] [--a2a] [--shared]` | The JSONL service on stdin/stdout, plus [wake-on-message](#wake-on-message) from the A2A mailbox. `--shell` grants `bash`; `--a2a` also opens the relay port (inbound from another *node*); `--shared` drops the trusted-local recall scope |
 | `smoke` | In-process end-to-end check: migrate, agent loop, local A2A, memory round trip, event log |
 | `prompt "<text>"` | One agent turn on the local `cli:local/main` thread |
 
-`memory`, `smoke`, `prompt` and `headless` auto-migrate at startup on a
-short-lived privileged connection; `config` and `stats` do not.
+`memory`, `mcp`, `tools`, `smoke`, `prompt` and `headless` auto-migrate at
+startup on a short-lived privileged connection; `config` and `stats` do not.
+Only `mcp list|sync`, `prompt` and `headless` open the MCP plane — `tools list`
+reads the catalog and starts no server, and `memory`, `stats` and `smoke` never
+touch it.
+
+`prompt` and `headless` install signal handlers, because a signal is how a
+supervisor stops a long-lived service and the default action is fatal: SIGTERM
+and SIGINT **drain** the session (in-flight runs abort exactly as they do when
+the client closes the pipe), then close the MCP clients — which is what reaps
+their stdio children — before the connection pool, and exit **143** / **130**,
+the codes a supervisor reads as "stopped by that signal" rather than "failed".
+Without that, every MCP child would be reparented and left running, one per
+server per restart. Two valves for a shutdown that hangs: a second signal exits
+immediately, and so does a drain or close still unfinished after 10s. Nothing
+on that path writes to stdout.
 
 In `stats cache`, `hit n/a` means the route reported no cache counters at all —
 not a 0% hit rate — so those turns are counted separately and never averaged in
@@ -283,6 +301,56 @@ once on stderr and recall runs on the lexical voice alone; on a Postgres
 without pgvector the `embedding` column never exists and the same thing
 happens. Both are supported modes, not failures.
 
+**Tool keys** — which tools are in the request header and which live in the
+catalog ([Deferred tools](#deferred-tools-and-mcp)):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `tools.defaultMode.builtin` | `"always"` | Where a built-in goes when no list names it: `always` (rendered in every request) or `deferred` |
+| `tools.defaultMode.mcp` | `"deferred"` | The same for MCP tools. There may be hundreds and they change under you, so the header is not where they go |
+| `tools.alwaysOn` | `[]` | Exact tool names forced into the header, whatever the default mode says |
+| `tools.deferred` | `[]` | Exact names forced out of it. Precedence is `alwaysOn` > `deferred` > `defaultMode[source]`, and all three lose to the four pinned names (`tool_search`, `tool_describe`, `tool_call`, `shed_context`) |
+| `tools.searchLimit` | `8` | Results per `tool_search`, 1–50. The hits land in the conversation, so the page size is a token bill |
+
+The two lists are checked for *shape* only, never for existence: the catalog is
+runtime state (servers come and go, `bash` depends on `--shell`), so a name
+matching nothing is inert rather than a value you cannot write while a server
+is down. Changing `alwaysOn` changes the header, which is the cached prefix —
+that costs one cold prompt on the next wake. Changing `deferred` is free.
+
+**MCP servers** — `mcp.servers.<name>`, the schema's one open map: an entry is
+a whole server config, set as one JSON value.
+
+```sh
+bun run packages/cli/src/index.ts config set mcp.servers.github \
+  '{"transport":"stdio","command":"bunx","args":["-y","@modelcontextprotocol/server-github"],"env":{"GITHUB_TOKEN":"${GITHUB_TOKEN}"}}'
+bun run packages/cli/src/index.ts config set mcp.servers.docs \
+  '{"transport":"http","url":"https://mcp.example.com/mcp","headers":{"Authorization":"Bearer ${DOCS_TOKEN}"}}'
+bun run packages/cli/src/index.ts mcp sync github     # connect, wait, publish
+```
+
+The name prefixes every tool the server contributes (`mcp__<name>__<tool>`), so
+it is validated `^[a-z0-9][a-z0-9_-]{0,31}$` **and may not contain `__`** —
+that is the separator itself, and server `github__issues` + tool `create` and
+server `github` + tool `issues__create` would both spell
+`mcp__github__issues__create`, one catalog row for two servers. A single `_` or
+`-` is fine. Values in `env` and `headers` may be written `${ENV_NAME}` and are
+resolved from the process environment at connect time, so the settings row
+holds a reference and never a secret (the config hash is taken over the
+*unresolved* form too, so rotating a credential does not invalidate a catalog
+generation). Shape is validated before the write; one unusable entry is dropped
+by `load()` on its own and its siblings survive.
+
+`mcp` and everything under it is **immutable to `settings_set`**, refused even
+under a `"*"` allow-list — a stdio `command` is arbitrary host execution and an
+http `url` is where the agent's own tool calls go, so adding a server stays a
+human act. `pinky config set` is the only write path.
+
+Servers are read **once, at bootstrap**, from the global + `agent:pinky`
+scopes. A `channel:<id>`-scoped `mcp.servers` row is therefore ignored — one
+manager and one set of child processes per channel is a different design, not a
+config value — and the first run that sees one says so on stderr.
+
 **Self-configuration keys** — P8 as revised. The human CLI is still the default
 write path, and config is still never a file. What changed is that an agent may
 now adjust *allow-listed* keys through the validated `settings_set` tool: the
@@ -316,6 +384,74 @@ tool can only write `agent:<self>` or `channel:<current>`, never `global`.
 Writes land in the table, not in the running snapshot: settings are re-read per
 run, so a change takes effect on the next one.
 
+## Deferred tools and MCP
+
+Tool schemas render at prefix position 0 of every request (`tools → system →
+messages`), so the tool list *is* the head of the cache key. A hundred MCP
+tools in the header is a bill paid on every turn, and a list that **moves** — a
+server reconnects, an agent is granted one more tool — invalidates every
+provider cache tier for the whole thread. So the header holds the always-on
+tools plus three fixed meta-tools, and everything else lives in a Postgres
+catalog (`tool_catalog`) the model reaches through them:
+
+| Tool | What it does |
+| --- | --- |
+| `tool_search(query, limit?)` | Full-text search over name, description and the *flattened argument schema* — the vocabulary a model searches with ("repository", "sha") is usually in the properties, not the one-line description. An empty query lists the catalog |
+| `tool_describe(name)` | The full description and the JSON Schema, capped at 4k chars / 16 KB and marked where truncated |
+| `tool_call(name, args)` | Runs it. Arguments are checked against the catalog's schema first, and a mismatch comes back **with the schema inline**, so a correction costs no second describe |
+
+**Loading a tool never rewrites the header.** A schema arrives as an ordinary
+`tool_result` event, appended like any other message, and the system prompt
+carries one static sentence about the three meta-tools that never names a
+catalog tool or counts them. Nothing new appears on the JSONL wire either: an
+MCP call is a `tool_result` line like `read` or `bash`. The partition is
+recomputed per run from the reloaded settings, so a header change is a
+deliberate, visible act.
+
+MCP tool names are `mcp__<server>__<tool>`, sanitized to `[A-Za-z0-9_-]` and
+capped at the providers' 64 characters — an over-long name (or the loser of a
+sanitization collision) is truncated and stamped with 8 hex of
+sha256(server + NUL + raw), so two distinct tools always get two distinct
+handles. Ordering everywhere is a code-unit compare, never `localeCompare`:
+that order is part of the cache key.
+
+Results are capped at **50 KB**, the same ceiling as `bash` — an unbounded tool
+result is an unbounded prompt, and past the window the loop escalates to a
+forced shed whose own request carries the same oversized message. Images and
+audio become `[image image/png, 1234 bytes]` placeholders, embedded text
+resources render as their text, `structuredContent` as a fenced JSON block, and
+`isError` passes straight through: a tool that ran and reported a problem is
+not a harness failure.
+
+**Protocol.** `@modelcontextprotocol/client` 2.0, speaking MCP **2026-07-28**:
+stateless (no `initialize` handshake, no session id), Streamable HTTP,
+`tools/list` freshness hints (`ttlMs`, clamped to 60s–24h so neither an
+aggressive nor an absurd hint becomes a hot loop) and `subscriptions/listen`
+for list changes. Version negotiation is `auto`, so a server that answers
+`server/discover` is spoken to as modern and anything older falls back to the
+2025 `initialize` handshake with unsolicited `notifications/tools/list_changed`
+— both eras are covered by fixtures in the integration suite. Roots, sampling
+and logging are deprecated in that revision and **not implemented**; a result
+that asks for elicitation (`resultType: "input_required"`) comes back as a
+clean tool error rather than a hang. HTTP servers configured with custom
+headers are fetched with `redirect: "error"`, because `fetch` replays request
+headers across a redirect and those headers carry the credentials.
+
+**A server never blocks startup.** Bootstrap awaits one catalog probe per
+server and connects in the background. Where the catalog's rows were written
+under the same config hash they are served immediately, so request 1 sees the
+same tools request 100 will and the header is byte-identical across the
+connect. A disconnect writes nothing — an outage keeps the previous generation
+rather than emptying the list — and a failed catalog write never tears down a
+healthy connection (that would turn one oversized tool description into an
+endless respawn loop). Every diagnostic goes to **stderr**, always: `pinky
+headless` owns stdout.
+
+There is a keyless route for the whole round trip: `fake/deferred` (beside
+`fake/echo` and `fake/retain-recall`) scripts `tool_search → tool_describe →
+tool_call →` an answer carrying the tool's own output, which is how `bun run
+smoke` and the integration suite exercise the path with no API key.
+
 ## Testing
 
 ```sh
@@ -328,7 +464,7 @@ bun run test:integration # live Postgres, live HTTP, live subprocess
 The unit suite is entirely fakes. That is fast and it is also how a real
 cross-node mailbox bug shipped green (see *Fixed defects* below), so the SQL,
 the jsonb round-trip, the wire format and the CLI path have their own suite
-under `packages/{core,runtime,cli}/test/integration/`, gated on
+under `packages/{core,runtime,mcp,cli}/test/integration/`, gated on
 `PINKY_INTEGRATION=1`:
 
 | File | Covers |
@@ -342,6 +478,8 @@ under `packages/{core,runtime,cli}/test/integration/`, gated on
 | `runtime/test/integration/providers-cache.test.ts` | That prompt caching actually *works* against the live Anthropic API: two byte-identical requests, the second must read the prefix the first wrote |
 | `cli/test/integration/headless.test.ts` | `pinky headless` as a real child process: the JSONL contract, and that *nothing* but the protocol reached stdout |
 | `cli/test/integration/stats.test.ts` | `pinky stats restarts` and `stats cache` as real child processes: the lateral join from each restart to the turn that paid for it, and the per-turn hit shares, cold transitions and uncounted-turn handling |
+| `mcp/test/integration/mcp-stdio.test.ts` | The MCP client against real child processes over real stdio — modern-era negotiation (2026-07-28) against an SDK-built fixture, the fallback to a hand-rolled legacy one (2025-06-18), byte-identical schemas from the cache and from a live sync, and a spawn that fails without emptying the catalog. Needs no database: what is under test is the wire |
+| `cli/test/integration/mcp-tools.test.ts` | Slice 9 through the CLI as real processes: `pinky mcp sync` publishing a server's tools, `pinky tools list` showing them as deferred, a `pinky headless` prompt answered by finding, describing and calling a tool that was never in its header — with every stdout line still parsing as JSON — and SIGTERM reaping the stdio child instead of orphaning it |
 
 One of those is gated twice over: `providers-cache.test.ts` runs only when
 `ANTHROPIC_API_KEY` is set as well as `PINKY_INTEGRATION=1`, because it spends
@@ -417,7 +555,10 @@ turns that do, and says `n/a` where none did. A cold transition or a rewrite is
 a bug in how the request was
 assembled (a tool definition changed, the system prefix moved, `messages[0]`
 was re-rendered), not a fact about the workload — which is why both are called
-out by name rather than averaged away.
+out by name rather than averaged away. Keeping MCP tools out of the header is
+part of the same discipline: a catalog that grows and churns behind
+`tool_search` costs nothing at position 0, where the same tools listed in the
+request would rewrite the prefix every time a server came or went.
 
 ## Fixed defects (now regression-tested)
 
@@ -472,6 +613,13 @@ Nothing here is outstanding.
   which is also what keeps the settings table reachable only through
   `settings_set` and its allow-list, rather than through a `psql` the agent
   shelled out to. It is not filesystem-sandboxed — that is slice 8.
+- **MCP servers are a human-only setting.** `mcp.servers.<name>` is immutable
+  to `settings_set`, refused even under a `"*"` allow-list: a stdio `command`
+  is arbitrary host execution and an http `url` is where the agent's own tool
+  calls go. Credentials live in `env`/`headers` as `${ENV_NAME}` references
+  resolved at connect time, so the settings table never holds the secret, and a
+  server configured with custom headers is fetched with `redirect: "error"` so
+  a 302 cannot forward them to another origin.
 - **Agent self-configuration is off by default and allow-listed.**
   `selfConfig.enabled` is `false` and `allowedKeys` is empty until a human says
   otherwise; `tenantId`, `selfConfig` itself and the `global` scope are refused
@@ -498,9 +646,10 @@ Nothing here is outstanding.
 ## Layout
 
 ```
-packages/core      event log, memory plane, mailbox, settings, migrations, db + tenant scoping
-packages/runtime   agent loop, providers, embedders, continuity, auto-recall, A2A messenger
-packages/tools     read / write / edit / glob / grep / bash / a2a / recall / retain / memory_edit / settings
+packages/core      event log, memory plane, tool catalog, mailbox, settings, migrations, db + tenant scoping
+packages/runtime   agent loop, providers, embedders, continuity, auto-recall, A2A messenger, tool partition
+packages/tools     read / write / edit / glob / grep / bash / a2a / recall / retain / memory_edit / settings / tool_search / tool_describe / tool_call
+packages/mcp       MCP client plane: naming + config hashing, connect/sync/dispatch, result rendering
 packages/gateway   JSONL headless protocol, A2A relay
 packages/cli       pinky — the human-owned control surface
 ```

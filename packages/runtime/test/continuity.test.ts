@@ -34,7 +34,11 @@ function context(contextTokens?: number): { ctx: ToolContext; emitted: ThreadEve
 const goodArgs = (): Record<string, unknown> => ({
   goal: "Fix the context ladder so long threads stop freezing",
   plan: { done: ["read DESIGN §4"], now: "rework the loop", next: ["tests", "typecheck"] },
-  workingSet: { files: ["/src/loop.ts"], urls: ["https://example.com/spec"] },
+  workingSet: {
+    files: ["/src/loop.ts"],
+    urls: ["https://example.com/spec"],
+    tools: ["mcp__srv__create_issue"],
+  },
   decisions: [{ what: "shed runs last in a batched turn", why: "cut-point safety (§4.5)" }],
   openLoops: ["confirm the hard fraction with a real model"],
   lessons: ["a system-role note churns the cache prefix"],
@@ -56,11 +60,23 @@ describe("validateContinuityDoc", () => {
       next: ["tests", "typecheck"],
     });
     expect(out.doc.workingSet.files).toEqual(["/src/loop.ts"]);
+    // Deferred tool names (slice 9): the successor's header does not list
+    // them, so the document is the only place they can survive a restart.
+    expect(out.doc.workingSet.tools).toEqual(["mcp__srv__create_issue"]);
     expect(out.doc.decisions[0]).toEqual({
       what: "shed runs last in a batched turn",
       why: "cut-point safety (§4.5)",
     });
     expect(out.doc.mood).toBe("steady");
+  });
+
+  test("workingSet.tools is absent, not empty, when the document omits it", () => {
+    // Same rule as files/artifacts/urls: only keys the author wrote appear, so
+    // an empty Working Set renders no section at all.
+    const out = validateContinuityDoc({ goal: "g", plan: { now: "n" }, workingSet: { files: ["/a"] } });
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(out.doc.workingSet).toEqual({ files: ["/a"] });
   });
 
   test("defaults every optional list to empty", () => {
@@ -92,6 +108,8 @@ describe("validateContinuityDoc", () => {
     [{ goal: "g", plan: { now: "n" }, decisions: "x" }, "decisions must be an array"],
     [{ goal: "g", plan: { now: "n" }, workingSet: [] }, "workingSet must be an object"],
     [{ goal: "g", plan: { now: "n" }, workingSet: { files: [7] } }, "workingSet.files[0] must be a non-empty string"],
+    [{ goal: "g", plan: { now: "n" }, workingSet: { tools: "tool_call" } }, "workingSet.tools must be an array of strings"],
+    [{ goal: "g", plan: { now: "n" }, workingSet: { tools: [""] } }, "workingSet.tools[0] must be a non-empty string"],
     [{ goal: "g", plan: { now: "n" }, mood: 3 }, "mood must be a string"],
   ])("rejects %o", (args, message) => {
     const out = validateContinuityDoc(args);
@@ -125,6 +143,19 @@ describe("ShedContextTool", () => {
       "workingSet",
     ]);
     expect((tool.parameters as { required: string[] }).required).toEqual(["goal", "plan"]);
+    // workingSet carries deferred tool names alongside files/artifacts/urls
+    // (slice 9): they are NOT in the successor's header, so a document that
+    // omitted them would make it rediscover the tool through tool_search.
+    const workingSet = props["workingSet"] as { properties: Record<string, unknown> };
+    expect(Object.keys(workingSet.properties).sort()).toEqual([
+      "artifacts",
+      "files",
+      "tools",
+      "urls",
+    ]);
+    expect((workingSet.properties["tools"] as { description: string }).description).toContain(
+      "tool_describe",
+    );
     expect(tool.description.split("\n")[0]!.length).toBeGreaterThan(20);
   });
 

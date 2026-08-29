@@ -31,11 +31,20 @@ export function serializeContinuity(doc: ContinuityDoc): string {
   lines.push(`- now: ${doc.plan.now || "(none)"}`);
   for (const item of doc.plan.done) lines.push(`- done: ${item}`);
   for (const item of doc.plan.next) lines.push(`- next: ${item}`);
-  if (doc.workingSet.files?.length || doc.workingSet.artifacts?.length || doc.workingSet.urls?.length) {
+  if (
+    doc.workingSet.files?.length ||
+    doc.workingSet.artifacts?.length ||
+    doc.workingSet.urls?.length ||
+    doc.workingSet.tools?.length
+  ) {
     lines.push("## Working Set");
     for (const f of doc.workingSet.files ?? []) lines.push(`- file: ${f}`);
     for (const a of doc.workingSet.artifacts ?? []) lines.push(`- artifact: ${a}`);
     for (const u of doc.workingSet.urls ?? []) lines.push(`- url: ${u}`);
+    // Deferred tools (slice 9): these names are NOT in the successor's header,
+    // so carrying them across the boundary is what saves it a tool_search to
+    // rediscover the tool this window was already using.
+    for (const t of doc.workingSet.tools ?? []) lines.push(`- tool: ${t}`);
   }
   if (doc.decisions.length) {
     lines.push("## Decisions");

@@ -12,7 +12,7 @@ import type { MemoryHit, MemoryStore, RecallScope, SearchInput } from "@pinky/co
 import { runAgentLoop } from "../src/loop";
 import { ShedContextTool } from "../src/continuity";
 import { FakeProvider } from "../src/providers/fake";
-import type { AgentLoopOptions, Embedder, MemoryContext } from "../src/types";
+import type { AgentLoopOptions, DeferredTools, Embedder, MemoryContext } from "../src/types";
 import type { AgentRunResult, AssistantTurn, CompleteOptions, LlmMessage, Provider, Tool, ToolChoice } from "../src/types";
 import type { FakeScript } from "../src/providers/fake";
 import type { RunAgentLoopOptions } from "../src/loop";
@@ -195,6 +195,8 @@ function settings(
     model: "fake/test-model",
     context: { advisoryFraction: 0.7, hardFraction: 0.9, approxWindowTokens: 180_000, ...context },
     replyGate: { classifierEnabled: false },
+    tools: { defaultMode: { builtin: "always", mcp: "deferred" }, alwaysOn: [], deferred: [], searchLimit: 8 },
+    mcp: { servers: {} },
     memory: {
       embeddingModel: "none",
       autoRecall: true,
@@ -1166,6 +1168,41 @@ describe("runAgentLoop tool context", () => {
     expect(seen).toHaveLength(1);
     expect(seen[0]).toBe(snapshot);
     expect(seen[0]!.context.advisoryFraction).toBe(0.55);
+  });
+
+  test("passes the deferred-tool plane through, and omits the key without one", async () => {
+    // tool_call reaches the catalog only through ctx.deferred (slice 9). The
+    // absent case is the other half: the three meta-tools are registered on
+    // every surface, so "no catalog here" has to arrive as a missing key they
+    // can answer for — never as a half-built object.
+    const seen: (DeferredTools | undefined)[] = [];
+    const spy: Tool = {
+      name: "spy",
+      description: "records its context",
+      parameters: { type: "object" },
+      execute: async (_args, ctx) => {
+        seen.push(ctx.deferred);
+        return { text: "ok" };
+      },
+    };
+    const deferred: DeferredTools = {
+      catalog: { search: async () => [], describe: async () => null },
+      call: async () => ({ text: "called" }),
+    };
+
+    const withPlane = harness(
+      [turn({ text: "", toolCalls: [call("c1", "spy")] }), turn({ text: "done" })],
+      [spy],
+    );
+    await withPlane.run({ deferred });
+    expect(seen[0]).toBe(deferred);
+
+    const without = harness(
+      [turn({ text: "", toolCalls: [call("c1", "spy")] }), turn({ text: "done" })],
+      [spy],
+    );
+    await without.run();
+    expect(seen[1]).toBeUndefined();
   });
 });
 

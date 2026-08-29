@@ -84,12 +84,34 @@ describe("DEFAULT_SETTINGS", () => {
     // never lands here is a key validateSettings would reject.
     expect(Object.keys(DEFAULT_SETTINGS).sort()).toEqual([
       "context",
+      "mcp",
       "memory",
       "model",
       "replyGate",
       "selfConfig",
       "tenantId",
+      "tools",
     ]);
+  });
+
+  it("ships the slice-9 tool partition: built-ins in the header, MCP deferred", () => {
+    // The default IS the argument of the slice: a built-in set small enough to
+    // render at prefix position 0 stays there, and MCP tools — hundreds of
+    // them, changing whenever a server does — reach the model through the
+    // catalog instead, so a server coming or going never rewrites the header.
+    expect(DEFAULT_SETTINGS.tools).toEqual({
+      defaultMode: { builtin: "always", mcp: "deferred" },
+      alwaysOn: [],
+      deferred: [],
+      searchLimit: 8,
+    });
+  });
+
+  it("ships no MCP servers: adding one is a human act", () => {
+    // An `mcp.servers` entry is a command to run or a URL to send tool calls
+    // (and header secrets) to, so the shipped state is "none" and the only
+    // write path is `pinky config set` — `mcp.*` is immutable to settings_set.
+    expect(DEFAULT_SETTINGS.mcp).toEqual({ servers: {} });
   });
 
   it("ships self-configuration off, delegating nothing (DESIGN.md P8, revised)", () => {

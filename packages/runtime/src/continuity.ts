@@ -45,6 +45,9 @@ export const continuityDocSchema: Record<string, unknown> = {
         files: stringArray("Absolute file paths."),
         artifacts: stringArray("Artifact refs (blob:sha256:...)."),
         urls: stringArray("URLs."),
+        tools: stringArray(
+          "Deferred tool names in use; the successor should tool_describe them before acting.",
+        ),
       },
     },
     decisions: {
@@ -128,11 +131,17 @@ export function validateContinuityDoc(args: unknown): ContinuityValidation {
 
   const workingSetRaw = args["workingSet"];
   if (workingSetRaw !== undefined && workingSetRaw !== null && !isRecord(workingSetRaw)) {
-    return { ok: false, error: "workingSet must be an object with optional files/artifacts/urls arrays" };
+    return {
+      ok: false,
+      error: "workingSet must be an object with optional files/artifacts/urls/tools arrays",
+    };
   }
   const ws = isRecord(workingSetRaw) ? workingSetRaw : {};
   const workingSet: ContinuityDoc["workingSet"] = {};
-  for (const key of ["files", "artifacts", "urls"] as const) {
+  // `tools` is the deferred-tool half of the working set (slice 9): the names
+  // are not in the successor's header, so without them it would have to
+  // rediscover through tool_search what this window already found.
+  for (const key of ["files", "artifacts", "urls", "tools"] as const) {
     if (ws[key] === undefined || ws[key] === null) continue;
     const list = strings(ws[key], `workingSet.${key}`);
     if (isFail(list)) return { ok: false, error: list.error };
@@ -197,7 +206,7 @@ export class ShedContextTool implements Tool {
   // list (see system-prompt.ts), so it has to stand alone.
   readonly description = [
     "Write your continuity document and restart your context window: the transcript before it stops being visible and you continue from the document alone.",
-    "Call it at a natural boundary — a task phase finished, a plan checkpoint reached, about to switch sub-problems — or when a harness notice reports context pressure. Everything load-bearing must be inside the document, because nothing outside it survives: the goal, the plan (done/now/next), the files and artifacts to reload, decisions with their reasons, open loops, and lessons learned from anything that went wrong.",
+    "Call it at a natural boundary — a task phase finished, a plan checkpoint reached, about to switch sub-problems — or when a harness notice reports context pressure. Everything load-bearing must be inside the document, because nothing outside it survives: the goal, the plan (done/now/next), the files and artifacts to reload, the deferred tools you were using, decisions with their reasons, open loops, and lessons learned from anything that went wrong.",
   ].join("\n");
   readonly parameters = continuityDocSchema;
 

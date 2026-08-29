@@ -4,6 +4,12 @@
  * The prefix (identity + behavior + tool summary) contains no timestamps or
  * per-run data so provider prompt caches stay warm; anything volatile (like
  * `now`) is appended at the very end.
+ *
+ * The tool list here is the HEAD partition only (runtime/deferred.ts) — the
+ * tools actually rendered in the request. Deferred tools are described by one
+ * fixed sentence and never enumerated: the catalog can hold hundreds of names
+ * and change while the process runs, and naming them here would put that churn
+ * inside the cached prefix.
  */
 import type { ToolSpec } from "./types";
 
@@ -32,6 +38,12 @@ export function buildSystemPrompt(opts: SystemPromptOptions): string {
     "- Do not narrate your process; act with tools and report results.",
     "",
     "## Tools",
+    // Static, and static on purpose (slice 9). The header is the cached prefix
+    // (§4.5/§9), so this sentence never names a catalog tool, never counts
+    // them, and never varies with which MCP servers happen to be connected —
+    // otherwise the prefix would move every time a server came or went. The
+    // catalog's contents reach the model through tool results instead.
+    "Some tools are deferred rather than listed here: `tool_search` finds them, `tool_describe` shows a schema, `tool_call` runs one. Record the ones you are using in your continuity document's working set.",
   ];
   if (opts.tools.length === 0) {
     lines.push("- (none available)");

@@ -1,5 +1,5 @@
 {
-  "name": "@pinky/cli",
+  "name": "@pinky/mcp",
   "version": "0.0.1",
   "private": true,
   "type": "module",
@@ -7,10 +7,8 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
     "@pinky/core": "workspace:*",
-    "@pinky/runtime": "workspace:*",
-    "@pinky/tools": "workspace:*",
-    "@pinky/gateway": "workspace:*",
-    "@pinky/mcp": "workspace:*"
+    "@pinky/runtime": "workspace:*"
   }
 }

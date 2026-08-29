@@ -19,6 +19,16 @@
  * nothing else. A memory is what the agent records about the world; a setting
  * is what it may adjust about itself — and only where a human said so.
  *
+ * The three meta-tools (tool_search/tool_describe/tool_call, slice 9) are
+ * registered unconditionally for a sharper reason than convenience: their
+ * presence must never flip. Tool schemas render at prefix position 0, so a
+ * header that gains or loses a tool because an MCP server was up (or wasn't)
+ * when the process started invalidates every provider cache tier for the
+ * thread — the exact cost the deferred-tool catalog exists to avoid
+ * (DESIGN.md §4.5/§9). Registered always, they are the same bytes on every
+ * run, and without `ctx.deferred` they answer "no deferred tools on this
+ * surface" like every other plane-less tool here.
+ *
  * bash is OPT-IN (`createTools({ shell: true })`) and off by default. Every
  * other tool here is either path-contained by sandboxResolve (read/write/edit/
  * glob/grep) or a narrow mailbox call (a2a). bash is neither: it is arbitrary
@@ -41,6 +51,7 @@ import { GrepTool } from "./grep";
 import { A2ASendTool, A2AInboxTool } from "./a2a";
 import { RecallTool, RetainTool, MemoryEditTool } from "./memory";
 import { SettingsGetTool, SettingsSetTool } from "./settings";
+import { ToolSearchTool, ToolDescribeTool, ToolCallTool } from "./deferred";
 
 export { BashTool, type BashToolOptions } from "./bash";
 export { ReadTool } from "./read";
@@ -51,6 +62,7 @@ export { GrepTool } from "./grep";
 export { A2ASendTool, A2AInboxTool } from "./a2a";
 export { RecallTool, RetainTool, MemoryEditTool, visibleInScope, allowedVisibility } from "./memory";
 export { SettingsGetTool, SettingsSetTool, readSettingPath } from "./settings";
+export { ToolSearchTool, ToolDescribeTool, ToolCallTool } from "./deferred";
 
 export interface CreateToolsOptions {
   /** Include the bash tool. Default false — callers must opt in deliberately. */
@@ -77,6 +89,9 @@ export function createTools(opts: CreateToolsOptions = {}): Tool[] {
     new MemoryEditTool(),
     new SettingsGetTool(),
     new SettingsSetTool(),
+    new ToolSearchTool(),
+    new ToolDescribeTool(),
+    new ToolCallTool(),
   );
   return tools;
 }

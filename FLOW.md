@@ -1,9 +1,9 @@
 # PinkyAgent — agent flow
 
 How one prompt travels from a client program to a reply, and what the agent
-loop does in between. Diagrams follow the code as of the prompt-cache alignment
-work; the file paths in the notes are where each box lives. DESIGN.md is still
-the spec — this is the map of what is built.
+loop does in between. Diagrams follow the code as of slice 9 (MCP + deferred
+tools); the file paths in the notes are where each box lives. DESIGN.md is
+still the spec — this is the map of what is built.
 
 ## 1. End to end: JSONL client → headless service → agent loop → reply
 
@@ -12,6 +12,7 @@ sequenceDiagram
     autonumber
     participant C as Client program<br/>(stdin / stdout)
     participant H as pinky headless<br/>gateway/headless.ts
+    participant D as Tool partition<br/>cli/index.ts + runtime/deferred.ts
     participant ES as EventStore<br/>core/event-store.ts
     participant L as runAgentLoop<br/>runtime/loop.ts
     participant M as Memory plane<br/>core/memory.ts
@@ -27,8 +28,10 @@ sequenceDiagram
     else new (or replay of an idle thread)
         H->>H: enqueue on the (channelId, threadId) lane — serialized per thread
         H-->>C: {"type":"run_started"}
-        H->>L: runAgent(thread, batch, {signal, onEvent, deliver})
-        Note over L: settings reloaded for this run:<br/>global, then channel:id, then agent:pinky
+        H->>D: runAgent(thread, batch, {signal, onEvent, deliver})
+        Note over D: settings reloaded for this run:<br/>global, then channel:id, then agent:pinky
+        D->>D: partitionTools(builtins + mcp.tools(), settings.tools)
+        D->>L: runAgentLoop — tools = head, systemPrompt built from head,<br/>deferred = DeferredToolRegistry over the tool catalog
         L->>ES: contextEvents(thread) — from the latest continuity boundary
         L->>L: buildContext → projection (ingress/a2a/notice/message/tool_result/continuity,<br/>tool args canonicalized, plus the journaled recall block hoisted to index 0)
         opt memory.autoRecall, and no recall event in this window carries a block key
@@ -38,7 +41,7 @@ sequenceDiagram
         end
         loop each turn (≤ maxTurns)
             L->>L: pressure ladder: advisory once per window / forced shed_context — each notice journaled, then pushed
-            L->>P: complete(system, messages, full tool list, cacheKey — tool_choice only on a forced retry)
+            L->>P: complete(system, messages, the HEAD tool list, cacheKey — tool_choice only on a forced retry)
             P-->>L: AssistantTurn {text, toolCalls, usage}
             L->>ES: append message event (+usage)
             ES-->>H: onEvent → {"type":"event", event}
@@ -48,7 +51,8 @@ sequenceDiagram
                 H-->>C: {"type":"reply","text":...}
                 L->>ES: append egress event
             else tool calls (shed_context always runs LAST)
-                L->>T: execute(args, ctx{db, thread, memory, settings, messenger})
+                L->>T: execute(args, ctx{db, thread, memory, settings, messenger, deferred})
+                Note over T: a meta-tool call reads the catalog<br/>and, for tool_call, runs the deferred tool —<br/>the schema arrives as a tool_result, the header never moves
                 T-->>L: ToolResult
                 L->>ES: append tool_result event
             end
@@ -68,7 +72,8 @@ guaranteed per thread: `run_started → (event | reply)* → run_finished`.
 
 ```mermaid
 flowchart TD
-    start([run starts]) --> load[loadContext: events since the latest continuity event<br/>buildContext → projection<br/>non-empty journaled recall block hoisted to index 0, notices in seq order<br/>tool args canonicalized on both sides of the log]
+    start([run starts]) --> part[per-run tool partition: builtins + mcp.tools<br/>partitionTools by settings.tools — alwaysOn &gt; deferred &gt; defaultMode<br/>head → the request's tools array AND the system prompt<br/>the rest → DeferredToolRegistry over the tool catalog]
+    part --> load[loadContext: events since the latest continuity event<br/>buildContext → projection<br/>non-empty journaled recall block hoisted to index 0, notices in seq order<br/>tool args canonicalized on both sides of the log]
     load --> journaled{"windowRecall: does this window already<br/>carry a recall event with a block key?"}
     journaled -- "yes, memory on, scope not narrower" --> opened
     journaled -- "no key, or memory off, or narrower scope than journaled" --> recall{memory.autoRecall<br/>and memory context?}
@@ -80,7 +85,7 @@ flowchart TD
     restart0 --> ladder
 
     ladder{estimateTokens vs<br/>context.* thresholds}
-    ladder -- "≥ hardFraction" --> forcing{"first forced attempt, or the retry?<br/>full tool list kept either way"}
+    ladder -- "≥ hardFraction" --> forcing{"first forced attempt, or the retry?<br/>the head tool list is kept whole either way"}
     ladder -- "context cap truncated the window" --> forcing
     forcing -- first --> hard1["append notice event, then push HARD notice as user msg<br/>NO tool_choice — appending keeps the messages cache warm;<br/>the note plus the harness guard hold the boundary"]
     forcing -- "retry — last attempt" --> hard2["append notice event, then push HARD RETRY notice as user msg<br/>tool_choice: shed_context — the guarantee, paid for with<br/>one uncached re-read of the transcript"]
@@ -112,6 +117,7 @@ flowchart TD
         mem[recall / retain / memory_edit<br/>→ memory plane, memory events]
         cfg[settings_get / settings_set<br/>human allow-listed, validated before write,<br/>config event]
         a2a[a2a_send / a2a_inbox<br/>→ mailbox]
+        meta[tool_search / tool_describe / tool_call<br/>always in the header, never deferrable<br/>→ tool catalog, then the deferred tool itself]
         shed[shed_context<br/>validates ContinuityDoc → continuity event]
     end
 
@@ -171,6 +177,44 @@ sequenceDiagram
     Note over H,MB: Recovery: at startup and every 30s,<br/>redeliverUnconsumed(agent) re-fires every row with read_at null —<br/>regardless of delivered_at. Same rule for any future timer:<br/>emit an event, receipt the consumption, never mark "fired" scheduler-side.
 ```
 
+## 4. The MCP plane: a configured server becomes catalog rows
+
+Nothing here is on the request path. `bootstrap()` awaits one catalog probe per
+server and returns; every connect runs on a background loop, so request 1 is
+answered from the catalog long before a stdio child has finished spawning.
+
+```mermaid
+flowchart TD
+    mstart([bootstrap: settings.mcp.servers<br/>read once, from global + agent scopes]) --> mprobe{catalog config_hash<br/>matches this server's config?}
+    mprobe -- yes --> mtrust[status trusted-cache<br/>adopt the catalog generation as the live tool set<br/>the header is identical before and after the connect]
+    mprobe -- no --> mcold[status connecting<br/>rows from a different config are not served]
+    mtrust --> mconn
+    mcold --> mconn
+
+    mconn[connect: versionNegotiation auto<br/>server/discover first, else the 2025 initialize handshake]
+    mconn -- ok --> mera[record era + protocol version + server name<br/>every line to stderr, never stdout]
+    mconn -- failed --> merr[status error, lastError kept<br/>the previous generation stays in the catalog]
+    merr --> mback[full-jitter backoff]
+    mback --> mconn
+
+    mera --> mlist[tools/list, every page<br/>names assigned for the whole generation at once<br/>sorted by final name, code-unit order]
+    mlist --> mrepl[catalog.replaceServer in ONE transaction<br/>upsert the live set, stamp removed_at on the vanished ones<br/>config hash stamped on the generation]
+    mrepl -- write failed --> mkeep[connection KEPT, generation KEPT<br/>backed-off sync retry — a bad row must not respawn the child]
+    mkeep --> mrepl
+    mrepl --> mlisten[subscribe to list changes<br/>subscriptions/listen on modern, notifications on legacy]
+    mrepl --> mttl[schedule a refresh from ttlMs<br/>floored at 60s, capped at 24h]
+    mlisten --> mlive([live: tools published to the partition<br/>tool_call dispatched with the server's RAW name])
+    mttl -- fires --> mlist
+    mlisten -- list_changed --> mlist
+    mlive -- link drops --> mback
+    mlive -- close: clients closed, children reaped --> mdone([SIGTERM 143 / SIGINT 130])
+```
+
+The catalog is what survives all of this: an outage never empties it, so
+`tool_search` keeps finding a tool whose server is down and `tool_call` answers
+"its server is offline" — a temporary condition the model can retry — rather
+than "no such tool".
+
 ## Where the pieces live
 
 | Box | File |
@@ -180,6 +224,10 @@ sequenceDiagram
 | Ingest (dedup + append in one tx), projection window | `packages/core/src/event-store.ts` |
 | Projection rules (what the model sees) | `packages/core/src/projection.ts` |
 | Turn cycle, pressure ladder, restart | `packages/runtime/src/loop.ts` |
+| Header/catalog partition, `tool_call` dispatch | `packages/runtime/src/deferred.ts` |
+| The three meta-tools | `packages/tools/src/deferred.ts` |
+| Tool catalog store (+ `schema/0006_tool_catalog.sql`) | `packages/core/src/tool-catalog.ts` |
+| MCP connect / sync / dispatch, `mcp__<server>__<tool>` naming | `packages/mcp/src/manager.ts`, `packages/mcp/src/naming.ts` |
 | Auto-recall block | `packages/runtime/src/memory-recall.ts` |
 | `shed_context` + ContinuityDoc validation | `packages/runtime/src/continuity.ts` |
 | Memory store (scopes, FTS + vector, fusion) | `packages/core/src/memory.ts` |

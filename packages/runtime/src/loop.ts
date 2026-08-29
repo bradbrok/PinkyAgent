@@ -506,6 +506,11 @@ export async function runAgentLoop(opts: RunAgentLoopOptions): Promise<AgentRunR
           settings: opts.settings,
           ...(opts.messenger ? { messenger: opts.messenger } : {}),
           ...(opts.memory ? { memory: opts.memory } : {}),
+          // The catalog plane behind tool_search/tool_describe/tool_call
+          // (slice 9). Absent on a surface with no catalog, which is what
+          // makes the three meta-tools answer "no deferred tools" instead of
+          // being conditionally registered — see packages/tools/src/index.ts.
+          ...(opts.deferred ? { deferred: opts.deferred } : {}),
           ...(opts.signal ? { signal: opts.signal } : {}),
         };
         try {

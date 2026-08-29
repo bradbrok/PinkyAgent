@@ -80,11 +80,11 @@ flowchart TD
     ladder{estimateTokens vs<br/>context.* thresholds}
     ladder -- "≥ hardFraction" --> hard[push HARD notice as user msg<br/>only shed_context offered]
     ladder -- "≥ advisoryFraction (once)" --> adv[push ADVISORY notice as user msg]
-    ladder -- below --> call
-    hard --> call
-    adv --> call
+    ladder -- below --> llm
+    hard --> llm
+    adv --> llm
 
-    call[provider.complete<br/>system prompt = stable cached prefix, never rewritten] --> journal[append message event<br/>with usage: input / output / cacheRead / cacheCreation]
+    llm[provider.complete<br/>system prompt = stable cached prefix, never rewritten] --> journal[append message event<br/>with usage: input / output / cacheRead / cacheCreation]
     journal --> calls{tool calls?}
 
     calls -- none --> deliver[deliver text → reply line<br/>append egress event]
@@ -113,7 +113,7 @@ flowchart TD
     shedq -- no --> more{turns left?}
     more -- yes --> ladder
     more -- no --> maxed([max_turns])
-    shedq -- yes --> rebuild[NEW BOUNDARY: reload projection from the continuity event<br/>re-run autoRecall (memoryHints feed the query)<br/>emit restart event]
+    shedq -- yes --> rebuild[NEW BOUNDARY: reload projection from the continuity event<br/>re-run autoRecall with the memoryHints in the query<br/>emit restart event]
     rebuild --> more2{turns left?}
     more2 -- yes --> ladder
     more2 -- no --> paused([shed — resumes on next wake])

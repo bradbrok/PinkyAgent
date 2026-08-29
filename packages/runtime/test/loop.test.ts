@@ -8,10 +8,11 @@
 import { describe, expect, test } from "bun:test";
 import { EventStore, threadKey } from "@pinky/core";
 import type { Db, SettingsSnapshot, ThreadEvent, ThreadEventData, ThreadRef, ToolCall } from "@pinky/core";
+import type { MemoryHit, MemoryStore, RecallScope, SearchInput } from "@pinky/core";
 import { runAgentLoop } from "../src/loop";
 import { ShedContextTool } from "../src/continuity";
 import { FakeProvider } from "../src/providers/fake";
-import type { AgentLoopOptions } from "../src/types";
+import type { AgentLoopOptions, Embedder, MemoryContext } from "../src/types";
 import type { AgentRunResult, AssistantTurn, CompleteOptions, LlmMessage, Provider, Tool } from "../src/types";
 import type { FakeScript } from "../src/providers/fake";
 import type { RunAgentLoopOptions } from "../src/loop";
@@ -144,12 +145,23 @@ class FakeDb implements Db {
 
 const THREAD: ThreadRef = { tenantId: "t1", channelId: "c1", threadId: "th1" };
 
-function settings(context?: Partial<SettingsSnapshot["context"]>): SettingsSnapshot {
+function settings(
+  context?: Partial<SettingsSnapshot["context"]>,
+  memory?: Partial<SettingsSnapshot["memory"]>,
+): SettingsSnapshot {
   return {
     tenantId: "t1",
     model: "fake/test-model",
     context: { advisoryFraction: 0.7, hardFraction: 0.9, approxWindowTokens: 180_000, ...context },
     replyGate: { classifierEnabled: false },
+    memory: {
+      embeddingModel: "none",
+      autoRecall: true,
+      recallLimit: 12,
+      recallTokenBudget: 5_000,
+      ...memory,
+    },
+    selfConfig: { enabled: false, allowedKeys: [] },
   };
 }
 
@@ -633,5 +645,303 @@ describe("runAgentLoop restart cycle (DESIGN §4.3)", () => {
     expect(notices(h.provider.prompts[0]!.messages)).toHaveLength(1); // first crossing
     expect(notices(h.provider.prompts[1]!.messages)).toHaveLength(0); // fresh window
     expect(notices(h.provider.prompts[2]!.messages)).toHaveLength(1); // re-armed, crossed again
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Memory plane: auto-recall at context start and after each restart
+// (DESIGN §5.4). The block is background context in a `user` message; the
+// system prompt — the cached prefix (§4.5/§9) — is never touched.
+// ---------------------------------------------------------------------------
+
+const SCOPE: RecallScope = {
+  agentId: "pinky",
+  channelId: "c1",
+  includeUser: false,
+  includePrivate: false,
+};
+
+let hitSeq = 0;
+
+function memoryHit(partial: Partial<MemoryHit> = {}): MemoryHit {
+  hitSeq += 1;
+  return {
+    id: `mem-${hitSeq}`,
+    tenantId: "t1",
+    agentId: "pinky",
+    visibility: "channel",
+    userId: null,
+    channelId: "c1",
+    kind: "semantic",
+    text: `memory ${hitSeq}`,
+    importance: 5,
+    validFrom: "2026-08-01T00:00:00.000Z",
+    validTo: null,
+    recordedAt: "2026-08-01T09:30:00.000Z",
+    embeddingModel: null,
+    meta: {},
+    score: 0.5,
+    voices: { fts: 1 },
+    ...partial,
+  };
+}
+
+class RecallStub {
+  readonly searches: SearchInput[] = [];
+  constructor(
+    private readonly opts: { hits?: MemoryHit[]; vectors?: boolean; searchError?: Error } = {},
+  ) {}
+
+  async supportsVectors(): Promise<boolean> {
+    return this.opts.vectors ?? false;
+  }
+
+  async search(input: SearchInput): Promise<MemoryHit[]> {
+    this.searches.push(input);
+    if (this.opts.searchError) throw this.opts.searchError;
+    return this.opts.hits ?? [];
+  }
+}
+
+class BrokenEmbedder implements Embedder {
+  readonly model = "fake/embed";
+  readonly dimensions = 4;
+  calls = 0;
+  async embed(): Promise<number[][]> {
+    this.calls += 1;
+    throw new Error("embeddings provider down");
+  }
+}
+
+function memoryContext(store: RecallStub, embedder?: Embedder): MemoryContext {
+  return {
+    store: store as unknown as MemoryStore,
+    scope: SCOPE,
+    ...(embedder ? { embedder } : {}),
+  };
+}
+
+const memoryEvents = (db: FakeDb): Extract<ThreadEventData, { type: "memory" }>[] =>
+  db.events
+    .map((e) => e.data)
+    .filter((d): d is Extract<ThreadEventData, { type: "memory" }> => d.type === "memory");
+
+const RECALL_HEAD = "[harness notice] Recalled memories";
+
+describe("runAgentLoop auto-recall (DESIGN §5.4)", () => {
+  test("injects the <memories> block at index 0 as a user message", async () => {
+    const h = harness([turn({ text: "ok" })]);
+    await h.store.append(THREAD, ingress("how do we handle provider retries?"));
+    const recalled = memoryHit({ text: "retries use jittered backoff" });
+    const store = new RecallStub({ hits: [recalled] });
+
+    await h.run({ memory: memoryContext(store) });
+
+    const msgs = h.provider.prompts[0]!.messages;
+    expect(msgs[0]!.role).toBe("user");
+    expect(msgs[0]!.text.startsWith(RECALL_HEAD)).toBe(true);
+    expect(msgs[0]!.text).toContain("retries use jittered backoff");
+    expect(msgs[1]!.text).toContain("how do we handle provider retries?");
+    // The block is a conversation turn, never a system message or a prefix edit.
+    expect(h.provider.prompts[0]!.system).toBe("sys");
+    expect(msgs.every((m) => m.role !== "system")).toBe(true);
+
+    // The query is seeded from the window, author prefix stripped.
+    expect(store.searches).toHaveLength(1);
+    expect(store.searches[0]!.query).toBe("how do we handle provider retries?");
+    expect(store.searches[0]!.limit).toBe(12);
+    expect(store.searches[0]!.scope).toEqual(SCOPE);
+
+    // Audit-only event: the projection never renders it.
+    expect(memoryEvents(h.db)).toEqual([
+      { type: "memory", op: "recall", ids: [recalled.id], text: "how do we handle provider retries?", count: 1 },
+    ]);
+  });
+
+  test("no hits: nothing is injected and no memory event is journaled", async () => {
+    const h = harness([turn({ text: "ok" })]);
+    await h.store.append(THREAD, ingress("hello"));
+    await h.run({ memory: memoryContext(new RecallStub({ hits: [] })) });
+
+    const msgs = h.provider.prompts[0]!.messages;
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]!.text).toContain("hello");
+    expect(memoryEvents(h.db)).toEqual([]);
+  });
+
+  test("autoRecall=false never touches the store", async () => {
+    const h = harness([turn({ text: "ok" })]);
+    await h.store.append(THREAD, ingress("hello"));
+    const store = new RecallStub({ hits: [memoryHit()] });
+    await h.run({
+      memory: memoryContext(store),
+      settings: settings(undefined, { autoRecall: false }),
+    });
+    expect(store.searches).toHaveLength(0);
+    expect(h.provider.prompts[0]!.messages).toHaveLength(1);
+  });
+
+  test("without a memory context the prompt is the bare projection", async () => {
+    const h = harness([turn({ text: "ok" })]);
+    await h.store.append(THREAD, ingress("hello"));
+    await h.run();
+    expect(h.provider.prompts[0]!.messages).toHaveLength(1);
+    expect(memoryEvents(h.db)).toEqual([]);
+  });
+
+  test("a restart recalls again, seeded by the continuity memoryHints", async () => {
+    const h = harness(
+      [
+        turn({ text: "", toolCalls: [call("s1", "shed_context", SHED_ARGS)], stopReason: "tool_calls" }),
+        turn({ text: "resumed" }),
+      ],
+      [echoTool, new ShedContextTool()],
+    );
+    await h.store.append(THREAD, ingress("widget pricing question"));
+    const store = new RecallStub({ hits: [memoryHit({ text: "widgets cost $4" })] });
+
+    const result = await h.run({ memory: memoryContext(store) });
+    expect(result).toEqual({ turns: 2, stopReason: "completed" });
+
+    // One recall per context: the initial window and the post-shed window.
+    expect(store.searches.map((s) => s.query)).toEqual([
+      "widget pricing question",
+      "continuity", // SHED_ARGS.memoryHints — the only signal in a fresh window
+    ]);
+
+    const after = h.provider.prompts[1]!.messages;
+    expect(after).toHaveLength(2);
+    expect(after[0]!.role).toBe("user");
+    expect(after[0]!.text.startsWith(RECALL_HEAD)).toBe(true);
+    expect(after[1]!.text).toContain("# Pinky Continuity");
+    expect(h.provider.prompts[1]!.system).toBe("sys");
+    expect(memoryEvents(h.db)).toHaveLength(2);
+  });
+
+  test("an embedder failure degrades to FTS-only and journals an error", async () => {
+    const h = harness([turn({ text: "ok" })]);
+    await h.store.append(THREAD, ingress("vector question"));
+    const store = new RecallStub({ vectors: true, hits: [memoryHit({ text: "fts still works" })] });
+    const embedder = new BrokenEmbedder();
+
+    const result = await h.run({ memory: memoryContext(store, embedder) });
+    expect(result.stopReason).toBe("completed");
+    expect(embedder.calls).toBe(1);
+    expect(store.searches[0]!.queryEmbedding).toBeUndefined();
+    expect(h.provider.prompts[0]!.messages[0]!.text).toContain("fts still works");
+
+    const err = h.db.events
+      .map((e) => e.data)
+      .find((d): d is Extract<ThreadEventData, { type: "error" }> => d.type === "error")!;
+    expect(err).toMatchObject({ source: "memory", count: 1 });
+    expect(err.message).toContain("embeddings provider down");
+  });
+
+  test("a store failure journals an error and the run continues unrecalled", async () => {
+    const h = harness([turn({ text: "ok" })]);
+    await h.store.append(THREAD, ingress("hello"));
+    const store = new RecallStub({ searchError: new Error("connection reset") });
+
+    const result = await h.run({ memory: memoryContext(store) });
+    expect(result).toEqual({ turns: 1, stopReason: "completed" });
+    expect(h.provider.prompts[0]!.messages).toHaveLength(1); // no block
+    expect(eventTypes(h.db)).toEqual(["ingress", "error", "message", "egress"]);
+    const err = h.db.events[1]!.data as Extract<ThreadEventData, { type: "error" }>;
+    expect(err.source).toBe("memory");
+    expect(err.message).toContain("recall failed");
+  });
+
+  test("the token budget cuts the block down to the highest-scored hits", async () => {
+    const h = harness([turn({ text: "ok" })]);
+    await h.store.append(THREAD, ingress("hello"));
+    const store = new RecallStub({
+      hits: [
+        memoryHit({ text: `top ${"a".repeat(200)}`, score: 0.9 }),
+        memoryHit({ text: `mid ${"b".repeat(200)}`, score: 0.8 }),
+        memoryHit({ text: `low ${"c".repeat(200)}`, score: 0.1 }),
+      ],
+    });
+
+    await h.run({
+      memory: memoryContext(store),
+      // ~104 tokens for header + one 200-char hit, as core's estimateTokens
+      // counts it (chars/4 plus the per-message overhead); a second hit is ~60
+      // more, so this budget admits exactly one.
+      settings: settings(undefined, { recallTokenBudget: 110 }),
+    });
+
+    const block = h.provider.prompts[0]!.messages[0]!.text;
+    expect(block).toContain("top a");
+    expect(block).not.toContain("mid b");
+    expect(block).not.toContain("low c");
+    const ev = memoryEvents(h.db)[0]!;
+    expect(ev.count).toBe(3); // candidates before the cut
+    expect(ev.ids).toHaveLength(1); // what the model actually saw
+  });
+});
+
+describe("runAgentLoop onEvent observer", () => {
+  test("every appended event reaches onEvent, in log order, with the stored row", async () => {
+    // Two turns and a tool call: message, tool_result, message, egress.
+    const h = harness(
+      [turn({ text: "", toolCalls: [call("c1", "echo", { a: 1 })] }), turn({ text: "done" })],
+      [echoTool],
+    );
+    const seen: ThreadEvent[] = [];
+    const result = await h.run({ onEvent: (e) => seen.push(e) });
+
+    expect(result).toEqual({ turns: 2, stopReason: "completed" });
+    // The observer sees exactly the log, in seq order — it is the append path,
+    // not a second source of truth (headless JSONL streams straight from it).
+    expect(eventTypes(h.db)).toEqual(seen.map((e) => e.data.type));
+    expect(seen.map((e) => e.seq)).toEqual([1, 2, 3, 4]);
+    expect(seen.map((e) => e.id)).toEqual(h.db.events.map((e) => e.id));
+    expect(seen[0]).toEqual(h.db.events[0]!);
+  });
+
+  test("a throwing observer never breaks the run", async () => {
+    const h = harness([turn({ text: "hello" })]);
+    let calls = 0;
+    const result = await h.run({
+      onEvent: () => {
+        calls++;
+        throw new Error("observer exploded");
+      },
+    });
+
+    expect(result).toEqual({ turns: 1, stopReason: "completed" });
+    expect(calls).toBe(2); // message + egress
+    expect(eventTypes(h.db)).toEqual(["message", "egress"]);
+    expect(h.delivered).toEqual(["hello"]);
+  });
+});
+
+describe("runAgentLoop tool context", () => {
+  test("hands every tool the run's settings snapshot, read-only", async () => {
+    // `settings_set` needs the snapshot to report `previous` and to read the
+    // selfConfig allow-list (DESIGN.md P8, revised). It must be the object the
+    // loop itself is running on — a stale or absent copy would let a tool
+    // report a threshold nobody is using.
+    const seen: (SettingsSnapshot | undefined)[] = [];
+    const spy: Tool = {
+      name: "spy",
+      description: "records its context",
+      parameters: { type: "object" },
+      execute: async (_args, ctx) => {
+        seen.push(ctx.settings);
+        return { text: "ok" };
+      },
+    };
+    const h = harness(
+      [turn({ text: "", toolCalls: [call("c1", "spy")] }), turn({ text: "done" })],
+      [spy],
+    );
+    const snapshot = settings({ advisoryFraction: 0.55 });
+    const result = await h.run({ settings: snapshot });
+
+    expect(result.stopReason).toBe("completed");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toBe(snapshot);
+    expect(seen[0]!.context.advisoryFraction).toBe(0.55);
   });
 });

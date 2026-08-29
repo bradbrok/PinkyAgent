@@ -26,7 +26,7 @@ section.
 | P5 | **One writer, many readers** | A single-threaded coordinator per conversation owns all external writes. Subagents run parallel, isolated, read/compute-only, and return artifacts (Cognition's narrowed position). |
 | P6 | **Durable by construction** | Every nondeterministic call (LLM, tool) is recorded once at an activity boundary. Human input is an async event, not a blocking call. |
 | P7 | **Agent-to-agent comms, cross-machine** | Agents are addressable peers (`agentId@nodeId`). A2A is a durable Postgres mailbox with at-least-once delivery: in-process publish on one node, HMAC-signed HTTP relay between machines. Wake-on-message, no shared process. |
-| P8 | **DB is the only config; agents cannot self-lobotomize** | All behavioral config (model, thresholds, gate) lives in the `settings` table, written solely by the human CLI. env bootstraps secrets/node identity only. The runtime reads a snapshot per wake and exposes **no** agent-writable config path — no self-model-switch, no prompt rewrite, no gate edits. Memory is heuristic-only; procedural promotion is human-gated (§13). |
+| P8 | **DB is the only config; agents cannot self-lobotomize** | All behavioral config (model, thresholds, gate) lives in the `settings` table — never in a config file. env bootstraps secrets/node identity only. The human CLI is the default write path; the runtime reads a snapshot per wake. An agent may change config **only** through a validated, journaled tool (`settings_set`), **only** for keys a human allow-listed (`selfConfig.allowedKeys`, off by default), and never `tenantId`, `selfConfig` itself, or the global scope. Validation happens before the write, so a value the agent gets wrong is a tool error it can read and retry — not a process that fails to boot on malformed config. Memory is heuristic-only; procedural promotion is human-gated (§13). |
 
 ---
 
@@ -273,6 +273,10 @@ Hybrid, fused, cheap:
 
 ## 6. Reply gating: when to speak
 
+> Implementation note: with the JSONL stdio ingress (§11) every prompt is addressed to
+> the agent by construction, so the gate below is inert — it comes back with the first
+> multi-party ingress.
+
 Every ingress event flows:
 
 ```text
@@ -406,16 +410,19 @@ disposable tool-execution environments:
 - **LLM layer**: provider-agnostic with role aliases (`default`, `smol`, `advisor`),
   prompt-cache-aware.
 - **Embeddings**: `text-embedding-3-small` behind an interface; local bge for dev.
-- **Gateways**: Slack (Events API, 3s-ack + enqueue, `event_id` dedup, `bot_id` drop,
-  `thread_ts` string threading, `reply_broadcast` knob) and Discord (gateway WS) first;
-  webhook-generic ingress for everything else.
+- **Gateways**: a JSONL stdio protocol is the primary ingress — one command object per
+  stdin line, one event object per stdout line, for a long-lived process another program
+  drives (the pi-headless shape). It needs no socket, no signature verification and no
+  reply gate, and the ordering contract is per thread. Slack and Discord are out of the
+  MVP; a webhook-generic ingress can come back when there is a second party to gate.
 
 ---
 
 ## 12. Build order (MVP slices)
 
-1. **Core loop + event log + one gateway** (Slack). Linear thread, projection, Postgres.
-   Agent replies when mentioned. No memory yet beyond the log.
+1. **Core loop + event log + JSONL headless ingress**. Linear thread, projection,
+   Postgres. Every prompt on the pipe is addressed to the agent. No memory yet beyond
+   the log.
 2. **Memory plane v1**: pgvector, scopes, hot tools (`recall/retain`), auto-recall at
    context start, hybrid retrieval (vector + FTS).
 3. **Continuity engine**: `shed_context` + `write_continuity`, threshold ladder, restart

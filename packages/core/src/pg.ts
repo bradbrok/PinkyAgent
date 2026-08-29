@@ -101,8 +101,10 @@ export function createDb(url: string, opts?: { max?: number }): Db {
   const sql = postgres(url, {
     max: opts?.max ?? 10,
     // Server NOTICEs (migration DO-blocks use RAISE NOTICE) print as one line
-    // instead of postgres.js's default full-object dump.
-    onnotice: (n) => console.log(`notice: ${n.message}`),
+    // instead of postgres.js's default full-object dump. On STDERR: stdout is
+    // the JSONL protocol in headless mode (DESIGN.md §11), and every command
+    // auto-migrates, so a notice on stdout would corrupt the stream.
+    onnotice: (n) => console.warn(`notice: ${n.message}`),
   }) as unknown as Client;
   return scopedDb(sql, true);
 }

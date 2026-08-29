@@ -26,18 +26,23 @@ jobs:
       - run: bun test
 
   integration:
-    name: integration tests (live postgres)
+    name: integration tests (${{ matrix.image }})
     runs-on: ubuntu-latest
     needs: check
 
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both images ON PURPOSE. pgvector is the only place the vector voice,
+        # 0002_embeddings.rerun.sql's ALTER TABLE and the HNSW index actually
+        # execute; alpine (what docker-compose.yml runs locally) is where the
+        # `supportsVectors() === false` degradation branch — FTS-only recall,
+        # retain without an embedding — is exercised. A green run needs both.
+        image: ["pgvector/pgvector:pg16", "postgres:16-alpine"]
+
     services:
       postgres:
-        # pgvector rather than the postgres:16-alpine used by docker-compose.yml
-        # ON PURPOSE: it is the only place 0002_embeddings.rerun.sql actually
-        # does its work. On an image without the extension that file takes its
-        # "pgvector unavailable" branch and no-ops, so the ALTER TABLE and the
-        # HNSW index are never executed locally. Here they are.
-        image: pgvector/pgvector:pg16
+        image: ${{ matrix.image }}
         env:
           POSTGRES_PASSWORD: pinky
           POSTGRES_DB: pinky
@@ -73,7 +78,7 @@ jobs:
       - name: Apply migrations
         run: bun run migrate
 
-      # migrate.test.ts asserts the pgvector branch of the rerun migration when
-      # the server has the extension, and the no-op branch when it does not —
-      # so this job is where the ALTER TABLE + HNSW index actually get executed.
+      # migrate.test.ts and memory.test.ts assert the pgvector branch when the
+      # server has the extension and the degradation branch when it does not,
+      # so each matrix leg proves a different half of the memory plane.
       - run: bun run test:integration

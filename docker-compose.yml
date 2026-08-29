@@ -1,7 +1,9 @@
 services:
   postgres:
     # pgvector/pgvector:pg16 preferred (slice 2 embeddings); postgres:16-alpine
-    # used here because it's already local and slice 1 has no vector queries.
+    # used here because it's already local; the memory plane degrades to FTS-only
+    # on it (`supportsVectors()` false). The `postgres-vector` service below is the
+    # pgvector counterpart on 5545.
     # The schema's `create extension if not exists vector` is a no-op guard.
     image: postgres:16-alpine
     environment:
@@ -29,5 +31,49 @@ services:
       timeout: 3s
       retries: 20
 
+  # ---------------------------------------------------------------------------
+  # Second server, WITH pgvector, for the vector half of hybrid recall
+  # (DESIGN.md §5.4). It is behind a compose profile, so the default
+  # `bun run db:up` still starts only the alpine server above and nothing about
+  # the day-to-day loop changes.
+  #
+  # Why a second service rather than swapping the image: the FTS voice and the
+  # vector voice are different code paths in packages/core/src/memory.ts, and
+  # the alpine server is the only place the "no pgvector" branch
+  # (supportsVectors() === false, retain-drops-the-embedding, search falls back
+  # to FTS) can be executed at all. Keeping both up means one `bun test` run
+  # per server covers both branches locally, the same pair CI covers
+  # (pgvector/pgvector:pg16 in .github/workflows/ci.yml, alpine here).
+  #
+  #   bun run db:up:vector
+  #   DATABASE_URL=postgres://postgres:pinky@localhost:5545/pinky \
+  #   DATABASE_ADMIN_URL=postgres://postgres:pinky@localhost:5545/pinky \
+  #     bun run migrate
+  #   bun run test:integration:vector
+  #
+  # Separate volume on purpose: the two servers must never share a data
+  # directory (different binaries, and a database migrated with the embedding
+  # column would break the alpine server's view of it).
+  postgres-vector:
+    image: pgvector/pgvector:pg16
+    profiles: ["vector"]
+    environment:
+      # Same dev credentials as the alpine server, so only the port differs:
+      #   DATABASE_ADMIN_URL=postgres://postgres:pinky@localhost:5545/pinky
+      #   DATABASE_URL=postgres://pinky_app:pinky@localhost:5545/pinky
+      POSTGRES_PASSWORD: pinky
+      POSTGRES_DB: pinky
+    ports:
+      # 5544 is the alpine server; 5545 is this one. Both can run at once.
+      - "5545:5432"
+    volumes:
+      - pinky_pg_vector:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pinky"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
 volumes:
   pinky_pg:
+  pinky_pg_vector:

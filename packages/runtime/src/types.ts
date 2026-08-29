@@ -4,6 +4,8 @@
  */
 import type {
   Db,
+  MemoryStore,
+  RecallScope,
   SettingsSnapshot,
   ThreadEvent,
   ThreadRef,
@@ -64,8 +66,34 @@ export interface Provider {
 }
 
 // ---------------------------------------------------------------------------
+// Embeddings (DESIGN.md §5.5)
+// ---------------------------------------------------------------------------
+
+export interface Embedder {
+  /** "provider/model-id" as configured, e.g. "openai/text-embedding-3-small". */
+  readonly model: string;
+  readonly dimensions: number; // 1536 for text-embedding-3-small
+  embed(texts: string[], opts?: { signal?: AbortSignal }): Promise<number[][]>;
+}
+
+// ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
+
+/**
+ * The memory plane as the runtime sees it (DESIGN.md §5): a store, the scope
+ * the caller is entitled to read/write (§5.1), and an optional embedder.
+ *
+ * Absent embedder => FTS-only: no vector voice on recall, no embedding written
+ * on retain. That is a degraded mode, not an error — recall still works.
+ */
+export interface MemoryContext {
+  store: MemoryStore;
+  /** Absent => FTS-only (no vector voice on recall, no embedding on retain). */
+  embedder?: Embedder;
+  /** Who is asking and from where; the store turns this into a SQL predicate. */
+  scope: RecallScope;
+}
 
 export interface ToolContext {
   cwd: string;
@@ -75,8 +103,24 @@ export interface ToolContext {
   emit: (data: ThreadEvent["data"]) => Promise<void>;
   /** Present when the runtime has A2A enabled. */
   messenger?: Messenger;
+  /** Present when the memory plane is enabled (DESIGN.md §5); the memory
+   *  tools degrade to a clean error without it. */
+  memory?: MemoryContext;
   /** This agent's stable id (for A2A addressing). */
   agentId?: string;
+  /**
+   * The settings snapshot this run started with — READ-ONLY, and a copy of
+   * what the loop itself is using. Mutating it changes nothing: the loop read
+   * its model and thresholds before the first turn, and the next run reloads
+   * from the table.
+   *
+   * A tool that wants to *change* a setting writes through
+   * `new SettingsStore(ctx.db).set(...)` under the `selfConfig` allow-list
+   * (DESIGN.md P8, revised) — never by mutating this object, and never by
+   * touching a file. Optional because a non-loop caller (a test, a one-shot
+   * tool invocation) may have no snapshot to hand over.
+   */
+  settings?: SettingsSnapshot;
   /**
    * The loop's estimate of the prompt size (tokens) for the turn that issued
    * this call. Set by runAgentLoop; `shed_context` records it as the
@@ -155,6 +199,10 @@ export interface AgentLoopOptions {
   thread: ThreadRef;
   agentId: string;
   messenger?: Messenger;
+  /** Enables auto-recall at context start / after each restart (DESIGN.md
+   *  §5.4) and hands the memory tools their store. Absent => the loop runs
+   *  exactly as it did before the memory plane existed. */
+  memory?: MemoryContext;
   systemPrompt: string;
   cwd: string;
   maxTurns?: number;
@@ -163,6 +211,12 @@ export interface AgentLoopOptions {
   settings: SettingsSnapshot;
   /** Deliver assistant text to the outside world; return false to suppress. */
   deliver?: (text: string) => Promise<void>;
+  /**
+   * Observer for every event the loop appends; errors are swallowed. Used by
+   * the headless JSONL mode to stream the log live. Fire-and-forget: it must
+   * not be a second write path, and nothing in the loop waits on it.
+   */
+  onEvent?: (event: ThreadEvent) => void;
 }
 
 export interface AgentRunResult {

@@ -86,9 +86,9 @@ suite("migrate() on a throwaway database", () => {
     const rows = await fresh.query<{ version: number }>(
       `select version from schema_migrations order by version`,
     );
-    // 0001 and 0003 are one-shots; 0002 is `.rerun.sql` and is deliberately
-    // never recorded, so it is re-attempted on every migrate.
-    expect(rows.map((r) => Number(r.version))).toEqual([1, 3]);
+    // 0001, 0003 and 0005 are one-shots; 0002 and 0004 are `.rerun.sql` and are
+    // deliberately never recorded, so they are re-attempted on every migrate.
+    expect(rows.map((r) => Number(r.version))).toEqual([1, 3, 5]);
   });
 
   it("leaves memories with RLS enabled AND forced", async () => {
@@ -126,7 +126,7 @@ suite("migrate() on a throwaway database", () => {
     const after = await fresh!.query<{ version: number; applied_at: string }>(
       `select version, applied_at from schema_migrations order by version`,
     );
-    expect(after.map((r) => Number(r.version))).toEqual([1, 3]);
+    expect(after.map((r) => Number(r.version))).toEqual([1, 3, 5]);
     // Identical timestamps prove the one-shots were skipped, not re-run.
     expect(after.map((r) => String(r.applied_at))).toEqual(before.map((r) => String(r.applied_at)));
   });
@@ -157,6 +157,47 @@ suite("migrate() on a throwaway database", () => {
       expect(column).toBe(0);
       expect(index).toBe(0);
     }
+  });
+
+  it("0005 adds the FTS column and index on EVERY image, pgvector or not", async () => {
+    // The counterpart to the test above: the vector voice is conditional, the
+    // lexical voice is not. 0005_memory_fts.sql needs nothing but stock
+    // Postgres, so a database with no `embedding` column must still come out
+    // of migrate() with a queryable tsv — otherwise recall on postgres:16-alpine
+    // has no relevance signal at all.
+    const tsv = await fresh!.queryOne<{ data_type: string; generated: string }>(
+      `select data_type, is_generated as generated from information_schema.columns
+        where table_name = 'memories' and column_name = 'tsv'`,
+    );
+    expect(tsv?.data_type).toBe("tsvector");
+    expect(tsv?.generated).toBe("ALWAYS");
+
+    const gin = await fresh!.queryOne<{ indexdef: string }>(
+      `select indexdef from pg_indexes where indexname = 'memories_tsv_idx'`,
+    );
+    expect(gin?.indexdef ?? "").toMatch(/using gin/i);
+
+    const model = await fresh!.queryOne<{ data_type: string }>(
+      `select data_type from information_schema.columns
+        where table_name = 'memories' and column_name = 'embedding_model'`,
+    );
+    expect(model?.data_type).toBe("text");
+
+    // The generated column is really generated: writing `text` fills `tsv`,
+    // and the query side uses the same 'english' configuration it was built
+    // with (a mismatch matches nothing, silently).
+    await fresh!.query(
+      `insert into memories (id, tenant_id, agent_id, visibility, kind, text)
+       values ('mig-tsv-probe', 'mig-tsv', 'a', 'tenant', 'semantic',
+               'the kangaroo deployed on Thursday')`,
+    );
+    const hit = await fresh!.queryOne<{ id: string }>(
+      `select id from memories
+        where id = 'mig-tsv-probe' and tsv @@ websearch_to_tsquery('english', $1)`,
+      ["deploy kangaroo"],
+    );
+    expect(hit?.id).toBe("mig-tsv-probe");
+    await fresh!.query(`delete from memories where id = 'mig-tsv-probe'`);
   });
 
   it("the app role exists and can read the migrated tables", async () => {

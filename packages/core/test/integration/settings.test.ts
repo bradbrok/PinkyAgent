@@ -14,8 +14,8 @@
  * is shared with the developer's own `pinky config set` and is never touched.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { loadEnvConfig } from "../../src/config";
-import { createDb } from "../../src/pg";
+import { DEFAULT_SETTINGS, loadEnvConfig } from "../../src/config";
+import { createDb, jsonbParam } from "../../src/pg";
 import { migrate } from "../../src/migrate";
 import { SettingsStore } from "../../src/settings";
 import type { Db } from "../../src/db";
@@ -236,6 +236,97 @@ suite("SettingsStore (live postgres, real jsonb)", () => {
     await store.set(mine, "model", "openrouter/mine/x");
     await store.set(theirs, "model", "openrouter/theirs/x");
     expect((await store.load({ scopes: [mine] })).model).toBe("openrouter/mine/x");
+  });
+
+  // -------------------------------------------------------------------------
+  // DEFECT (FIXED) — one unreadable row used to wedge the whole scope.
+  //
+  // `validateSettings` rejected unknown keys on READ, and `set()` validated a
+  // merged candidate that still contained the offending row. So a single row
+  // whose key named no setting — a typo, a key removed by a later version, a
+  // hand-written INSERT — made `load()`, `pinky config get`, every per-run
+  // reload AND `pinky config set <any other key>` throw. Nothing could clear
+  // it from inside the product; you needed psql.
+  //
+  // The fix is the load()/set() asymmetry documented in src/settings.ts:
+  // load() prunes and warns, set() stays strict, and unset() removes a row
+  // without caring whether its key was ever legal.
+  // -------------------------------------------------------------------------
+
+  it("DEFECT: a row naming no setting cannot brick load(), and unset clears it", async () => {
+    const s = scope("channel", "junkrow");
+    // Straight past the store, the way a typo in an older version left it.
+    await db.query(`insert into settings (scope, key, value) values ($1, $2, $3)`, [
+      s,
+      "context.hardFractoin",
+      jsonbParam(0.95),
+    ]);
+
+    const warnings: string[] = [];
+    const lenient = new SettingsStore(db, { onWarning: (m) => warnings.push(m) });
+
+    // 1. load() survives, with the defaults for the sub-tree it could not read.
+    const snapshot = await lenient.load({ scopes: [s] });
+    expect(snapshot.context).toEqual(DEFAULT_SETTINGS.context);
+    expect(warnings.some((m) => m.includes("context.hardFractoin"))).toBe(true);
+
+    // 2. an unrelated write still works — this is the half that used to make
+    //    the wedge permanent.
+    await lenient.set(s, "model", "openrouter/still/writable");
+    expect((await lenient.load({ scopes: [s] })).model).toBe("openrouter/still/writable");
+
+    // 3. and the human can actually remove it.
+    expect(await lenient.unset(s, "context.hardFractoin")).toBe(true);
+    expect(await lenient.unset(s, "context.hardFractoin")).toBe(false);
+    expect((await rowsIn(s)).map((r) => r.key)).toEqual(["model"]);
+  });
+
+  it("DEFECT: a row with a real key and a broken VALUE degrades to the default", async () => {
+    const s = scope("channel", "badvalue");
+    await db.query(`insert into settings (scope, key, value) values ($1, $2, $3)`, [
+      s,
+      "context.hardFraction",
+      jsonbParam("abc"),
+    ]);
+    const warnings: string[] = [];
+    const lenient = new SettingsStore(db, { onWarning: (m) => warnings.push(m) });
+
+    const snapshot = await lenient.load({ scopes: [s] });
+    expect(snapshot.context.hardFraction).toBe(DEFAULT_SETTINGS.context.hardFraction);
+    expect(warnings.some((m) => /context\.hardFraction/.test(m))).toBe(true);
+
+    // Writing the key properly is the repair, and it is accepted.
+    await lenient.set(s, "context.hardFraction", 0.95);
+    expect((await lenient.load({ scopes: [s] })).context.hardFraction).toBe(0.95);
+  });
+
+  it("set(validateScopes) catches an inversion that spans two scopes", async () => {
+    // Each write is valid in its own scope; together they invert the ladder
+    // for every run that loads both. Only the cross-scope check sees it.
+    const ch = scope("channel", "cross");
+    const ag = scope("agent", "cross");
+    // Valid in the agent's own view: the default advisory is 0.7.
+    await store.set(ag, "context.hardFraction", 0.75);
+
+    await expect(
+      store.set(ch, "context.advisoryFraction", 0.8, { validateScopes: [ch, ag] }),
+    ).rejects.toThrow(/less than context\.hardFraction/);
+    expect(await rowsIn(ch)).toEqual([]);
+
+    // Without the run's scopes the very same write is accepted — that IS the
+    // hole: the channel's own view still has the default hardFraction 0.9.
+    await store.set(ch, "context.advisoryFraction", 0.8);
+    expect((await rowsIn(ch)).map((r) => r.key)).toEqual(["context.advisoryFraction"]);
+
+    // What a run then gets: not a crash (load() repairs), but not the operator's
+    // intent either — the advisory they wrote is gone. Refusing the write is
+    // the only place that outcome can actually be prevented.
+    const warnings: string[] = [];
+    const lenient = new SettingsStore(db, { onWarning: (m) => warnings.push(m) });
+    const run = await lenient.load({ scopes: [ch, ag] });
+    expect(run.context.hardFraction).toBe(0.75);
+    expect(run.context.advisoryFraction).toBe(DEFAULT_SETTINGS.context.advisoryFraction);
+    expect(warnings.some((m) => m.includes("context.advisoryFraction"))).toBe(true);
   });
 
   it("DEFECT: a second set in a scope that already holds an object row succeeds", async () => {

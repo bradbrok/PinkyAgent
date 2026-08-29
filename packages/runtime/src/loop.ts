@@ -4,8 +4,9 @@
  * cycle) and §4.5 (cut-point safety / cache alignment).
  */
 import { EventStore, buildContext, estimateTokens } from "@pinky/core";
-import type { ThreadEventData } from "@pinky/core";
+import type { ThreadEvent, ThreadEventData } from "@pinky/core";
 import { SHED_CONTEXT_TOOL_NAME } from "./continuity";
+import { autoRecall, recallQueryFor } from "./memory-recall";
 import type {
   AgentLoopOptions,
   AgentRunResult,
@@ -74,15 +75,27 @@ export async function runAgentLoop(opts: RunAgentLoopOptions): Promise<AgentRunR
   const allSpecs = toolSpecs(opts.tools);
   const shedTool = opts.tools.find((t) => t.name === SHED_CONTEXT_TOOL_NAME);
 
-  const emit = (data: ThreadEventData): Promise<void> =>
-    eventStore.append(opts.thread, data).then(() => undefined);
+  /**
+   * The one append path. `opts.onEvent` observes what landed (the headless
+   * JSONL mode streams it to stdout); it is fire-and-forget by contract, so a
+   * throwing observer can never take down a run that is already journaled.
+   */
+  const emit = async (data: ThreadEventData): Promise<void> => {
+    const event = await eventStore.append(opts.thread, data);
+    if (!opts.onEvent) return;
+    try {
+      opts.onEvent(event);
+    } catch {
+      // Observer errors are the observer's problem.
+    }
+  };
 
   /**
    * Prompt = projection of the log from the latest continuity boundary
    * (DESIGN.md §3). Never a fixed forward page: that would pin a long thread
    * to its first N events forever.
    */
-  const loadContext = async (): Promise<LlmMessage[]> => {
+  const loadContext = async (): Promise<{ messages: LlmMessage[]; events: ThreadEvent[] }> => {
     const window = await eventStore.contextEvents(opts.thread);
     if (window.truncated) {
       // The cap keeps the NEWEST events; say so in the log rather than
@@ -94,10 +107,39 @@ export async function runAgentLoop(opts: RunAgentLoopOptions): Promise<AgentRunR
         count: 1,
       });
     }
-    return buildContext(window.events);
+    return { messages: buildContext(window.events), events: window.events };
   };
 
-  let messages: LlmMessage[] = await loadContext();
+  /**
+   * The projection plus the budgeted `<memories>` block (DESIGN.md §5.4:
+   * "token-capped <memories> block at context start and after each restart").
+   *
+   * The block goes in at index 0 as a `user` message — it IS the context
+   * start — and the system prompt is left alone, because that string is the
+   * cached prefix (§4.5/§9). Recall failures are non-fatal by construction
+   * (autoRecall journals them and returns null), and with no memory context
+   * or `autoRecall` off this is exactly the old loadContext().
+   */
+  const loadContextWithMemories = async (): Promise<LlmMessage[]> => {
+    const { messages, events } = await loadContext();
+    const memory = opts.memory;
+    const cfg = opts.settings.memory;
+    // Optional-chained on purpose: a snapshot predating the memory settings
+    // (older fixtures, a stale row) must degrade to "no recall", not throw.
+    if (!memory || !cfg?.autoRecall) return messages;
+    const block = await autoRecall({
+      memory,
+      query: recallQueryFor(messages, events),
+      limit: cfg.recallLimit,
+      tokenBudget: cfg.recallTokenBudget,
+      emit,
+      ...(opts.signal ? { signal: opts.signal } : {}),
+    });
+    if (block) messages.unshift({ role: "user", text: block });
+    return messages;
+  };
+
+  let messages: LlmMessage[] = await loadContextWithMemories();
 
   let turns = 0;
   /** Advisory fires once per crossing; a shed re-arms it. */
@@ -201,7 +243,11 @@ export async function runAgentLoop(opts: RunAgentLoopOptions): Promise<AgentRunR
           emit,
           agentId: opts.agentId,
           contextTokens: tokens,
+          // Read-only view of the run's config. `settings_set` writes through
+          // the store, never through this object (DESIGN.md P8, revised).
+          settings: opts.settings,
           ...(opts.messenger ? { messenger: opts.messenger } : {}),
+          ...(opts.memory ? { memory: opts.memory } : {}),
           ...(opts.signal ? { signal: opts.signal } : {}),
         };
         try {
@@ -230,8 +276,9 @@ export async function runAgentLoop(opts: RunAgentLoopOptions): Promise<AgentRunR
       // Restart cycle (DESIGN.md §4.3): the continuity event is the new
       // boundary, so rebuild from a fresh projection and keep working in the
       // same run. The orphan tool_result for this very call is dropped by
-      // buildContext.
-      messages = await loadContext();
+      // buildContext, and the fresh window gets its own recall pass (§5.4)
+      // seeded by the document's memoryHints.
+      messages = await loadContextWithMemories();
       advisoryArmed = true;
       forcedShedFailures = 0;
       // No turns left to resume into: report the restart, not a turn overrun.

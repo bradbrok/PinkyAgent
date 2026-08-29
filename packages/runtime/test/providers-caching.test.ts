@@ -5,7 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import { AnthropicProvider, buildSystemBlocks, type AnthropicUsage } from "../src/providers/anthropic";
 import { OpenAIProvider } from "../src/providers/openai";
-import { createProvider, transportOptionsFromEnv } from "../src/providers/index";
+import { createProvider, SUPPORTED_PROVIDERS, transportOptionsFromEnv } from "../src/providers/index";
 import { sseStreamFromText } from "../src/providers/sse";
 import type { CompleteOptions } from "../src/types";
 
@@ -214,5 +214,47 @@ describe("createProvider transport env", () => {
     expect(createProvider("anthropic/claude-opus-5", env).name).toBe("anthropic");
     expect(createProvider("openai/gpt-4o", env).name).toBe("openai");
     expect(createProvider("openrouter/moonshotai/kimi-k2", env).name).toBe("openai");
+  });
+});
+
+// The `fake/*` route is what makes a keyless end-to-end run possible (headless
+// JSONL e2e, smoke): no API key is consulted and no request is ever made.
+describe("createProvider fake route", () => {
+  const NO_ENV: Record<string, string | undefined> = {};
+
+  test("fake/echo echoes the last user message with no key configured", async () => {
+    const provider = createProvider("fake/echo", NO_ENV);
+    expect(provider.name).toBe("fake");
+    const turn = await provider.complete({
+      ...OPTS,
+      messages: [
+        { role: "user", text: "[harness notice] Recalled memories …" },
+        { role: "assistant", text: "ok" },
+        { role: "user", text: "[jsonl local]: hello there" },
+      ],
+    });
+    expect(turn.text).toBe("echo: [jsonl local]: hello there");
+    expect(turn.toolCalls).toEqual([]);
+    expect(turn.stopReason).toBe("stop");
+  });
+
+  test("fake/retain-recall scripts retain -> recall -> text", async () => {
+    const provider = createProvider("fake/retain-recall", NO_ENV);
+    const first = await provider.complete(OPTS);
+    expect(first.toolCalls.map((c) => c.name)).toEqual(["retain"]);
+    expect(String((first.toolCalls[0]!.args as { text: string }).text)).toContain("zebra-quartz");
+    const second = await provider.complete(OPTS);
+    expect(second.toolCalls.map((c) => c.name)).toEqual(["recall"]);
+    const third = await provider.complete(OPTS);
+    expect(third.toolCalls).toEqual([]);
+    expect(third.stopReason).toBe("stop");
+  });
+
+  test("an unknown fake behavior names the supported ones", () => {
+    expect(() => createProvider("fake/nope", NO_ENV)).toThrow(/Supported: echo, retain-recall/);
+  });
+
+  test("fake is listed as a supported provider", () => {
+    expect(SUPPORTED_PROVIDERS).toContain("fake");
   });
 });

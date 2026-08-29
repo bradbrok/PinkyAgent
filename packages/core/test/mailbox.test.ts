@@ -170,6 +170,85 @@ describe("Mailbox.claimDelivery", () => {
   });
 });
 
+describe("Mailbox.claimRead", () => {
+  const CLAIM = /update a2a_messages set read_at = now\(\)[\s\S]*returning id/;
+
+  it("claims an unread row in THIS node's partition", async () => {
+    const db = new FakeDb([{ pattern: CLAIM, respond: () => [{ id: "msg-1" }] }]);
+    const mbox = new Mailbox(db, { nodeId: "node2" });
+    expect(await mbox.claimRead("msg-1")).toBe(true);
+    // The receipt is node-scoped and only claimable while unread — the same
+    // shape as claimDelivery, on the column that means "an agent consumed it".
+    expect(db.calls[0]!.sql).toContain("node_to = $2");
+    expect(db.calls[0]!.sql).toContain("read_at is null");
+    expect(db.calls[0]!.sql).toContain("returning id");
+    expect(db.calls[0]!.params).toEqual(["msg-1", "node2"]);
+  });
+
+  it("returns false when nothing was claimed (already consumed, or another node's)", async () => {
+    const db = new FakeDb([{ pattern: CLAIM, respond: () => [] }]);
+    const mbox = new Mailbox(db, { nodeId: "node2" });
+    expect(await mbox.claimRead("msg-1")).toBe(false);
+  });
+
+  it("runs on the caller's handle when given one, so the receipt joins their tx", async () => {
+    const own = new FakeDb([{ pattern: CLAIM, respond: () => [] }]);
+    const tx = new FakeDb([{ pattern: CLAIM, respond: () => [{ id: "msg-1" }] }]);
+    const mbox = new Mailbox(own, { nodeId: "node2" });
+    expect(await mbox.claimRead("msg-1", tx)).toBe(true);
+    // The whole point: the statement went to the consumer's transaction, so it
+    // commits (or rolls back) with the work it is a receipt for.
+    expect(tx.calls).toHaveLength(1);
+    expect(own.calls).toHaveLength(0);
+  });
+});
+
+describe("Mailbox.unconsumedFor", () => {
+  const row = {
+    id: "msg-1",
+    from_agent: "weather",
+    to_agent: "planner",
+    node_from: "node2",
+    node_to: "node2",
+    kind: "message" as const,
+    text: "hi",
+    thread_hint: null,
+    // Delivered — and still unconsumed. This is exactly the row a crash
+    // between the delivery claim and the agent's turn leaves behind.
+    delivered_at: "2026-08-28T10:01:00Z",
+    read_at: null,
+    created_at: "2026-08-28T10:00:00Z",
+  };
+
+  it("selects unread rows regardless of delivered_at, oldest first", async () => {
+    const db = new FakeDb([{ pattern: /select .* from a2a_messages/i, respond: () => [row] }]);
+    const mbox = new Mailbox(db, { nodeId: "node2" });
+    const out = await mbox.unconsumedFor("planner");
+    expect(out).toHaveLength(1);
+    expect(out[0]!.from).toBe("weather@node2");
+    const sql = db.calls[0]!.sql;
+    expect(sql).toContain("read_at is null");
+    // The bug this exists for: filtering on delivered_at here would skip the
+    // orphans, because they ARE delivered. (It is still SELECTed, just never
+    // a predicate.)
+    expect(sql).not.toMatch(/delivered_at is (not )?null/);
+    expect(sql).toContain("order by created_at asc");
+    expect(sql).toContain("to_agent in ($1, 'broadcast')");
+    expect(sql).toContain("node_to = $2");
+    expect(db.calls[0]!.params).toEqual(["planner", "node2", 100]);
+  });
+
+  it("takes an explicit limit and never marks anything", async () => {
+    const db = new FakeDb([{ pattern: /select .* from a2a_messages/i, respond: () => [] }]);
+    const mbox = new Mailbox(db, { nodeId: "node2" });
+    await mbox.unconsumedFor("planner", { limit: 5 });
+    expect(db.calls[0]!.params).toEqual(["planner", "node2", 5]);
+    // Reading the backlog is not consuming it: only the consumer's own
+    // transaction may stamp a receipt.
+    expect(db.calls.some((c) => /update/i.test(c.sql))).toBe(false);
+  });
+});
+
 describe("Mailbox.deliverLocal", () => {
   it("returns undelivered rows for the agent and marks delivered_at", async () => {
     const rows = [

@@ -189,6 +189,56 @@ export class Mailbox {
   }
 
   /**
+   * Consumption RECEIPT (issue #4). Stamps read_at for one row in THIS node's
+   * partition and returns true only for the caller that actually stamped it.
+   *
+   * The two markers answer different questions and only one of them is
+   * evidence of work:
+   *   - `delivered_at` = this NODE accepted the message. Relay bookkeeping,
+   *     and the idempotency hinge for {@link Mailbox.claimDelivery}. A process
+   *     that dies between the claim and the agent's turn leaves a row that is
+   *     "delivered" forever and was never acted on.
+   *   - `read_at` = an AGENT consumed it. That is the receipt, and it is the
+   *     only marker a recovery sweep may trust.
+   *
+   * `db` exists so the receipt can be stamped INSIDE the consumer's own
+   * transaction, alongside the events that consuming it produced: either both
+   * commit or neither does, and a rolled-back turn is redelivered instead of
+   * being silently lost. Called without it, the receipt commits on its own —
+   * fine for a reader like {@link Mailbox.inbox} that has no other writes.
+   */
+  async claimRead(id: string, db: Db = this.db): Promise<boolean> {
+    const rows = await db.query<{ id: string }>(
+      `update a2a_messages set read_at = now()
+       where id = $1 and node_to = $2 and read_at is null
+       returning id`,
+      [id, this.nodeId],
+    );
+    return rows.length > 0;
+  }
+
+  /**
+   * Everything addressed to `agentId` (or `broadcast`) in this node's
+   * partition that carries NO receipt yet, oldest first — deliberately
+   * REGARDLESS of delivered_at.
+   *
+   * These are the rows a crash may have orphaned: delivered (so nothing will
+   * re-deliver them) but never consumed. Re-firing them is safe precisely
+   * because the consumer claims the receipt transactionally, so a duplicate
+   * fire is a no-op at the consumer rather than a duplicate turn.
+   */
+  async unconsumedFor(agentId: string, opts?: { limit?: number }): Promise<A2AEnvelope[]> {
+    const limit = opts?.limit ?? 100;
+    const rows = await this.db.query<A2aRow>(
+      `select ${SELECT_COLS} from a2a_messages
+       where to_agent in ($1, 'broadcast') and node_to = $2 and read_at is null
+       order by created_at asc limit $3`,
+      [agentId, this.nodeId, limit],
+    );
+    return rows.map(toEnvelope);
+  }
+
+  /**
    * Recovery sweep: all undelivered rows for `agentId` in this node's
    * partition; marks delivered_at. The happy path marks a single row via
    * markDelivered(); this drains anything a crash left behind.
@@ -213,7 +263,12 @@ export class Mailbox {
     });
   }
 
-  /** Delivered-but-unread messages for `agentId` on this node; marks read_at. */
+  /**
+   * Delivered-but-unread messages for `agentId` on this node; marks read_at —
+   * the same receipt {@link Mailbox.claimRead} stamps, so a message the
+   * `a2a_inbox` tool polled is not re-fired by a later recovery sweep, and one
+   * a woken run consumed does not show up in the tool either.
+   */
   async inbox(agentId: string, opts?: { limit?: number }): Promise<A2AEnvelope[]> {
     const limit = opts?.limit ?? 50;
     return await this.db.tx(async (tx) => {

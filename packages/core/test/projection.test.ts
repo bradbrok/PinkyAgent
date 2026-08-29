@@ -138,6 +138,40 @@ describe("buildContext", () => {
     expect(msgs.map((m) => m.role)).toEqual(["user"]);
   });
 
+  // DESIGN.md §7 wake-on-message: a peer's message is the whole reason a run
+  // was woken (issue #4), so it has to be IN the prompt. It is the only record
+  // the run has — the mailbox row is not part of the projection.
+  it("renders an a2a event as a user turn", () => {
+    nextSeq = 0;
+    const msgs = buildContext([
+      ev({
+        type: "a2a",
+        from: "weather@node2",
+        to: "pinky@local",
+        kind: "request",
+        text: "what is the forecast?",
+        msgId: "m-1",
+      }),
+    ]);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]!.role).toBe("user");
+    // The address is spelled out so the model can answer the right peer.
+    expect(msgs[0]!.text).toBe("[a2a request from weather@node2]: what is the forecast?");
+  });
+
+  it("interleaves a2a arrivals with ingress and drops them before a boundary", () => {
+    nextSeq = 0;
+    const msgs = buildContext([
+      ev({ type: "a2a", from: "old@n", to: "pinky@local", kind: "message", text: "ancient", msgId: "m-0" }),
+      continuity(),
+      ev({ type: "a2a", from: "weather@n", to: "pinky@local", kind: "response", text: "sunny", msgId: "m-1" }),
+      assistant("thanks"),
+    ]);
+    expect(msgs.map((m) => m.role)).toEqual(["user", "user", "assistant"]);
+    expect(msgs[1]!.text).toBe("[a2a response from weather@n]: sunny");
+    expect(msgs.some((m) => m.text.includes("ancient"))).toBe(false);
+  });
+
   it("skips audit-only event types", () => {
     nextSeq = 0;
     const msgs = buildContext([
@@ -185,6 +219,30 @@ describe("buildContext", () => {
     ]);
     expect(msgs).toHaveLength(1);
     expect(msgs[0]!.text).toBe("[cli u1]: what do you know about me?");
+  });
+
+  // DESIGN.md §13 (cost model): the restart accounting sits in the log right
+  // after the boundary it measures, which is inside every window built from
+  // that boundary. Rendering it would put the harness's own bookkeeping in
+  // front of the model on every turn of the successor — and re-injecting the
+  // token counts a restart was meant to shed.
+  it("skips restart events (audit-only, DESIGN.md §13)", () => {
+    nextSeq = 0;
+    const msgs = buildContext([
+      continuity(1),
+      ev({
+        type: "restart",
+        boundarySeq: 1,
+        tokensBefore: 120_000,
+        tokensAfter: 3_400,
+        recallTokens: 800,
+        messages: 2,
+      }),
+      ingress("keep going"),
+    ]);
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0]!.text.startsWith("# Pinky Continuity")).toBe(true);
+    expect(msgs[1]!.text).toBe("[cli u1]: keep going");
   });
 });
 

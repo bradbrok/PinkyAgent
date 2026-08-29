@@ -10,7 +10,13 @@
 import { describe, expect, test } from "bun:test";
 import type { ThreadEvent, ThreadEventData, ThreadRef } from "@pinky/core";
 import type { AgentRunResult } from "@pinky/runtime";
-import { parseCommand, runHeadless, type HeadlessRunHooks } from "../src/headless";
+import {
+  parseCommand,
+  runHeadless,
+  type HeadlessOpts,
+  type HeadlessRunHooks,
+  type WakeEnqueue,
+} from "../src/headless";
 import type { EventSink, RawIngress } from "../src/server";
 
 // ---------------------------------------------------------------------------
@@ -117,6 +123,7 @@ function session(opts: {
     hooks: HeadlessRunHooks,
   ) => Promise<AgentRunResult>;
   events?: FakeEvents;
+  wakes?: HeadlessOpts["wakes"];
 }): Session {
   const out: string[] = [];
   const events = opts.events ?? new FakeEvents();
@@ -127,6 +134,7 @@ function session(opts: {
     defaultModel: "fake/test-model",
     events,
     runAgent: opts.runAgent,
+    ...(opts.wakes ? { wakes: opts.wakes } : {}),
     stdin: opts.stdin,
     write: (line) => {
       out.push(line);
@@ -879,5 +887,227 @@ describe("runHeadless", () => {
     expect(String(error.message)).toContain("provider on fire");
     // Human detail goes to the log sink (stderr), never to the protocol stream.
     expect(logged.join("\n")).toContain("provider on fire");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wake sources (DESIGN.md §8.1; issue #4)
+// ---------------------------------------------------------------------------
+
+describe("runHeadless wake sources", () => {
+  const wakeThread: ThreadRef = { tenantId: "t1", channelId: "a2a:weather@node2", threadId: "main" };
+  const wakeBatch: RawIngress[] = [
+    { text: "the forecast is sunny", author: { platform: "a2a", userId: "weather@node2" }, externalId: "m-1" },
+  ];
+
+  test("a wake produces the same run lines as a prompt, tagged with its cause", async () => {
+    const s = session({
+      stdin: scriptedStdin([`${JSON.stringify({ type: "exit" })}\n`]),
+      runAgent: chattyRun,
+      // Enqueued during subscribe, i.e. before the first stdin line is read:
+      // startup recovery must not lose a race with an immediate exit.
+      wakes: (enqueue) => {
+        enqueue(wakeThread, wakeBatch, "a2a");
+        return () => {};
+      },
+    });
+    await s.done;
+
+    // Identical to a prompt's shape (chattyRun streams two events and a reply).
+    expect(s.types()).toEqual([
+      "ready",
+      "run_started",
+      "event",
+      "reply",
+      "event",
+      "run_finished",
+      "exiting",
+    ]);
+    const started = s.lines()[1]!;
+    expect(started).toMatchObject({
+      channelId: "a2a:weather@node2",
+      threadId: "main",
+      cause: "a2a",
+    });
+    expect("replay" in started).toBe(false);
+    // The source journals its own arrival; the session must not re-ingest it.
+    expect(s.events.calls).toHaveLength(0);
+  });
+
+  test("a wake with no cause reports the default one; a prompt reports none", async () => {
+    const s = session({
+      stdin: scriptedStdin([prompt({ text: "hello", id: "p1" }), `${JSON.stringify({ type: "exit" })}\n`]),
+      runAgent: chattyRun,
+      wakes: (enqueue) => {
+        enqueue(wakeThread, wakeBatch);
+        return () => {};
+      },
+    });
+    await s.done;
+
+    const starts = s.lines().filter((l) => l.type === "run_started");
+    expect(starts).toHaveLength(2);
+    expect(starts.find((l) => l.channelId === "a2a:weather@node2")!.cause).toBe("wake");
+    expect("cause" in starts.find((l) => l.channelId === "jsonl:local")!).toBe(false);
+  });
+
+  test("the wake's thread and batch reach runAgent untouched", async () => {
+    const seen: { thread: ThreadRef; batch: RawIngress[] }[] = [];
+    const s = session({
+      stdin: scriptedStdin([`${JSON.stringify({ type: "exit" })}\n`]),
+      runAgent: (thread, batch, hooks) => {
+        seen.push({ thread, batch });
+        return chattyRun(thread, batch, hooks);
+      },
+      wakes: (enqueue) => {
+        enqueue(wakeThread, wakeBatch, "a2a");
+        return () => {};
+      },
+    });
+    await s.done;
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]!.thread).toEqual(wakeThread);
+    expect(seen[0]!.batch).toEqual(wakeBatch);
+  });
+
+  test("a wake on a busy thread waits its turn on that lane", async () => {
+    const runner = new ManualRunner();
+    let wake: WakeEnqueue | undefined;
+    const s = session({
+      stdin: scriptedStdin([
+        prompt({ text: "first", id: "p1" }),
+        () => waitFor(() => runner.calls.length === 1, "the prompt run"),
+        // Same (channel, thread) as the prompt: it must not start a second
+        // concurrent run on the conversation.
+        () => {
+          wake!({ tenantId: "t1", channelId: "jsonl:local", threadId: "main" }, wakeBatch, "a2a");
+        },
+        () => Bun.sleep(5),
+        () => {
+          expect(runner.calls).toHaveLength(1);
+          runner.calls[0]!.finish({ turns: 1, stopReason: "completed" });
+        },
+        () => waitFor(() => runner.calls.length === 2, "the wake run"),
+        () => {
+          runner.calls[1]!.finish({ turns: 1, stopReason: "completed" });
+        },
+        `${JSON.stringify({ type: "exit" })}\n`,
+      ]),
+      runAgent: runner.run,
+      wakes: (enqueue) => {
+        wake = enqueue;
+        return () => {};
+      },
+    });
+    await s.done;
+
+    expect(s.types()).toEqual([
+      "ready",
+      "run_started",
+      "run_finished",
+      "run_started",
+      "run_finished",
+      "exiting",
+    ]);
+    expect(s.lines()[3]!.cause).toBe("a2a");
+  });
+
+  test("the unsubscribe returned by the source runs on exit", async () => {
+    let stopped = 0;
+    const s = session({
+      stdin: scriptedStdin([`${JSON.stringify({ type: "exit" })}\n`]),
+      runAgent: chattyRun,
+      wakes: () => () => {
+        stopped++;
+      },
+    });
+    await s.done;
+    expect(stopped).toBe(1);
+  });
+
+  test("a wake enqueued after the session stopped is dropped, not queued", async () => {
+    let wake: WakeEnqueue | undefined;
+    const runs: ThreadRef[] = [];
+    const s = session({
+      stdin: scriptedStdin([`${JSON.stringify({ type: "exit" })}\n`]),
+      runAgent: (thread, batch, hooks) => {
+        runs.push(thread);
+        return chattyRun(thread, batch, hooks);
+      },
+      wakes: (enqueue) => {
+        wake = enqueue;
+        return () => {};
+      },
+    });
+    await s.done;
+    const after = s.out.length;
+
+    // A source that fires one last time after `exiting` must not append lines
+    // to a finished session — `exiting` has to be the last line.
+    wake!(wakeThread, wakeBatch, "a2a");
+    await Bun.sleep(5);
+    expect(s.out).toHaveLength(after);
+    expect(runs).toHaveLength(0);
+    expect(s.types().at(-1)).toBe("exiting");
+  });
+
+  test("an async source finishes its startup recovery before stdin is read", async () => {
+    const order: string[] = [];
+    const s = session({
+      stdin: scriptedStdin([prompt({ text: "hello", id: "p1" }), `${JSON.stringify({ type: "exit" })}\n`]),
+      runAgent: (thread, batch, hooks) => {
+        order.push(thread.channelId);
+        return chattyRun(thread, batch, hooks);
+      },
+      wakes: async (enqueue) => {
+        await Bun.sleep(5); // a mailbox drain, say
+        enqueue(wakeThread, wakeBatch, "a2a");
+        return () => {};
+      },
+    });
+    await s.done;
+
+    // The recovered wake was queued first, so it is answered first: a client
+    // that pipes in a prompt and closes stdin cannot outrun the recovery.
+    expect(order).toEqual(["a2a:weather@node2", "jsonl:local"]);
+  });
+
+  test("a source that fails to start is reported once and stdin still works", async () => {
+    const logged: string[] = [];
+    const out: string[] = [];
+    const done = runHeadless({
+      tenantId: "t1",
+      agentId: "pinky",
+      nodeId: "local",
+      defaultModel: "fake/test-model",
+      events: new FakeEvents(),
+      runAgent: chattyRun,
+      wakes: () => Promise.reject(new Error("mailbox unreachable")),
+      stdin: scriptedStdin([prompt({ text: "still alive?", id: "p1" })]),
+      write: (line) => {
+        out.push(line);
+      },
+      log: (msg) => {
+        logged.push(msg);
+      },
+    });
+    await done;
+
+    const types = out.map((l) => (JSON.parse(l) as { type: string }).type);
+    expect(types).toEqual([
+      "ready",
+      "error",
+      "run_started",
+      "event",
+      "reply",
+      "event",
+      "run_finished",
+      "exiting",
+    ]);
+    expect(String((JSON.parse(out[1]!) as Record<string, unknown>).message)).toContain(
+      "mailbox unreachable",
+    );
+    expect(logged.join("\n")).toContain("mailbox unreachable");
   });
 });

@@ -146,6 +146,24 @@ export class EventStore {
     return out;
   }
 
+  /**
+   * Append inside a transaction the CALLER owns, under the same per-thread
+   * lock as every other append.
+   *
+   * For work that must commit with something else — the A2A consumption
+   * receipt (issue #4) is the case this exists for: stamp `read_at` and
+   * journal the `a2a` event in ONE transaction, so a message is marked
+   * consumed if and only if the event that proves it exists. `ingest()` does
+   * the same trick for the platform dedup id; this is the open version for
+   * callers whose other write is not a dedup row.
+   *
+   * The tx MUST really be a transaction (`db.tx(...)`): outside one the thread
+   * lock is released at once and concurrent appends can collide on seq.
+   */
+  static appendTx(tx: Db, ref: ThreadRef, data: ThreadEventData[]): Promise<ThreadEvent[]> {
+    return EventStore.appendLockedTx(tx, ref, data, "appendTx");
+  }
+
   async append(ref: ThreadRef, data: ThreadEventData): Promise<ThreadEvent> {
     const [event] = await this.db.tx((tx) =>
       EventStore.appendLockedTx(tx, ref, [data], "append"),

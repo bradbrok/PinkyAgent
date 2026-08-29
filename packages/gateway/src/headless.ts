@@ -26,6 +26,14 @@
  * one thread is answered one run at a time, in arrival order, while other
  * threads proceed in parallel.
  *
+ * stdin is not the only wake source (DESIGN.md §8.1: ingress, timer, peer
+ * message and human answer are all the same shape). `opts.wakes` is the seam
+ * for the others: it is handed the very same enqueue, so a wake is serialized
+ * on its thread's lane like a prompt and reports the same run lines — with a
+ * `cause` on `run_started` saying what woke it. Whatever it enqueues must
+ * already be journaled, because a run projects the log, and its idempotency
+ * belongs to the source (for A2A: the consumption receipt, issue #4).
+ *
  * RUN ACCOUNTING: every enqueued prompt produces exactly one
  * `run_started` … (`run_finished` | `error` with `"run":"failed"`) pair, so a
  * client can balance them. A run that is cancelled before it ever reaches the
@@ -76,6 +84,24 @@ export type HeadlessCommand =
 // Session options
 // ---------------------------------------------------------------------------
 
+/**
+ * How a wake source hands work to the session (DESIGN.md §8.1: every wake
+ * source is the same shape — ingress, timer, peer message, human answer).
+ *
+ * The batch MUST already be journaled by the caller, exactly as `prompt` is
+ * journaled by `EventSink.ingest` before it enqueues: the run projects the
+ * event log, not this array, which it uses only to know who is speaking. The
+ * caller is also responsible for the idempotency of that write — the session
+ * queues whatever it is handed.
+ *
+ * `cause` is reported on `run_started` (default `"wake"`), so a client can
+ * tell a run it asked for from one the agent was woken for.
+ */
+export type WakeEnqueue = (thread: ThreadRef, batch: RawIngress[], cause?: string) => void;
+
+/** Cause reported for a wake whose source named none. */
+const DEFAULT_WAKE_CAUSE = "wake";
+
 /** Per-run callbacks the session hands the caller's runAgent. */
 export interface HeadlessRunHooks {
   /** Fires when `abort` (or `exit --abort`, or `opts.signal`) targets this run. */
@@ -107,6 +133,21 @@ export interface HeadlessOpts {
     batch: RawIngress[],
     hooks: HeadlessRunHooks,
   ) => Promise<AgentRunResult>;
+  /**
+   * Wake sources other than stdin (DESIGN.md §8.1). Called ONCE, after
+   * `ready` and BEFORE the first stdin line is read, with the session's
+   * enqueue; the function it returns is called on the way out, so a source can
+   * unsubscribe. Everything it enqueues goes through the same per-lane
+   * serialization and emits the same `run_started → (event|reply)* →
+   * run_finished` lines as a prompt.
+   *
+   * It may be async, and it is awaited: that is what lets a source finish its
+   * STARTUP RECOVERY — draining whatever the last process left unconsumed —
+   * before the session accepts input, so a recovered wake cannot lose a race
+   * with an immediate `exit`. A source that never resolves stalls the session,
+   * so keep it to the work that must precede the first command.
+   */
+  wakes?: (enqueue: WakeEnqueue) => (() => void) | Promise<() => void>;
   stdin: AsyncIterable<string | Uint8Array>;
   /** The ONLY stdout path. Called with a complete line, newline included. */
   write: (line: string) => void;
@@ -360,10 +401,13 @@ interface Lane {
 /** One queued unit of work, with the lane epoch it was queued in. */
 interface QueuedRun {
   thread: ThreadRef;
-  ingress: RawIngress;
+  /** Already journaled by whoever enqueued it; the run projects the log. */
+  batch: RawIngress[];
   epoch: number;
   /** The ingress was already in the log (a duplicate id nothing ever ran). */
   replay: boolean;
+  /** What woke this run; absent for a client `prompt`. */
+  cause?: string;
 }
 
 const laneKey = (channelId: string, threadId: string): string => `${channelId} ${threadId}`;
@@ -431,7 +475,12 @@ export async function runHeadless(opts: HeadlessOpts): Promise<void> {
     const { channelId, threadId } = run.thread;
     const at = { threadId, channelId };
     try {
-      emit({ type: "run_started", ...at, ...(run.replay ? { replay: true } : {}) });
+      emit({
+        type: "run_started",
+        ...at,
+        ...(run.cause === undefined ? {} : { cause: run.cause }),
+        ...(run.replay ? { replay: true } : {}),
+      });
 
       if (sessionAbort.signal.aborted || run.epoch < lane.epoch) {
         // Cancelled while parked on the chain. It gets the closing half of its
@@ -445,7 +494,7 @@ export async function runHeadless(opts: HeadlessOpts): Promise<void> {
       const link = forwardAbort(sessionAbort.signal, controller);
       lane.inFlight = controller;
       try {
-        const result = await opts.runAgent(run.thread, [run.ingress], {
+        const result = await opts.runAgent(run.thread, run.batch, {
           signal: controller.signal,
           onEvent: (event) => emit({ type: "event", ...at, event }),
           deliver: async (text) => {
@@ -476,7 +525,16 @@ export async function runHeadless(opts: HeadlessOpts): Promise<void> {
     }
   };
 
-  const enqueue = (thread: ThreadRef, ingress: RawIngress, replay = false): void => {
+  /**
+   * Queue one already-journaled batch on its lane. The single entry point for
+   * every wake source: a client `prompt`, a replay, and whatever `opts.wakes`
+   * feeds in all land here and are serialized per (channel, thread) alike.
+   */
+  const enqueue = (
+    thread: ThreadRef,
+    batch: RawIngress[],
+    how: { replay?: boolean; cause?: string } = {},
+  ): void => {
     const key = laneKey(thread.channelId, thread.threadId);
     let lane = lanes.get(key);
     if (!lane) {
@@ -491,7 +549,13 @@ export async function runHeadless(opts: HeadlessOpts): Promise<void> {
     }
     const current = lane;
     current.queued++;
-    const run: QueuedRun = { thread, ingress, epoch: current.epoch, replay };
+    const run: QueuedRun = {
+      thread,
+      batch,
+      epoch: current.epoch,
+      replay: how.replay === true,
+      ...(how.cause === undefined ? {} : { cause: how.cause }),
+    };
     const step = async (): Promise<void> => {
       try {
         await runOne(current, run);
@@ -575,12 +639,37 @@ export async function runHeadless(opts: HeadlessOpts): Promise<void> {
       // (a process that died between ingest and run), and refusing forever
       // would make that unrecoverable, so it runs — flagged `replay` so the
       // client knows this run answers a prompt it already sent.
-      enqueue(thread, { text: cmd.text, author: cmd.author, externalId }, true);
+      enqueue(thread, [{ text: cmd.text, author: cmd.author, externalId }], { replay: true });
       return;
     }
 
-    enqueue(thread, { text: cmd.text, author: cmd.author, externalId });
+    enqueue(thread, [{ text: cmd.text, author: cmd.author, externalId }]);
   };
+
+  /**
+   * The wake sources' handle on the session. Runs enqueued after the session
+   * has stopped accepting work are dropped rather than queued onto a chain
+   * nothing will ever await: `exiting` has to mean the session is finished.
+   */
+  let acceptingWakes = true;
+  const wakeEnqueue: WakeEnqueue = (thread, batch, cause) => {
+    if (!acceptingWakes || batch.length === 0) return;
+    enqueue(thread, batch, { cause: cause ?? DEFAULT_WAKE_CAUSE });
+  };
+  let stopWakes: (() => void) | undefined;
+  if (opts.wakes) {
+    try {
+      // Awaited on purpose: a source's startup recovery (a mailbox drain, say)
+      // must be queued before the first command is read, or an immediate
+      // `exit` could drain past it.
+      stopWakes = await opts.wakes(wakeEnqueue);
+    } catch (err) {
+      // A wake source that cannot start is not a reason to refuse the session:
+      // stdin still works, and the client is told once.
+      emit({ type: "error", message: `wake source failed to start: ${errText(err)}` });
+      log(`wake source failed to start: ${errText(err)}`);
+    }
+  }
 
   /** Every lane's chain as it stands now (no new work is accepted by then). */
   const drain = async (): Promise<void> => {
@@ -591,32 +680,44 @@ export async function runHeadless(opts: HeadlessOpts): Promise<void> {
     emit({ type: "error", message: `line exceeds ${MAX_LINE_BYTES} bytes; dropped` });
   };
 
-  for await (const rawLine of toLines(untilAborted(opts.stdin, sessionAbort.signal), onOverflow)) {
-    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
-    if (line.trim().length === 0) continue;
+  try {
+    for await (const rawLine of toLines(untilAborted(opts.stdin, sessionAbort.signal), onOverflow)) {
+      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+      if (line.trim().length === 0) continue;
 
-    const parsed = parseCommand(line);
-    if (!parsed.ok) {
-      emit({ type: "error", message: parsed.error, line: line.slice(0, MAX_ECHOED_LINE) });
-      continue;
-    }
-
-    const cmd = parsed.cmd;
-    if (cmd.type === "exit") {
-      if (cmd.abort) abortAll();
-      break;
-    }
-    if (cmd.type === "abort") {
-      if (abortThread(cmd.threadId) === 0) {
-        emit({
-          type: "error",
-          threadId: cmd.threadId,
-          message: `no run in flight or queued for thread ${JSON.stringify(cmd.threadId)}`,
-        });
+      const parsed = parseCommand(line);
+      if (!parsed.ok) {
+        emit({ type: "error", message: parsed.error, line: line.slice(0, MAX_ECHOED_LINE) });
+        continue;
       }
-      continue;
+
+      const cmd = parsed.cmd;
+      if (cmd.type === "exit") {
+        if (cmd.abort) abortAll();
+        break;
+      }
+      if (cmd.type === "abort") {
+        if (abortThread(cmd.threadId) === 0) {
+          emit({
+            type: "error",
+            threadId: cmd.threadId,
+            message: `no run in flight or queued for thread ${JSON.stringify(cmd.threadId)}`,
+          });
+        }
+        continue;
+      }
+      await handlePrompt(cmd);
     }
-    await handlePrompt(cmd);
+  } finally {
+    // No more wakes once the session is on its way out — including when stdin
+    // itself threw. Unsubscribing BEFORE the drain is what makes `exiting`
+    // honest: nothing can queue a run the drain below will not await.
+    acceptingWakes = false;
+    try {
+      stopWakes?.();
+    } catch (err) {
+      log(`wake source failed to stop: ${errText(err)}`);
+    }
   }
 
   // EOF is an exit: finish what is running (an aborted run still settles, and

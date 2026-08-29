@@ -31,6 +31,43 @@ const DEFAULT_MAX_TURNS = 16;
 const MAX_FORCED_SHED_TURNS = 2;
 
 /**
+ * One rebuilt context window: what the model is about to see, plus the parts
+ * that went into it. The loop carries the pieces rather than recomputing them
+ * so the `restart` event reports the numbers actually used (DESIGN.md §13).
+ */
+interface LoadedContext {
+  messages: LlmMessage[];
+  /** The raw window, boundary event included — it seeds the recall query. */
+  events: ThreadEvent[];
+  /** Seq of the continuity event at the boundary; 0 when the thread has none. */
+  boundarySeq: number;
+  /** The injected `<memories>` block, when auto-recall produced one. */
+  block: string | null;
+}
+
+/** Has this window's boundary already been billed by a `restart` event? */
+function hasRestart(loaded: LoadedContext): boolean {
+  return loaded.events.some(
+    (e) => e.data.type === "restart" && e.data.boundarySeq === loaded.boundarySeq,
+  );
+}
+
+/**
+ * The shedding turn's own estimate, read off the continuity event at this
+ * window's boundary — the `tokensBefore` a `restart` event mirrors.
+ *
+ * Null means "not a window that opens on a restart": either the thread has
+ * never shed, or the safety cap dropped the boundary event itself out of the
+ * window, in which case this wake is not the successor of anything and must
+ * not be billed as one.
+ */
+function boundaryTokensBefore(loaded: LoadedContext): number | null {
+  if (loaded.boundarySeq <= 0) return null;
+  const boundary = loaded.events.find((e) => e.seq === loaded.boundarySeq);
+  return boundary?.data.type === "continuity" ? boundary.data.tokensBefore : null;
+}
+
+/**
  * Harness notices ride in a `user` message, never `role: "system"`: the
  * Anthropic provider hoists mid-conversation system messages into the
  * top-level system param, which churns the cached prefix (DESIGN.md §4.5/§9).
@@ -95,7 +132,7 @@ export async function runAgentLoop(opts: RunAgentLoopOptions): Promise<AgentRunR
    * (DESIGN.md §3). Never a fixed forward page: that would pin a long thread
    * to its first N events forever.
    */
-  const loadContext = async (): Promise<{ messages: LlmMessage[]; events: ThreadEvent[] }> => {
+  const loadContext = async (): Promise<Omit<LoadedContext, "block">> => {
     const window = await eventStore.contextEvents(opts.thread);
     if (window.truncated) {
       // The cap keeps the NEWEST events; say so in the log rather than
@@ -107,7 +144,11 @@ export async function runAgentLoop(opts: RunAgentLoopOptions): Promise<AgentRunR
         count: 1,
       });
     }
-    return { messages: buildContext(window.events), events: window.events };
+    return {
+      messages: buildContext(window.events),
+      events: window.events,
+      boundarySeq: window.boundarySeq,
+    };
   };
 
   /**
@@ -120,13 +161,14 @@ export async function runAgentLoop(opts: RunAgentLoopOptions): Promise<AgentRunR
    * (autoRecall journals them and returns null), and with no memory context
    * or `autoRecall` off this is exactly the old loadContext().
    */
-  const loadContextWithMemories = async (): Promise<LlmMessage[]> => {
-    const { messages, events } = await loadContext();
+  const loadContextWithMemories = async (): Promise<LoadedContext> => {
+    const loaded = await loadContext();
+    const { messages, events } = loaded;
     const memory = opts.memory;
     const cfg = opts.settings.memory;
     // Optional-chained on purpose: a snapshot predating the memory settings
     // (older fixtures, a stale row) must degrade to "no recall", not throw.
-    if (!memory || !cfg?.autoRecall) return messages;
+    if (!memory || !cfg?.autoRecall) return { ...loaded, block: null };
     const block = await autoRecall({
       memory,
       query: recallQueryFor(messages, events),
@@ -136,10 +178,45 @@ export async function runAgentLoop(opts: RunAgentLoopOptions): Promise<AgentRunR
       ...(opts.signal ? { signal: opts.signal } : {}),
     });
     if (block) messages.unshift({ role: "user", text: block });
-    return messages;
+    return { ...loaded, block };
   };
 
-  let messages: LlmMessage[] = await loadContextWithMemories();
+  /**
+   * Journal what one restart cost (DESIGN.md §13: "restarts discard cache
+   * warmth; measure $/task vs a compaction baseline early"). Audit-only, so
+   * measuring the restart costs the model nothing.
+   *
+   * `tokensAfter` is core's estimate over exactly what the next provider call
+   * receives — system prompt included, because the cached prefix is re-paid as
+   * a cache WRITE on the first turn of a fresh window, and that write is the
+   * cost this instrument exists to find. `recallTokens` is the injected
+   * `<memories>` block measured the same way the recall budget measures it, so
+   * the two numbers are comparable.
+   */
+  const emitRestart = async (loaded: LoadedContext, tokensBefore: number): Promise<void> => {
+    await emit({
+      type: "restart",
+      boundarySeq: loaded.boundarySeq,
+      tokensBefore,
+      tokensAfter: estimateTokens([
+        { role: "system", text: opts.systemPrompt },
+        ...loaded.messages,
+      ]),
+      recallTokens: loaded.block ? estimateTokens([{ role: "user", text: loaded.block }]) : 0,
+      messages: loaded.messages.length,
+    });
+  };
+
+  const initial = await loadContextWithMemories();
+  let messages: LlmMessage[] = initial.messages;
+
+  // A run that OPENS on a continuity boundary is the successor wake a restart
+  // paid for: the shedding run stopped with `shed` before it could take a turn
+  // on the fresh window, or died between the two. Billed once per boundary —
+  // the `restart` event lands inside the very window it describes, so every
+  // later wake on the same boundary finds it and stays quiet.
+  const openedAt = boundaryTokensBefore(initial);
+  if (openedAt !== null && !hasRestart(initial)) await emitRestart(initial, openedAt);
 
   let turns = 0;
   /** Advisory fires once per crossing; a shed re-arms it. */
@@ -278,7 +355,11 @@ export async function runAgentLoop(opts: RunAgentLoopOptions): Promise<AgentRunR
       // same run. The orphan tool_result for this very call is dropped by
       // buildContext, and the fresh window gets its own recall pass (§5.4)
       // seeded by the document's memoryHints.
-      messages = await loadContextWithMemories();
+      const rebuilt = await loadContextWithMemories();
+      messages = rebuilt.messages;
+      // Bill the restart before any turn spends the fresh window (§13); the
+      // shedding turn's own estimate is what the continuity event recorded.
+      await emitRestart(rebuilt, tokens);
       advisoryArmed = true;
       forcedShedFailures = 0;
       // No turns left to resume into: report the restart, not a turn overrun.

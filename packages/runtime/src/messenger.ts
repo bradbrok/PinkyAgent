@@ -15,6 +15,13 @@
  *
  * The messenger's nodeId is also the mailbox's: addresses without "@", and
  * addresses ending in "@<thisNode>", are the same local mailbox partition.
+ *
+ * Delivery is not consumption (issue #4). `delivered_at` is the relay's
+ * bookkeeping — it makes receive() idempotent and says nothing about whether
+ * an agent ever acted. The receipt is `read_at`, stamped by the consumer
+ * inside the transaction that journals the work (claimConsumption), so
+ * recovery needs no scheduler state at all: redeliverUnconsumed() re-fires
+ * everything unread, and a duplicate fire loses the claim and does nothing.
  */
 import { createHmac, randomUUID } from "node:crypto";
 import { Mailbox, parseA2AAddress } from "@pinky/core";
@@ -152,6 +159,44 @@ export class LocalMessenger implements Messenger {
     this.fire(agentId, env);
     if (agentId === "broadcast") this.fire("*", env);
     return true;
+  }
+
+  /**
+   * Recovery for the consumption edge (issue #4): re-fire every message for
+   * `agentId` on this node with no receipt yet (`read_at is null`), whatever
+   * delivered_at says. Returns how many were fired.
+   *
+   * `delivered_at` only ever meant "this node took custody" — with nothing
+   * subscribed, or a handler that threw, or a process that died between the
+   * claim and the turn, the row stays delivered and unconsumed forever and the
+   * wake is lost with no way to notice. The receipt (`read_at`, stamped by the
+   * consumer in its own transaction) is what says the work happened, so
+   * recovery is simply "fire everything unread".
+   *
+   * Idempotent by construction, not by bookkeeping: a duplicate fire loses the
+   * claimConsumption race at the consumer and produces nothing. Broadcast rows
+   * fire on the same keys as the live path (`broadcast` and `*`), so a node
+   * with no broadcast subscriber leaves them unconsumed — honestly so: nobody
+   * ever acted on them.
+   */
+  async redeliverUnconsumed(agentId: string): Promise<number> {
+    const pending = await this.mailbox.unconsumedFor(agentId);
+    for (const env of pending) {
+      const { agentId: to } = parseA2AAddress(env.to, this.nodeId);
+      this.fire(to, env);
+      if (to === "broadcast") this.fire("*", env);
+    }
+    return pending.length;
+  }
+
+  /**
+   * Stamp the consumption receipt for one message; true only for the caller
+   * that stamped it. Pass the consumer's `tx` so the receipt commits with the
+   * work — that is what makes redelivery safe and a rolled-back turn
+   * recoverable (Mailbox.claimRead).
+   */
+  claimConsumption(id: string, tx?: Db): Promise<boolean> {
+    return tx ? this.mailbox.claimRead(id, tx) : this.mailbox.claimRead(id);
   }
 
   /** @deprecated Use receive(): it persists and dedups. Kept as a thin shim. */

@@ -37,6 +37,14 @@ class FakeMessenger implements Messenger {
     this.wakeups.push(env); // subscribers fire only for the winning claim
     return Promise.resolve(true);
   }
+  // Consumption edge (issue #4). The relay never touches it — delivery is not
+  // consumption — so the double only has to satisfy the interface.
+  redeliverUnconsumed(): Promise<number> {
+    return Promise.resolve(0);
+  }
+  claimConsumption(): Promise<boolean> {
+    return Promise.resolve(false);
+  }
 }
 
 function envelope(overrides: Partial<A2AEnvelope> = {}): A2AEnvelope {

@@ -23,7 +23,7 @@ self-configuration):
 | JSONL headless service: ingest + dedup in one transaction → one serialized run per thread → every event streamed | **Reply gating** — nothing to gate yet: every prompt on the pipe is addressed to the agent, so the rule cascade and classifier are unbuilt |
 | Memory plane v1: scopes, hybrid FTS + pgvector recall, auto-recall at context start, invalidate-never-delete | **Subagents** — no spawn, no fan-out, no depth caps |
 | Agent loop with tools: read, write, edit, glob, grep, bash, a2a, recall/retain/memory_edit, settings_get/set | **Sleep-time worker** — no extraction, consolidation, or reflection |
-| A2A mailbox + cross-node HTTP relay, at-least-once both ways | **HITL** — the `human_request` event type exists; nothing raises or resumes it |
+| A2A mailbox + cross-node HTTP relay, at-least-once both ways, wake-on-message with consumption receipts | **HITL** — the `human_request` event type exists; nothing raises or resumes it |
 | Settings table, `config` + `memory` CLI, allow-listed self-configuration, RLS on `memories`, migrations | **Cross-tenant `global` memories** — `global` visibility is still fenced by `tenant_id` in v1 |
 | Continuity events + `shed_context` | **Sandboxing** — `bash` strips the environment but is not filesystem-confined |
 
@@ -137,6 +137,35 @@ reached the agent (an `abort` while it was queued, or `exit --abort`) still
 reports `run_started` then `run_finished` with `"stopReason":"aborted"` and
 `"turns":0`.
 
+### Wake-on-message
+
+stdin is not the only way to reach the agent. While `pinky headless` runs, a
+message from a peer (`a2a_send`, or a signed `POST /a2a/deliver` from another
+node) wakes a run by itself — no prompt required. It arrives on the same lanes
+and reports the same lines, with `"cause":"a2a"` on `run_started`:
+
+```jsonc
+{"type":"run_started","threadId":"main","channelId":"a2a:weather@node2","cause":"a2a"}
+```
+
+The thread is the *sender's*: `a2a:<agentId@nodeId>` as the channel — so a peer
+can be given its own model or budget with `config set --scope
+channel:a2a:weather@node2` — and the sender's thread hint (else `main`) as the
+thread. The message is journaled as an `a2a` event and projected as a user turn
+(`[a2a request from weather@node2]: …`), so the woken run sees what woke it.
+
+**Delivery is not consumption.** `delivered_at` only records that this node
+took custody of a message; the receipt is `read_at`, and the consumer stamps it
+in the *same transaction* that journals the `a2a` event — so a message counts
+as handled only when the work is in the log, and a turn that fails to commit is
+handled again rather than lost. Recovery needs no scheduler state: everything
+unread is re-fired at startup (before the first stdin line is read) and every
+30s afterwards, which is what makes a message that arrived while the process
+was down, or during a crash right after delivery, still get answered. Re-firing
+is safe because the receipt is the idempotency hinge: a message already
+consumed produces no second run. The `a2a_inbox` tool stamps the same receipt,
+so polling and waking never double-handle one message.
+
 ## CLI
 
 There is no installed `pinky` binary yet — run the entry point directly.
@@ -156,12 +185,13 @@ bun run packages/cli/src/index.ts <command>
 | `memory search "<q>" [--limit N]` | Hybrid recall (FTS, plus the vector voice where pgvector and a key exist) |
 | `memory show <id-or-prefix>` | One memory in full: scope, importance, validity, embedder, meta |
 | `memory forget <id-or-prefix> [--reason "…"]` | Invalidate it — memories are retired, never deleted |
-| `headless [--shell] [--a2a] [--shared]` | The JSONL service on stdin/stdout. `--shell` grants `bash`; `--a2a` also opens the relay port; `--shared` drops the trusted-local recall scope |
+| `stats restarts [--channel <id>] [--limit N]` | What context restarts cost: `tokensBefore → tokensAfter` per boundary, the successor's first-turn cache split, and the total rebuild bill |
+| `headless [--shell] [--a2a] [--shared]` | The JSONL service on stdin/stdout, plus [wake-on-message](#wake-on-message) from the A2A mailbox. `--shell` grants `bash`; `--a2a` also opens the relay port (inbound from another *node*); `--shared` drops the trusted-local recall scope |
 | `smoke` | In-process end-to-end check: migrate, agent loop, local A2A, memory round trip, event log |
 | `prompt "<text>"` | One agent turn on the local `cli:local/main` thread |
 
 `memory`, `smoke`, `prompt` and `headless` auto-migrate at startup on a
-short-lived privileged connection; `config` does not.
+short-lived privileged connection; `config` and `stats` do not.
 
 `headless` runs as a **trusted local surface** by default: `user`- and
 `private`-visibility memories are recallable, and the subject user is whatever
@@ -282,6 +312,7 @@ under `packages/{core,runtime,cli}/test/integration/`, gated on
 | `core/test/integration/memory.test.ts` | Scope predicate, FTS, one-transaction `update()`, RLS, and the `::vector` voice |
 | `runtime/test/integration/messenger.test.ts` | Two nodes, one HMAC-signed socket, replay, offline retry, and `bun run smoke` |
 | `cli/test/integration/headless.test.ts` | `pinky headless` as a real child process: the JSONL contract, and that *nothing* but the protocol reached stdout |
+| `cli/test/integration/stats.test.ts` | `pinky stats restarts` as a real child process: the lateral join from each restart to the turn that paid for it |
 
 The vector half of recall needs pgvector, which the default alpine server does
 not have, so it runs against a second server on 5545:
@@ -305,6 +336,34 @@ CI ([.github/workflows/ci.yml](./.github/workflows/ci.yml)) runs typecheck and
 the unit suite on every push, then the integration suite against a
 `pgvector/pgvector:pg16` service — which is where the vector voice and
 `0002_embeddings.rerun.sql` are executed on every push.
+
+### Restart economics
+
+[DESIGN.md §13](./DESIGN.md#13-open-questions) leaves the cost model open —
+*restarts discard cache warmth; measure $/task against a compaction baseline* —
+so the runtime measures it instead of deferring it. Every rebuild from a
+continuity boundary journals an audit-only `restart` event (`boundarySeq`,
+`tokensBefore` → `tokensAfter`, `recallTokens`, `messages`), written once per
+boundary: by the loop right after a shed, or backfilled by the successor wake
+when the shedding run stopped before it could. The bill itself lands on the
+next turn, whose `message` event already carries the provider's `usage` — and
+on a fresh window that input is nearly all cache *creation*, at ~1.25x an
+ordinary input token.
+
+`pinky stats restarts` is the §13 eval as a query rather than a study: one row
+per restart with the window it replaced, the recall budget it spent, and the
+successor's `input / cacheRead / cacheCreation / output` split, then a summary
+line — restarts, mean `tokensAfter`, mean cache-write share of first-turn
+input, and Σ `tokensAfter` as the estimated rebuild cost. If the fresh window
+starts creeping up, or the stable prefix stops re-warming cheaply, the time
+series says so before the invoice does.
+
+```
+thread                                      bnd    before      after           change   recall  msgs  first turn
+cli:local/main                                3      1092 ->     425      -667 (-61%)        0     1  in 180 read 0 write 1240 out 64
+
+restarts 1  mean tokensAfter 425  mean cache-write share 87% (1/1 turns reported cache usage)  est. rebuild cost 425 tokens
+```
 
 ## Fixed defects (now regression-tested)
 

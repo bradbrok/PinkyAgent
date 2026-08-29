@@ -31,6 +31,15 @@ class FakeMessenger implements Messenger {
     this.seen.add(env.id);
     return Promise.resolve(fresh);
   }
+
+  // The consumption edge (issue #4) is the agent's, not the relay's.
+  redeliverUnconsumed(_agentId: string): Promise<number> {
+    return Promise.resolve(0);
+  }
+
+  claimConsumption(_id: string): Promise<boolean> {
+    return Promise.resolve(false);
+  }
 }
 
 function makeEnv(overrides: Partial<EnvConfig> = {}): EnvConfig {

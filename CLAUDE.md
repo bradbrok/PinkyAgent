@@ -4,7 +4,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-PinkyAgent is a headless, event-sourced agent runtime (Bun 1.4 + TypeScript workspace, Postgres 16). **DESIGN.md is the spec**; code comments cite it by section (`DESIGN.md §4.1`). README.md covers status, quickstart, CLI, and env vars — don't duplicate those here. Read DESIGN.md §1 (pillars) before changing anything structural.
+PinkyAgent is a headless, event-sourced agent runtime (Bun 1.4 + TypeScript workspace, Postgres 16). **DESIGN.md is the spec**; code comments cite it by section (`DESIGN.md §4.1`). README.md covers quickstart, CLI, protocol, and env vars — don't duplicate those here; the slice ledger below is the one status summary kept in this file. Read DESIGN.md §1 (pillars) before changing anything structural.
+
+## Build status (DESIGN.md §12 slices) — as of 2026-08-28, PR #1 merged
+
+| Slice | State | Where |
+| --- | --- | --- |
+| 1. Core loop + event log + ingress | **Done** — ingress is the JSONL headless service, not Slack (Slack was built, then removed on 2026-08-28) | `core/event-store.ts`, `core/projection.ts`, `runtime/loop.ts`, `gateway/headless.ts` |
+| 2. Memory plane v1 | **Done** — scopes, hybrid FTS+pgvector recall, auto-recall, `recall`/`retain`/`memory_edit`, `pinky memory` | `core/memory.ts`, `schema/0005_memory_fts.sql`, `runtime/embeddings.ts`, `runtime/memory-recall.ts`, `tools/memory.ts` |
+| 3. Continuity engine | **Done** — `shed_context`, pressure ladder, restart projection | `runtime/continuity.ts`, `runtime/loop.ts` |
+| 4. Reply gating | **Not built** — inert with a single-party pipe; the Slack rule cascade went with Slack; `replyGate` setting kept as reserved | — |
+| 5. Subagents | **Not built** (`subagent_spawn` event type exists) | — |
+| 6. Sleep-time worker | **Not built** (extraction / consolidation / reflection into the memory plane) | — |
+| 7. HITL | **Not built** (`human_request` event type exists; nothing raises/resumes it) | — |
+| 8. Hardening | **Partial** — RLS on `memories` under `pinky_app`; no filesystem sandbox for `bash`, no per-tenant quotas, `global` memory visibility still tenant-fenced | `schema/0003_rls.sql`, `tools/bash.ts` |
+| P8 revised (not a slice) | **Done** — human-granted self-configuration via `settings_get`/`settings_set`, `selfConfig.*`, lenient `load()`, `pinky config unset` | `tools/settings.ts`, `core/settings.ts` |
+
+Known open items (scope, not bugs): P6 durability has no checkpoint/resume (a crash mid-run re-calls the LLM); tenancy is one global `tenantId`; RLS covers only `memories`; headless runs a *trusted* memory scope by default (`--shared` drops private/user rows); stdout backpressure is ignored (Bun buffers); re-sending a completed prompt id replays it (`replay:true`). Natural next slice: 5 or 6. Keep this table current when a slice lands.
 
 ## Commands
 
@@ -57,6 +73,7 @@ Dependency direction: `core ← runtime ← tools, gateway ← cli`. `packages/r
 - Integration tests live in `packages/{core,runtime,cli}/test/integration/`, gated on `process.env.PINKY_INTEGRATION === "1"`, read the DB URL from `loadEnvConfig()` (CI uses port 5432, local 5544), use unique ids per run, and delete only what they created. Tests named `DEFECT: …` are regression guards for bugs the unit suite missed — the SQL is only exercised here, so a green `bun test` is not evidence for anything that touches Postgres or the wire.
 - `cli/test/integration/headless.test.ts` spawns `pinky headless` as a **real child process** with the channel's model set to `fake/echo`, and asserts every stdout line parses as JSON. It is the only test that can catch something on the startup path printing to stdout; `gateway/test/headless.test.ts` injects `write`, so a stray `console.log` is structurally invisible there.
 - The vector voice runs only where pgvector exists: CI (`.github/workflows/ci.yml`, `pgvector/pgvector:pg16`) and locally on 5545 via `db:up:vector` + `test:integration:vector`. On the default alpine server `memories.embedding` never exists, so `supportsVectors()` is false and the FTS-only branch is what gets executed — both branches matter, run both.
+- Integration assertions must not depend on server collation: the pgvector image is Debian/glibc `en_US` (hyphens ignored at the first level), alpine is C, so `order by <text>` disagrees with JS `.sort()` for some random run ids. Sort on the JS side of every comparison (a real CI flake, fixed in `da33d0e`).
 - `bun run smoke` now covers the memory plane too (retain → recall through the tools, plus auto-recall injecting `<memories>` at `messages[0]` on a fresh thread) with a `FakeEmbedder` at 1536 dimensions so it matches the real column in CI.
 
 ## TypeScript notes

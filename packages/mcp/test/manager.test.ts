@@ -238,6 +238,15 @@ function jsonbReorder(value: unknown): unknown {
   return out;
 }
 
+/** A promise the test resolves by hand. */
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 /** Spin the event loop until `predicate` holds, or fail loudly. */
 async function waitFor(predicate: () => boolean, label: string, ms = 2000): Promise<void> {
   const deadline = Date.now() + ms;
@@ -444,6 +453,70 @@ describe("McpManager — sync", () => {
     expect(rows.find((t) => t.name === names[1])?.rawName).toBe("a/b");
     // ... and both are callable, with the server's own spelling on the wire.
     expect(await mgr.call(names[1] as string, {})).toEqual({ text: "called a/b" });
+    await mgr.close();
+  });
+
+  it("DEFECT: status flips to connected only AFTER the first catalog write commits", async () => {
+    // `connected` is the readiness signal `pinky mcp sync` and the smoke leg
+    // poll on, and what they do next is READ THE CATALOG. Flipping the status
+    // between the handshake and the `replaceServer` commit publishes a
+    // readiness that is a lie: the fixture wins that race locally and loses it
+    // on a cold CI runner ("FAIL catalog holds the server's namespaced tools").
+    const catalog = new FakeCatalog();
+    const held = deferred<void>();
+    const original = catalog.replaceServer.bind(catalog);
+    let entered = false;
+    catalog.replaceServer = async (server, hash, tools) => {
+      entered = true;
+      await held.promise;
+      return await original(server, hash, tools);
+    };
+    const mgr = new McpManager({
+      servers: { s: HTTP_CONFIG },
+      catalog,
+      transportFactory: () => modernScript(),
+      timers: new FakeTimers(),
+    });
+    await mgr.start();
+    await waitFor(() => entered, "the catalog write to be in flight");
+
+    // Handshake done, generation not committed: no observer may see `connected`.
+    expect(mgr.state("s")?.status).toBe("connecting");
+    expect(catalog.generations).toHaveLength(0);
+    // Hold it open across several turns of the loop to rule out a lucky read.
+    for (let i = 0; i < 5; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+      expect(mgr.state("s")?.status).toBe("connecting");
+    }
+
+    held.resolve();
+    await waitFor(() => mgr.state("s")?.status === "connected", "connected");
+    // The invariant a poller depends on: connected implies the rows are there.
+    expect(catalog.generations).toHaveLength(1);
+    expect(catalog.latest()).toEqual(["mcp__s__alpha_one", "mcp__s__beta"]);
+    expect(mgr.tools().map((t) => t.name)).toEqual(["mcp__s__alpha_one", "mcp__s__beta"]);
+    await mgr.close();
+  });
+
+  it("a FAILED first sync still reports connected, with lastError and a retry", async () => {
+    // Deliberate: the connection is genuinely up and the retry will land, so
+    // reporting `error` would tell a poller to give up on a healthy server.
+    const catalog = new FakeCatalog();
+    const timers = new FakeTimers();
+    catalog.replaceServer = async () => {
+      throw new Error("catalog unavailable");
+    };
+    const mgr = new McpManager({
+      servers: { s: HTTP_CONFIG },
+      catalog,
+      transportFactory: () => modernScript(),
+      timers,
+      random: () => 1,
+    });
+    await mgr.start();
+    await waitFor(() => mgr.state("s")?.status === "connected", "connected despite the failure");
+    expect(mgr.state("s")?.lastError).toContain("catalog unavailable");
+    expect(timers.scheduled.filter((t) => !t.cancelled)).toHaveLength(1);
     await mgr.close();
   });
 

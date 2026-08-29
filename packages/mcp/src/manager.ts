@@ -91,10 +91,24 @@ export interface CatalogSink {
 /**
  * - `trusted-cache` — the catalog's rows match the configured hash and are
  *   being served; the connection is still coming up.
- * - `connecting` — no trusted rows (or a reconnect in flight).
- * - `connected` — live, synced.
+ * - `connecting` — no trusted rows, OR a reconnect in flight, OR the handshake
+ *   is done but the FIRST SYNC HAS NOT RUN YET.
+ * - `connected` — the connection is up AND the first sync attempt has
+ *   completed, so the catalog holds this generation.
  * - `error` — the last connect attempt failed; a retry is scheduled and the
  *   previous generation (if any) is still in the catalog.
+ *
+ * `connected` deliberately means "handshake done AND sync attempted", not
+ * "handshake done". It is the readiness signal a poller waits on (`pinky mcp
+ * sync`, the smoke leg), and those pollers then READ THE CATALOG. Flipping to
+ * `connected` between the handshake and the `replaceServer` commit publishes a
+ * readiness that is a lie: the fixture usually wins that race locally and
+ * loses it on a cold CI runner, which is exactly how it failed.
+ *
+ * A first sync that FAILS still ends `connected` — with `lastError` set and a
+ * retry scheduled. That is deliberate: the connection genuinely is up, the
+ * previous generation still stands, and reporting `error` would tell a poller
+ * to give up on a server that is about to succeed (see `enqueueSync`).
  */
 export type McpServerStatus = "trusted-cache" | "connecting" | "connected" | "error";
 
@@ -773,14 +787,20 @@ export class McpManager {
     rt.protocolVersion = client.getNegotiatedProtocolVersion();
     rt.serverName = client.getServerVersion()?.name;
     rt.lastError = undefined;
-    rt.status = "connected";
     this.log(
       `[mcp] ${rt.server}: connected era=${rt.era ?? "?"} protocol=${rt.protocolVersion ?? "?"}` +
         ` server=${rt.serverName ?? "anonymous"}`,
     );
 
+    // The STATUS stays `connecting` across the handshake-to-sync window. A
+    // poller that sees `connected` then reads the catalog, so publishing
+    // readiness before `replaceServer` has committed hands it an empty
+    // generation (see McpServerStatus). Both flags flip together, after the
+    // sync attempt, and `syncNow` never throws — a failed sync leaves
+    // `connected` + `lastError` + a scheduled retry.
     await this.syncNow(rt);
     await this.subscribeListChanged(rt);
+    rt.status = "connected";
     rt.live = true;
   }
 

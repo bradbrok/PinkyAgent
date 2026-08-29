@@ -106,7 +106,12 @@ suite("McpManager over real stdio", () => {
     });
     try {
       await mgr.start();
-      await waitFor(() => catalog.generations.length >= 1, "first sync");
+      // `waitForServer` semantics, exactly as `pinky mcp sync` and the smoke
+      // leg poll: wait on the STATUS, then read the catalog with no further
+      // waiting. `connected` must already imply the generation is committed.
+      await waitFor(() => mgr.state("modern")?.status === "connected", "status connected");
+      expect(catalog.generations.length).toBeGreaterThanOrEqual(1);
+      expect(catalog.latest().length).toBeGreaterThan(0);
 
       expect(mgr.state("modern")).toMatchObject({
         server: "modern",
@@ -225,7 +230,8 @@ suite("McpManager over real stdio", () => {
     });
     try {
       await mgr.start();
-      await waitFor(() => catalog.generations.length >= 1, "first sync");
+      await waitFor(() => mgr.state("legacy")?.status === "connected", "status connected");
+      expect(catalog.latest().length).toBeGreaterThan(0);
 
       expect(mgr.state("legacy")).toMatchObject({
         status: "connected",

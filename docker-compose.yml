@@ -1,0 +1,33 @@
+services:
+  postgres:
+    # pgvector/pgvector:pg16 preferred (slice 2 embeddings); postgres:16-alpine
+    # used here because it's already local and slice 1 has no vector queries.
+    # The schema's `create extension if not exists vector` is a no-op guard.
+    image: postgres:16-alpine
+    environment:
+      # Superuser. Used ONLY by `pinky migrate` (DDL + CREATE ROLE) via
+      # DATABASE_ADMIN_URL. The app must NOT connect with it: superusers
+      # bypass row-level security, which would make the memories tenant
+      # policy decorative (DESIGN.md §5.1).
+      #   DATABASE_ADMIN_URL=postgres://postgres:pinky@localhost:5544/pinky
+      #
+      # The app connects as `pinky_app` (LOGIN, NOSUPERUSER, NOBYPASSRLS),
+      # created by migration 0003_rls.sql with this same dev password:
+      #   DATABASE_URL=postgres://pinky_app:pinky@localhost:5544/pinky
+      # Dev-only credential; production rotates it with
+      #   alter role pinky_app password '<generated>'
+      POSTGRES_PASSWORD: pinky
+      POSTGRES_DB: pinky
+    ports:
+      # Host 5432 is held by stale containers from other projects; use 5544.
+      - "5544:5432"
+    volumes:
+      - pinky_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pinky"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pinky_pg:

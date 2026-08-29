@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    name: typecheck + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # Single source of truth for the toolchain version, shared with
+          # package.json's packageManager/engines fields.
+          bun-version-file: .bun-version
+
+      - run: bun install --frozen-lockfile
+
+      - run: bun run typecheck
+
+      # No PINKY_INTEGRATION here, so the integration files report as skipped
+      # and this job needs no services at all.
+      - run: bun test
+
+  integration:
+    name: integration tests (live postgres)
+    runs-on: ubuntu-latest
+    needs: check
+
+    services:
+      postgres:
+        # pgvector rather than the postgres:16-alpine used by docker-compose.yml
+        # ON PURPOSE: it is the only place 0002_embeddings.rerun.sql actually
+        # does its work. On an image without the extension that file takes its
+        # "pgvector unavailable" branch and no-ops, so the ALTER TABLE and the
+        # HNSW index are never executed locally. Here they are.
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: pinky
+          POSTGRES_DB: pinky
+        ports:
+          # CI publishes the stock port; local dev uses 5544 because 5432 is
+          # usually taken. Every test reads the url from loadEnvConfig(), so
+          # the only thing that changes between them is the env below.
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pinky"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      DATABASE_URL: postgres://postgres:pinky@localhost:5432/pinky
+      # migrate() needs DDL + CREATE ROLE; the same superuser here, and the
+      # value rls.test.ts and migrate.test.ts read for their admin connection.
+      DATABASE_ADMIN_URL: postgres://postgres:pinky@localhost:5432/pinky
+      # The unprivileged role migration 0003 creates — rls.test.ts connects as
+      # this to prove the policy actually bites.
+      PINKY_TEST_APP_URL: postgres://pinky_app:pinky@localhost:5432/pinky
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - run: bun install --frozen-lockfile
+
+      - name: Apply migrations
+        run: bun run migrate
+
+      # migrate.test.ts asserts the pgvector branch of the rerun migration when
+      # the server has the extension, and the no-op branch when it does not —
+      # so this job is where the ALTER TABLE + HNSW index actually get executed.
+      - run: bun run test:integration

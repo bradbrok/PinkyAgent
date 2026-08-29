@@ -1,0 +1,5 @@
+# Bun 1.4 defaults to the isolated linker, which does not hoist workspace
+# links (@pinky/*) into root node_modules — root eval/tests can't resolve them.
+# Hoisted restores the classic layout so cross-package imports resolve everywhere.
+[install]
+linker = "hoisted"

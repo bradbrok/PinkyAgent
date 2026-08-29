@@ -1,0 +1,74 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "pinkyagent",
+      "devDependencies": {
+        "bun-types": "^1.4.0",
+        "typescript": "^5.9.3",
+      },
+    },
+    "packages/cli": {
+      "name": "@pinky/cli",
+      "version": "0.0.1",
+      "dependencies": {
+        "@pinky/core": "workspace:*",
+        "@pinky/gateway": "workspace:*",
+        "@pinky/runtime": "workspace:*",
+        "@pinky/tools": "workspace:*",
+      },
+    },
+    "packages/core": {
+      "name": "@pinky/core",
+      "version": "0.0.1",
+      "dependencies": {
+        "postgres": "^3.4.9",
+      },
+    },
+    "packages/gateway": {
+      "name": "@pinky/gateway",
+      "version": "0.0.1",
+      "dependencies": {
+        "@pinky/core": "workspace:*",
+        "@pinky/runtime": "workspace:*",
+      },
+    },
+    "packages/runtime": {
+      "name": "@pinky/runtime",
+      "version": "0.0.1",
+      "dependencies": {
+        "@pinky/core": "workspace:*",
+      },
+    },
+    "packages/tools": {
+      "name": "@pinky/tools",
+      "version": "0.0.1",
+      "dependencies": {
+        "@pinky/core": "workspace:*",
+        "@pinky/runtime": "workspace:*",
+      },
+    },
+  },
+  "packages": {
+    "@pinky/cli": ["@pinky/cli@workspace:packages/cli"],
+
+    "@pinky/core": ["@pinky/core@workspace:packages/core"],
+
+    "@pinky/gateway": ["@pinky/gateway@workspace:packages/gateway"],
+
+    "@pinky/runtime": ["@pinky/runtime@workspace:packages/runtime"],
+
+    "@pinky/tools": ["@pinky/tools@workspace:packages/tools"],
+
+    "@types/node": ["@types/node@26.4.0", "", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-faiGnoIrLH/V8cibOMEAZ8pMw6oXqSukl29ra4mN8GdaB2ZewzeaLj+INpV5N+Z1eKWzY+IzaIZH2EIR6YZRNQ=="],
+
+    "bun-types": ["bun-types@1.4.0", "", { "dependencies": { "@types/node": "*" } }, "sha512-iIKw23BspnQQYd3prITOBxeUsxBHnwzX6YJfGMuNOZzeNcMmVqzIIVGRm1l69ogaPQmb4wB6BN8mA5bE9YuC5Q=="],
+
+    "postgres": ["postgres@3.4.9", "", {}, "sha512-GD3qdB0x1z9xgFI6cdRD6xu2Sp2WCOEoe3mtnyB5Ee0XrrL5Pe+e4CCnJrRMnL1zYtRDZmQQVbvOttLnKDLnaw=="],
+
+    "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
+
+    "undici-types": ["undici-types@8.3.0", "", {}, "sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ=="],
+  }
+}

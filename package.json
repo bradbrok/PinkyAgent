@@ -1,0 +1,25 @@
+{
+  "name": "pinkyagent",
+  "private": true,
+  "version": "0.0.1",
+  "packageManager": "bun@1.4.0",
+  "engines": {
+    "bun": ">=1.4.0"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "test:integration": "PINKY_INTEGRATION=1 bun test packages/core/test/integration packages/runtime/test/integration packages/gateway/test/integration",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "db:up": "docker compose up -d postgres",
+    "migrate": "bun run packages/cli/src/index.ts migrate",
+    "gateway": "bun run packages/cli/src/index.ts gateway",
+    "smoke": "bun run packages/cli/src/index.ts smoke"
+  },
+  "devDependencies": {
+    "bun-types": "^1.4.0",
+    "typescript": "^5.9.3"
+  }
+}

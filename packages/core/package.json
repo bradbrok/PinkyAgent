@@ -1,0 +1,12 @@
+{
+  "name": "@pinky/core",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "postgres": "^3.4.9"
+  }
+}

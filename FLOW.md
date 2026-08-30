@@ -1,8 +1,10 @@
 # PinkyAgent — agent flow
 
 How one prompt travels from a client program to a reply, and what the agent
-loop does in between. Diagrams follow the code as of slice 9 (MCP + deferred
-tools); the file paths in the notes are where each box lives. DESIGN.md is
+loop does in between — and, in §5, what happens to that log once the thread
+goes quiet. Diagrams follow the code as of slice 6 (the sleep-time worker) on
+top of slice 9 (MCP + deferred tools); the file paths in the notes are where
+each box lives. DESIGN.md is
 still the spec — this is the map of what is built.
 
 ## 1. End to end: JSONL client → headless service → agent loop → reply
@@ -215,6 +217,73 @@ The catalog is what survives all of this: an outage never empties it, so
 "its server is offline" — a temporary condition the model can retry — rather
 than "no such tool".
 
+## 5. The sleep-time worker: an idle thread becomes memory rows
+
+Nothing here is on the request path either, and nothing it writes renders: every
+event a pass appends is audit-only, so a thread's prompt is byte-identical
+before and after a sweep. The scheduler holds **no state** — the timer (or a
+cron `pinky sleep run`) asks the log what is due, and each pass journals its
+own receipt inside the transaction that made its memory writes. Kill it at any
+instant and there is nothing to reconcile.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as Trigger<br/>headless timer, or cron: pinky sleep run
+    participant W as sweep<br/>sleep/worker.ts
+    participant DQ as discoverDueThreads<br/>sleep/discovery.ts
+    participant EX as runExtractPass<br/>sleep/extract.ts
+    participant P as LLM provider<br/>sleep.model, else the run model
+    participant ES as EventStore<br/>core/event-store.ts
+    participant M as Memory plane<br/>core/memory.ts
+    participant RF as runReflectPass<br/>sleep/reflect.ts
+
+    K->>W: sweep — the scheduler carries no state in and keeps none after
+    W->>DQ: which threads are due?
+    DQ->>ES: lateral over threads: newest event, and newest extract receipt's toSeq
+    DQ-->>W: newest event ≥ idleMs old AND material past the cursor<br/>oldest-idle first, ≤ maxThreadsPerSweep, sleep: channels excluded
+
+    loop each due thread, sequentially — a pass holds a thread lock
+        W->>EX: runExtractPass thread
+        EX->>ES: cursor = toSeq of the newest sleep/extract receipt, else 0
+        EX->>ES: history from cursor, ≤ maxEventsPerPass
+        EX->>EX: renderTranscript: ingress, a2a, message, tool_result, continuity<br/>error events excluded — a failed pass writes one, and it would feed itself<br/>24k char budget, and the cursor stops where the transcript stopped
+        EX->>P: extract_memories — forced tool call
+        P-->>EX: candidates<br/>a user-visible one is downgraded unless that person spoke here
+        EX->>M: top-10 similar rows per candidate
+        EX->>P: decide_memory_updates — forced, with the neighbours
+        P-->>EX: ADD / UPDATE / DELETE / NOOP, one per candidate
+
+        rect rgb(238, 238, 238)
+            Note over EX,ES: ONE transaction: the rows and the receipt that says they exist<br/>commit together or not at all
+            EX->>ES: lockThreadTx
+            EX->>ES: RE-READ the cursor under the lock
+            alt cursor moved — a concurrent pass finished this range
+                EX-->>W: skipped: lost-claim, nothing written
+            else still ours
+                EX->>M: bind to this tx: retain / update / invalidate<br/>DELETE is invalidation, never a SQL delete<br/>UPDATE and DELETE refused unless the target lives where the candidate does
+                EX->>ES: audit memory events, then the sleep/extract receipt LAST
+            end
+        end
+    end
+
+    W->>RF: runReflectPass — once per sweep, after extraction
+    RF->>ES: watermark = through of the newest reflect receipt<br/>on the worker's own thread sleep:agentId / reflect
+    RF->>M: rows since that watermark: allChannels, tenant/channel/global only<br/>never user or private, and never its own earlier insights
+    RF->>P: reflect_memories — forced
+    P-->>RF: 0-3 insights, each citing sources, maybe superseding some
+    RF->>M: retain the insight, invalidate what it truly replaces<br/>sources from one channel stay in it, from two the insight is DROPPED
+    RF->>ES: memory events + the sleep/reflect receipt, one tx on that thread
+
+    Note over W,ES: A failed pass journals ONE error event outside the rolled-back tx —<br/>that event is now the newest, so the idle gate is the backoff.<br/>Two consecutive threads failing identically halt the sweep.
+```
+
+The receipt is the only durable record either phase keeps, which is what makes
+re-firing free: a second sweep on the same thread takes the lock, sees the
+receipt, and reports `lost-claim`, and a crash before commit leaves neither
+rows nor receipt for the next one to trip over. `pinky stats sleep` reads those
+receipts back — cost and product of every pass, from the same log.
+
 ## Where the pieces live
 
 | Box | File |
@@ -231,5 +300,10 @@ than "no such tool".
 | Auto-recall block | `packages/runtime/src/memory-recall.ts` |
 | `shed_context` + ContinuityDoc validation | `packages/runtime/src/continuity.ts` |
 | Memory store (scopes, FTS + vector, fusion) | `packages/core/src/memory.ts` |
+| Reflect batch (`since`, the tuple watermark), tx-bound store (`bind`) | `packages/core/src/memory.ts` |
+| Due-thread discovery, the sweep and its timer | `packages/sleep/src/discovery.ts`, `packages/sleep/src/worker.ts` |
+| Extraction pass, transcript rendering, the three forced schemas | `packages/sleep/src/extract.ts`, `transcript.ts`, `schemas.ts`, `prompts.ts` |
+| Reflection / consolidation, insight visibility | `packages/sleep/src/reflect.ts` |
+| Per-thread lock held across a caller's own work | `packages/core/src/event-store.ts` (`lockThreadTx`) |
 | Mailbox receipts, messenger delivery/redelivery | `packages/core/src/mailbox.ts`, `packages/runtime/src/messenger.ts` |
 | Tools | `packages/tools/src/*.ts` |

@@ -204,6 +204,16 @@ function settings(
       recallTokenBudget: 5_000,
       ...memory,
     },
+    sleep: {
+      enabled: false,
+      intervalMs: 300_000,
+      idleMs: 600_000,
+      model: "",
+      maxEventsPerPass: 200,
+      maxThreadsPerSweep: 10,
+      reflectMinMemories: 5,
+      reflectBatch: 50,
+    },
     selfConfig: { enabled: false, allowedKeys: [] },
   };
 }

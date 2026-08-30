@@ -6,7 +6,18 @@
 import type { ToolCall } from "@pinky/core";
 import type { AssistantTurn, CompleteOptions, LlmMessage, Provider } from "../types";
 
-export type FakeScript = AssistantTurn[] | ((messages: LlmMessage[]) => AssistantTurn);
+/**
+ * A canned list of turns, or a function of the prompt.
+ *
+ * The function form takes the whole `CompleteOptions` as a second parameter
+ * because some routes answer the REQUEST rather than the conversation:
+ * `fake/sleep` keys on which tool the sleep worker forced, and that lives in
+ * `opts.tools`, not in `messages`. Second parameter, never a replacement —
+ * every existing one-argument script still type-checks and still runs.
+ */
+export type FakeScript =
+  | AssistantTurn[]
+  | ((messages: LlmMessage[], opts: CompleteOptions) => AssistantTurn);
 
 export class FakeProvider implements Provider {
   readonly name = "fake";
@@ -21,7 +32,7 @@ export class FakeProvider implements Provider {
   complete(opts: CompleteOptions): Promise<AssistantTurn> {
     this.received.push(opts);
     if (typeof this.script === "function") {
-      return Promise.resolve(this.script(opts.messages));
+      return Promise.resolve(this.script(opts.messages, opts));
     }
     const next = this.script.shift();
     if (!next) {
@@ -51,8 +62,20 @@ export const FAKE_DEFERRED_QUERY = "echo";
  *  is asserting that all four turns ran — a lucky echo cannot produce it. */
 export const FAKE_DEFERRED_MARKER = "[fake/deferred done]";
 
+/** Lines `fake/sleep` turns into extraction candidates: the text after
+ *  `remember:` on any line of the rendered transcript. Multiline + insensitive
+ *  because a transcript line is `[<seq>] user <platform>:<id>: remember: …`.
+ *  Route-internal: exported for this module's unit test only, NOT re-exported
+ *  from `@pinky/runtime` — a caller seeding a thread writes the literal word
+ *  `remember:` in its text, it does not need the pattern. */
+export const FAKE_SLEEP_REMEMBER_RE = /remember:\s*(.+)$/gim;
+/** Opening words of the insight `fake/sleep` synthesizes. A memory row starting
+ *  with this came from the reflect pass and nothing else, which is what lets a
+ *  test assert the third LLM call ran rather than that *a* row exists. */
+export const FAKE_SLEEP_REFLECT_PREFIX = "Reflection over";
+
 /** Behaviors reachable as `fake/<id>`; listed in the error for a typo. */
-export const FAKE_BEHAVIORS = ["echo", "retain-recall", "deferred"] as const;
+export const FAKE_BEHAVIORS = ["echo", "retain-recall", "deferred", "sleep"] as const;
 export type FakeBehavior = (typeof FAKE_BEHAVIORS)[number];
 
 /** Newest user-role message in the prompt — the ingress the loop just projected
@@ -223,6 +246,143 @@ function fillValue(schema: Record<string, unknown>, text: string): unknown {
   }
 }
 
+// ---------------------------------------------------------------------------
+// fake/sleep — the sleep-time worker's three calls, scripted (slice 6)
+// ---------------------------------------------------------------------------
+
+/**
+ * The tool names the worker forces (packages/sleep/src/schemas.ts:
+ * EXTRACT_TOOL_NAME / DECIDE_TOOL_NAME / REFLECT_TOOL_NAME) and the candidate
+ * cap (MAX_CANDIDATES). Copied, not imported: the dependency direction is
+ * `core <- runtime <- sleep`, so runtime may not reach into @pinky/sleep. Keep
+ * the two in step — a rename there makes every call here "unexpected", which
+ * is at least a loud failure rather than a wrong memory.
+ */
+const SLEEP_EXTRACT_TOOL = "extract_memories";
+const SLEEP_DECIDE_TOOL = "decide_memory_updates";
+const SLEEP_REFLECT_TOOL = "reflect_memories";
+const SLEEP_MAX_CANDIDATES = 12;
+/** `maxLength` of an insight's `text` in the reflect schema. Quoting a long
+ *  memory row verbatim would otherwise fail the worker's validator and turn a
+ *  keyless smoke run into a `failed` pass over nothing. */
+const SLEEP_MAX_INSIGHT_CHARS = 1500;
+
+/**
+ * The single sentence every off-script branch answers with. One fixed string
+ * (not a per-branch diagnosis) because the worker's hand-rolled validator sees
+ * a turn with NO tool call and reports `failed` cleanly; a route that threw
+ * instead would surface as a stack trace from inside a sweep.
+ */
+const SLEEP_UNEXPECTED = "fake/sleep: unexpected call";
+
+/**
+ * `fake/sleep`, keyed on the tool the worker FORCED rather than on the
+ * conversation: each of the three passes is a one-shot `complete()` with a
+ * single user message and a single-entry `tools` array, so there is no window
+ * to read a position out of (unlike {@link deferredTurn}).
+ *
+ * It exists so `bun run smoke` and the CLI e2e can drive the whole
+ * extract -> decide -> reflect round trip — LLM calls, memory writes, receipts —
+ * on a machine with no API key, and deterministically enough that a second
+ * sweep over the same fact is provably a no-op.
+ */
+function sleepTurn(messages: LlmMessage[], opts: CompleteOptions): AssistantTurn {
+  const text = lastUserText(messages);
+  switch (opts.tools[0]?.name) {
+    case SLEEP_EXTRACT_TOOL:
+      return sleepExtractTurn(text);
+    case SLEEP_DECIDE_TOOL:
+      return sleepDecideTurn(text);
+    case SLEEP_REFLECT_TOOL:
+      return sleepReflectTurn(text);
+    default:
+      return say(SLEEP_UNEXPECTED);
+  }
+}
+
+/** One candidate per `remember:` line of the transcript. */
+function sleepExtractTurn(transcript: string): AssistantTurn {
+  const candidates: Record<string, unknown>[] = [];
+  // A fresh regex per call: FAKE_SLEEP_REMEMBER_RE is global, so `exec` leaves
+  // `lastIndex` behind and a scan that stops at the cap would resume mid-string
+  // on the next pass — the same transcript would extract different candidates
+  // the second time it is read.
+  const re = new RegExp(FAKE_SLEEP_REMEMBER_RE.source, FAKE_SLEEP_REMEMBER_RE.flags);
+  for (const match of transcript.matchAll(re)) {
+    const text = (match[1] ?? "").trim();
+    // minLength 1 in the schema: a blank candidate would fail the whole pass.
+    if (text === "") continue;
+    candidates.push({ text, kind: "semantic", importance: 7, visibility: "channel" });
+    if (candidates.length >= SLEEP_MAX_CANDIDATES) break;
+  }
+  return callTurn(`fake-extract-${candidates.length}`, SLEEP_EXTRACT_TOOL, { candidates });
+}
+
+/**
+ * ADD unless the fact is already there verbatim, which is what makes a second
+ * sweep over the same transcript idempotent in smoke: the first pass retains
+ * the row, the second finds it as a neighbor with byte-identical text and says
+ * NOOP. Exact equality, never a similarity heuristic — a fake must not have
+ * judgement, only a rule a test can predict.
+ */
+function sleepDecideTurn(payload: string): AssistantTurn {
+  const parsed = parseJsonRecord(payload);
+  const candidates = parsed && Array.isArray(parsed.candidates) ? parsed.candidates : undefined;
+  if (!candidates) return say(SLEEP_UNEXPECTED);
+
+  const decisions = candidates.map((raw, i) => {
+    const candidate = isRecord(raw) ? raw : {};
+    // The payload's own index, so a decision still names its candidate if the
+    // worker ever sends them out of array order (the validator demands each
+    // index exactly once).
+    const index = typeof candidate.index === "number" ? candidate.index : i;
+    const text = typeof candidate.text === "string" ? candidate.text : "";
+    const neighbors = Array.isArray(candidate.neighbors) ? candidate.neighbors : [];
+    const known = neighbors.some((n) => isRecord(n) && n.text === text);
+    return { candidate: index, action: known ? "NOOP" : "ADD" };
+  });
+  return callTurn(`fake-decide-${decisions.length}`, SLEEP_DECIDE_TOOL, { decisions });
+}
+
+/** ONE insight over the whole batch, citing every row and superseding none —
+ *  invalidation is the interesting path and a fake should not take it by
+ *  default. An empty batch returns zero insights (the worker still journals a
+ *  receipt, so the watermark moves). */
+function sleepReflectTurn(payload: string): AssistantTurn {
+  const parsed = parseJsonRecord(payload);
+  const memories = parsed && Array.isArray(parsed.memories) ? parsed.memories : undefined;
+  if (!memories) return say(SLEEP_UNEXPECTED);
+
+  const rows = memories.filter(isRecord);
+  const first = rows[0];
+  const insights =
+    first === undefined
+      ? []
+      : [
+          {
+            text: `${FAKE_SLEEP_REFLECT_PREFIX} ${rows.length} memories: ${String(
+              first.text ?? "",
+            )}`.slice(0, SLEEP_MAX_INSIGHT_CHARS),
+            importance: 5,
+            sources: rows.map((r) => String(r.id ?? "")),
+            supersedes: [],
+          },
+        ];
+  return callTurn(`fake-reflect-${insights.length}`, SLEEP_REFLECT_TOOL, { insights });
+}
+
+/** The decide/reflect payloads arrive as `JSON.stringify(payload)` in the last
+ *  user message. Total: malformed JSON is a value here, never a throw, so the
+ *  worker reports one clean `failed` instead of an exception out of a sweep. */
+function parseJsonRecord(text: string): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Keyless provider behaviors for `createProvider("fake/<behavior>")`.
  *
@@ -238,6 +398,10 @@ function fillValue(schema: Record<string, unknown>, text: string): unknown {
  *   `tool_call` -> a final message — the deferred-tool round trip (slice 9),
  *   which is the only way to prove end to end that a tool NOT in the header
  *   was found, read and executed. See {@link deferredTurn}.
+ * - `fake/sleep`         answers the sleep-time worker's three forced calls
+ *   (`extract_memories` / `decide_memory_updates` / `reflect_memories`, slice
+ *   6) off the FORCED TOOL rather than the conversation, so a sweep writes real
+ *   memory rows and receipts with no API key. See {@link sleepTurn}.
  */
 export function createFakeProvider(behavior: string): FakeProvider {
   switch (behavior) {
@@ -265,6 +429,8 @@ export function createFakeProvider(behavior: string): FakeProvider {
       ]);
     case "deferred":
       return new FakeProvider(deferredTurn);
+    case "sleep":
+      return new FakeProvider(sleepTurn);
     default:
       throw new Error(
         `Unknown fake behavior ${JSON.stringify(behavior)}. ` +

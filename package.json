@@ -11,8 +11,8 @@
   ],
   "scripts": {
     "test": "bun test",
-    "test:integration": "PINKY_INTEGRATION=1 bun test packages/core/test/integration packages/runtime/test/integration packages/mcp/test/integration packages/cli/test/integration",
-    "test:integration:vector": "DATABASE_URL=postgres://postgres:pinky@localhost:5545/pinky DATABASE_ADMIN_URL=postgres://postgres:pinky@localhost:5545/pinky PINKY_INTEGRATION=1 bun test packages/core/test/integration packages/runtime/test/integration packages/mcp/test/integration packages/cli/test/integration",
+    "test:integration": "PINKY_INTEGRATION=1 bun test packages/core/test/integration packages/runtime/test/integration packages/mcp/test/integration packages/sleep/test/integration packages/cli/test/integration",
+    "test:integration:vector": "DATABASE_URL=postgres://postgres:pinky@localhost:5545/pinky DATABASE_ADMIN_URL=postgres://postgres:pinky@localhost:5545/pinky PINKY_INTEGRATION=1 bun test packages/core/test/integration packages/runtime/test/integration packages/mcp/test/integration packages/sleep/test/integration packages/cli/test/integration",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "db:up": "docker compose up -d postgres",
     "db:up:vector": "docker compose --profile vector up -d postgres-vector",

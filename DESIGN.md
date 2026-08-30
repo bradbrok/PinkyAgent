@@ -264,6 +264,36 @@ accumulation is the same lesson: destructive LLM-driven edits degrade memory qua
      skill promotion (Generative Agents' reflection).
    Runs on cron/idle, shares the memory plane, never touches live context.
 
+   **Built (slice 6).** The scheduler holds no state, in §7/§8.1's shape: a timer in
+   `pinky headless` (or `pinky sleep run` from cron) asks the log which threads are due —
+   newest event at least `sleep.idleMs` old, something extractable past the cursor — and
+   each pass journals a `sleep` **receipt** inside the transaction that made its memory
+   writes, under the thread lock. There is no "last run at" anywhere: the cursor is the
+   newest receipt's `toSeq`, so a crash before commit leaves neither rows nor receipt and
+   the next sweep redoes the pass, while two passes racing serialize on the lock and the
+   loser writes nothing. The idle gate is also the retry backoff — a failed pass journals
+   an `error`, which is a new newest event. Every event either phase appends is
+   audit-only, so §4.5's byte-for-byte prefix is untouched by a sweep.
+   Consolidation reads **wider** than any conversation and writes **narrower**: a
+   worker-only `allChannels` scope arm makes `channel`-visibility rows of every channel
+   legible (§5.1 says a run sees one channel; a pass that consolidates the plane has to
+   see all of it), and the insight it synthesizes is placed by its sources — one channel
+   → that channel, none → tenant, **two or more → dropped**, because there is no honest
+   place for it. A row may only be superseded by an insight at exactly its own placement.
+   The same never-widen rule constrains extraction's UPDATE/DELETE: a target whose
+   visibility (and channel or user) differs from the candidate's is refused and counted
+   as a NOOP — the neighbour list is wider than the candidate, and re-filing a fact is
+   not an edit of it. What extraction *may* do is write a `tenant`-visible row out of one
+   channel's transcript, exactly the latitude the `retain` tool already gives the agent
+   (§5.1); the normative rule is the narrower one it constrains: **reflection never
+   widens channel content**, and reflection is also the only path that could, since it is
+   the only one that reads across channels. Reflection excludes its own output
+   (`meta.source = "sleep:reflect"`) from the next batch, or it would spend itself
+   consolidating consolidations. Procedural skill promotion is **not** built and is not a
+   later increment of this pass: §13 says it starts human-approved, so the reflect schema
+   has no `procedural` kind and every insight is retained `semantic`. What each pass cost
+   and produced is one query over the receipts (`pinky stats sleep`, §13).
+
 ### 5.4 Retrieval
 
 Hybrid, fused, cheap:
@@ -446,6 +476,7 @@ disposable tool-execution environments:
 | KV-cache thrash | Manus: 10× cost delta cached vs not | Stable system prefix; append-only within a window; tool set masked not mutated mid-window, and the mask itself deferred to the forced retry (§4.5); conversation breakpoints on the last two messages; notices and the recall block journaled, and tool-call arguments canonicalized on both sides of the log so jsonb key order cannot move a byte — wake N+1 is a byte-extension of wake N |
 | Tool-list churn at position 0 | Tool defs render ahead of system and messages; an MCP server's list moves under you | Header/catalog partition (§7.1): the header is a small fixed set, everything else is a catalog reached by three meta-tools, and loading a tool appends a result instead of rewriting the header. A server's rows are trusted by config hash on start and kept across an outage, so the header is identical before and after a connect |
 | Destructive memory edits | Mem0 2026: UPDATE/DELETE degrade quality | Invalidation-not-deletion; sleep-worker-only consolidation; hot edits limited to append + annotate |
+| Memory stagnation and consolidation drift | Generative Agents: reflection is what turns observations into standing beliefs; Mem0: unreviewed accumulation degrades retrieval | The sleep-time worker (§5.3 item 3) is the one path allowed to consolidate, off the live path and idle-gated. Its drift risks are bounded structurally rather than by prompt: it never reads its own insights back as fresh material, an insight is never wider than the channels that fed it, a superseded row must sit at the insight's own placement, and every pass leaves a receipt so the whole history is `pinky stats sleep` |
 
 ---
 
@@ -503,6 +534,11 @@ disposable tool-execution environments:
    queue modes.
 5. **Subagents**: isolated spawn, artifact return, parallel fan-out, depth caps.
 6. **Sleep-time worker**: extraction (ADD/UPDATE/DELETE/NOOP), consolidation, reflection.
+   **Built**, out of order — ahead of 4, 5, 7 — as a standalone wave: idle-gated
+   extraction per thread and cross-thread reflection, each committing its receipt with
+   its memory writes, driven by a timer in `pinky headless` or by `pinky sleep run` from
+   cron, and measured with `pinky stats sleep`. Procedural skill promotion is excluded on
+   purpose (§13).
 7. **HITL**: `human_request` events, notify-and-break, webhook resume.
 8. **Hardening**: sandboxed execution, per-tenant quotas, memory ABAC polish, temporal
    graph voice in recall.
@@ -523,11 +559,19 @@ disposable tool-execution environments:
 - **Cross-channel identity**: principal resolution (Slack user ↔ GitHub user ↔ email) —
   punted to v2 with a `principal_aliases` table.
 - **Procedural memory promotion**: when does a repeated lesson become a system-prompt
-  rule? Dangerous if automatic — start human-approved.
+  rule? Dangerous if automatic — start human-approved. Still open with slice 6 built: the
+  sleep worker's reflect schema has no `procedural` kind, so nothing it synthesizes can
+  promote itself.
 - **`tool_catalog` has no RLS** (§7.1, §8.3): it holds tool schemas rather than user data
   and every read and write states `tenant_id`, but `memories` is still the only table with
   a database-side policy. The follow-up belongs with slice 8, when RLS is extended past
   the memory plane — the GUC and the `withTenant` wrapper it keys on are already there.
+- **No index on `memories(recorded_at)`** (§5.3 item 3): the sleep worker's reflect batch
+  reads forward from a `(recorded_at, id)` watermark, so it is a scan under the scope
+  predicate — one page per sweep at plane scale, which is nothing, but it is the first
+  read whose cost grows with the plane rather than with the query. The index belongs with
+  slice 8's storage pass, together with the RLS item above, and its expression has to
+  match the truncated one the cursor compares on.
 - **Per-channel MCP servers**: `mcp.servers` is read once at bootstrap from the global +
   agent scopes, so a channel-scoped row is ignored (and warned about). Honoring one means
   a manager and a set of child processes per channel — a lifecycle question, not a config

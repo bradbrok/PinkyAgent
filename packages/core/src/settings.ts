@@ -42,9 +42,9 @@
  * are repaired in the database instead, by
  * schema/0004_jsonb_repair.rerun.sql.
  *
- * Keys are top-level settings field names ("tenantId",
- * "model", "context", "replyGate", "memory", "tools", "mcp", "selfConfig") or
- * dotted sub-paths ("context.advisoryFraction") — the loader materializes a
+ * Keys are top-level settings field names ("tenantId", "model", "context",
+ * "replyGate", "memory", "sleep", "tools", "mcp", "selfConfig") or dotted
+ * sub-paths ("context.advisoryFraction") — the loader materializes a
  * snapshot by merging each row into the tree, so "context" as a whole replaces
  * the sub-tree while dotted keys merge granularly. Within one scope rows apply
  * in key order, so "context" lands before "context.advisoryFraction" and the
@@ -118,6 +118,11 @@ function isPositiveInt(v: unknown): v is number {
   return Number.isInteger(v) && (v as number) > 0;
 }
 
+/** Integer within an inclusive range. */
+function isIntInRange(v: unknown, min: number, max: number): v is number {
+  return Number.isInteger(v) && (v as number) >= min && (v as number) <= max;
+}
+
 /** Mirrors runtime splitModel(): a non-empty provider prefix before the first
  *  "/", and a non-empty model id after it. Shared by `model` and
  *  `memory.embeddingModel` so the two ids stay parseable by the same code. */
@@ -144,6 +149,35 @@ export const MIN_FRACTION_GAP = 0.05;
 
 /** Float slack, so an exactly-0.05 gap written as 0.7/0.75 is not rejected. */
 const GAP_EPSILON = 1e-9;
+
+/**
+ * Floor for `sleep.intervalMs` (slice 6). Each sweep opens a transaction per
+ * due thread and can make LLM calls; under ten seconds the worker is not a
+ * background task any more, it is a load generator competing with the runs it
+ * exists to serve. The idle gate (`sleep.idleMs`) is what makes a pass rare —
+ * the interval only decides how often we look.
+ */
+export const MIN_SLEEP_INTERVAL_MS = 10_000;
+
+/**
+ * Ceiling for `sleep.maxEventsPerPass`. It matches DEFAULT_CONTEXT_EVENT_CAP in
+ * event-store.ts: past that, one pass reads more of a thread than a run ever
+ * sees, and the transcript is trimmed by its character budget long before the
+ * row limit bites anyway.
+ */
+export const MAX_SLEEP_EVENTS_PER_PASS = 5000;
+
+/** Ceiling for `sleep.maxThreadsPerSweep`: one sweep should end, and every
+ *  thread it takes is a transaction plus up to two LLM calls. */
+export const MAX_SLEEP_THREADS_PER_SWEEP = 1000;
+
+/**
+ * Ceiling for `sleep.reflectBatch`. The whole batch is serialized into ONE user
+ * message for the reflect call, so the page size is a context bill on that
+ * request — the same reasoning as `tools.searchLimit`, at a bigger scale
+ * because these rows are read by a dedicated call and not by a live run.
+ */
+export const MAX_SLEEP_REFLECT_BATCH = 500;
 
 /**
  * Ceiling for `tools.searchLimit`. `tool_search` results are rendered into the
@@ -179,6 +213,7 @@ const TOP_KEYS = Object.keys(DEFAULT_SETTINGS);
 const CONTEXT_KEYS = Object.keys(DEFAULT_SETTINGS.context);
 const REPLY_GATE_KEYS = Object.keys(DEFAULT_SETTINGS.replyGate);
 const MEMORY_KEYS = Object.keys(DEFAULT_SETTINGS.memory);
+const SLEEP_KEYS = Object.keys(DEFAULT_SETTINGS.sleep);
 const TOOLS_KEYS = Object.keys(DEFAULT_SETTINGS.tools);
 const DEFAULT_MODE_KEYS = Object.keys(DEFAULT_SETTINGS.tools.defaultMode);
 const MCP_KEYS = Object.keys(DEFAULT_SETTINGS.mcp);
@@ -579,6 +614,87 @@ function collectIssues(candidate: Record<string, unknown>): Issue[] {
       bad(
         "memory.recallTokenBudget",
         `expected a positive integer, got ${show(memory.recallTokenBudget)}`,
+      );
+    }
+  }
+
+  // Sleep-time worker (DESIGN.md §5.3 item 3, slice 6). Every bound here is a
+  // cost bound, not a taste: the worker runs unattended, so a value that reads
+  // as "more thorough" is a value that spends money and connections on a timer
+  // with nobody watching.
+  const sleep = candidate.sleep;
+  if (!isRecord(sleep)) {
+    bad("sleep", `expected an object, got ${show(sleep)}`);
+  } else {
+    for (const key of Object.keys(sleep)) {
+      if (!SLEEP_KEYS.includes(key)) {
+        bad(`sleep.${key}`, `unknown setting key (known: ${SLEEP_KEYS.join(", ")})`, "delete");
+      }
+    }
+    if (typeof sleep.enabled !== "boolean") {
+      bad("sleep.enabled", `expected a boolean, got ${show(sleep.enabled)}`);
+    }
+    if (!Number.isInteger(sleep.intervalMs) || (sleep.intervalMs as number) < MIN_SLEEP_INTERVAL_MS) {
+      bad(
+        "sleep.intervalMs",
+        `expected an integer >= ${MIN_SLEEP_INTERVAL_MS} ` +
+          `(a faster sweep competes with the runs the worker exists to serve), ` +
+          `got ${show(sleep.intervalMs)}`,
+      );
+    }
+    // 0 is legal and means "no idle gate" — `pinky sleep run --now` and the
+    // smoke leg both want a pass on a thread that was just written to.
+    if (!Number.isInteger(sleep.idleMs) || (sleep.idleMs as number) < 0) {
+      bad("sleep.idleMs", `expected an integer >= 0 (0 = no idle gate), got ${show(sleep.idleMs)}`);
+    }
+    // "" = use the run model. Anything else is a model id the same splitModel()
+    // has to be able to parse, so a typo fails here rather than on the first
+    // sweep of an unattended timer.
+    const sleepModel = sleep.model;
+    if (typeof sleepModel !== "string") {
+      bad("sleep.model", `expected a string, got ${show(sleepModel)}`);
+    } else if (sleepModel !== "" && !hasProviderPrefix(sleepModel)) {
+      bad(
+        "sleep.model",
+        `expected "" (use the run model) or "provider/model-id" ` +
+          `(e.g. "openrouter/moonshotai/kimi-k2"), got ${show(sleepModel)}`,
+      );
+    }
+    if (!isIntInRange(sleep.maxEventsPerPass, 1, MAX_SLEEP_EVENTS_PER_PASS)) {
+      bad(
+        "sleep.maxEventsPerPass",
+        `expected an integer in [1, ${MAX_SLEEP_EVENTS_PER_PASS}], got ${show(sleep.maxEventsPerPass)}`,
+      );
+    }
+    if (!isIntInRange(sleep.maxThreadsPerSweep, 1, MAX_SLEEP_THREADS_PER_SWEEP)) {
+      bad(
+        "sleep.maxThreadsPerSweep",
+        `expected an integer in [1, ${MAX_SLEEP_THREADS_PER_SWEEP}], ` +
+          `got ${show(sleep.maxThreadsPerSweep)}`,
+      );
+    }
+    const reflectMin = sleep.reflectMinMemories;
+    const reflectBatch = sleep.reflectBatch;
+    if (!isPositiveInt(reflectMin)) {
+      bad(
+        "sleep.reflectMinMemories",
+        `expected an integer >= 1 (0 would reflect over an empty batch), got ${show(reflectMin)}`,
+      );
+    }
+    if (!isIntInRange(reflectBatch, 1, MAX_SLEEP_REFLECT_BATCH)) {
+      bad(
+        "sleep.reflectBatch",
+        `expected an integer in [1, ${MAX_SLEEP_REFLECT_BATCH}] ` +
+          `(the whole batch is serialized into one reflect request), got ${show(reflectBatch)}`,
+      );
+    } else if (isPositiveInt(reflectMin) && reflectBatch < reflectMin) {
+      // Cross-field: the batch is what the pass READS and the minimum is what
+      // it needs before it runs at all, so a batch below the minimum can never
+      // reach the threshold — the reflect pass would skip forever, silently.
+      bad(
+        "sleep.reflectBatch",
+        `expected to be at least sleep.reflectMinMemories, so a full batch can ` +
+          `reach the threshold, got ${show(reflectBatch)} < ${show(reflectMin)}`,
       );
     }
   }

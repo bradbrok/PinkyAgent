@@ -241,6 +241,65 @@ export type ThreadEventData =
     }
   | {
       /**
+       * A sleep-time worker receipt (DESIGN.md §5.3 item 3, slice 6): one
+       * extraction pass over a range of THIS thread's events. AUDIT-ONLY — the
+       * projection never renders it, so a pass costs the live context nothing.
+       *
+       * Journaled INSIDE the transaction that made the pass's memory writes,
+       * under the thread's row lock, so it exists if and only if those writes
+       * committed (the same receipt discipline as the A2A consumption claim,
+       * §7). The scheduler holds no state of its own: the next pass reads its
+       * cursor (`toSeq`) from the newest receipt, and a concurrent pass that
+       * loses the lock finds the receipt and writes nothing.
+       */
+      type: "sleep";
+      phase: "extract";
+      /** Inclusive event range consumed; the next pass starts at toSeq + 1. */
+      fromSeq: number;
+      toSeq: number;
+      /** Events rendered into the transcript (audit-only types are not counted). */
+      scanned: number;
+      candidates: number;
+      added: number;
+      updated: number;
+      invalidated: number;
+      noop: number;
+      /** "provider/model-id" the pass used. */
+      model: string;
+      /** Summed over the pass's LLM calls; absent when no call reported usage. */
+      usage?: TokenUsage;
+      /** Wall-clock milliseconds for the pass. */
+      ms: number;
+    }
+  | {
+      /**
+       * A sleep-time worker receipt for one REFLECTION pass (cross-thread
+       * consolidation, DESIGN.md §5.3 item 3). Lives on the worker's own
+       * thread (`sleep:<agentId>` / `reflect`) — the event log is the state
+       * (P1), so the worker journals where everything else does. AUDIT-ONLY.
+       *
+       * The watermark is a (recorded_at, id) tuple because recorded_at alone
+       * is not unique: two rows retained in one transaction share it, and a
+       * timestamp-only cursor would skip the second.
+       */
+      type: "sleep";
+      phase: "reflect";
+      /** Watermark BEFORE this pass; null on the first. */
+      after: { recordedAt: string; id: string } | null;
+      /** Watermark AFTER it: the last memory row this pass read. */
+      through: { recordedAt: string; id: string };
+      scanned: number;
+      candidates: number;
+      added: number;
+      updated: number;
+      invalidated: number;
+      noop: number;
+      model: string;
+      usage?: TokenUsage;
+      ms: number;
+    }
+  | {
+      /**
        * A settings write the agent made through the `settings_set` tool
        * (DESIGN.md P8, revised: human-granted self-configuration). Audit-only:
        * the projection never renders it, so a self-config write costs no

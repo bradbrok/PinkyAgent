@@ -11,6 +11,7 @@
     "@pinky/runtime": "workspace:*",
     "@pinky/tools": "workspace:*",
     "@pinky/gateway": "workspace:*",
-    "@pinky/mcp": "workspace:*"
+    "@pinky/mcp": "workspace:*",
+    "@pinky/sleep": "workspace:*"
   }
 }

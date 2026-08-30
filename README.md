@@ -14,19 +14,21 @@ The architecture, and the reasoning behind it, is in **[DESIGN.md](./DESIGN.md)*
 ## Status
 
 Early. Slices 1 and 2 of the [build order](./DESIGN.md#12-build-order-mvp-slices),
-parts of slice 3 (the continuity engine), slice 9 (MCP + deferred tools), and
-the revised P8 (human-granted self-configuration):
+parts of slice 3 (the continuity engine), slice 6 (the sleep-time worker),
+slice 9 (MCP + deferred tools), and the revised P8 (human-granted
+self-configuration):
 
 | Built | Not built yet |
 | --- | --- |
 | Event log, projection, per-thread seq | **Multi-party ingress** — the stdio pipe is the only front door; no Slack, Discord or webhook gateway |
 | JSONL headless service: ingest + dedup in one transaction → one serialized run per thread → every event streamed | **Reply gating** — nothing to gate yet: every prompt on the pipe is addressed to the agent, so the rule cascade and classifier are unbuilt |
 | Memory plane v1: scopes, hybrid FTS + pgvector recall, auto-recall at context start, invalidate-never-delete | **Subagents** — no spawn, no fan-out, no depth caps |
-| Agent loop with tools: read, write, edit, glob, grep, bash, a2a, recall/retain/memory_edit, settings_get/set, tool_search/describe/call | **Sleep-time worker** — no extraction, consolidation, or reflection |
+| Agent loop with tools: read, write, edit, glob, grep, bash, a2a, recall/retain/memory_edit, settings_get/set, tool_search/describe/call | **Procedural skill promotion** — the sleep worker never promotes a repeated lesson into a rule; [DESIGN.md §13](./DESIGN.md#13-open-questions) says that one starts human-approved |
 | MCP servers + a deferred-tool catalog: header/catalog partition, the three meta-tools, `pinky mcp`, `pinky tools` | **Native tool deferral** — phase 2 (a provider's own `defer_loading` / `tool_reference`) would ride the same catalog; today every route goes through the meta-tools |
 | A2A mailbox + cross-node HTTP relay, at-least-once both ways, wake-on-message with consumption receipts | **HITL** — the `human_request` event type exists; nothing raises or resumes it |
 | Settings table, `config` + `memory` CLI, allow-listed self-configuration, RLS on `memories`, migrations | **Cross-tenant `global` memories** — `global` visibility is still fenced by `tenant_id` in v1 |
 | Continuity events + `shed_context` | **Sandboxing** — `bash` strips the environment but is not filesystem-confined |
+| Sleep-time worker: idle-gated extraction (ADD/UPDATE/DELETE/NOOP, DELETE = invalidation) and cross-thread reflection, each committing its receipt with its memory writes; `pinky sleep run`, `pinky stats sleep`, a timer in `pinky headless` | **Run durability** — there is no checkpoint/resume: a crash mid-run replays from the log, which means the LLM calls are paid for again |
 
 Bugs the unit suite missed and the integration suite caught are recorded under
 [Fixed defects](#fixed-defects-now-regression-tested).
@@ -44,8 +46,9 @@ bun run smoke                 # end-to-end check, no API key needed
 ```
 
 `smoke` runs the real agent loop against a scripted fake provider — A2A round
-trip, retain → recall, auto-recall on a fresh thread — and prints a PASS line
-per check.
+trip, retain → recall, auto-recall on a fresh thread, an MCP fixture child
+found and called through the deferred-tool catalog, and a sleep-time sweep
+turning a seeded thread into a memory row — and prints a PASS line per check.
 
 The service itself is `bun run headless`: it reads commands from stdin and
 writes events to stdout for as long as the pipe is open. There is a keyless
@@ -199,18 +202,22 @@ bun run packages/cli/src/index.ts <command>
 | `memory forget <id-or-prefix> [--reason "…"]` | Invalidate it — memories are retired, never deleted |
 | `stats restarts [--channel <id>] [--limit N]` | What context restarts cost: `tokensBefore → tokensAfter` per boundary, the successor's first-turn cache split, and the total rebuild bill |
 | `stats cache [--channel <id>] [--thread <id>] [--limit N]` | The steady-state prompt-cache hit rate over the newest N turns (default 50): per turn `prompt = read + write + uncached` with a `hit` share, `⊘ cold` on a warm→cold transition, then the mean and totals over the measured turns and the "prefix rewritten" count |
+| `stats sleep [--channel <id>] [--limit N]` | What the [sleep-time worker](#how-memory-gets-written-while-the-agent-sleeps) cost and wrote: the newest N receipts (default 50), both phases, then per-phase totals and how many of its rows are still current |
+| `sleep run [--now] [--channel <id>] [--thread <id>] [--limit N]` | One sweep, right now — the cron entry point. `--now` ignores the idle gate, `--thread` pins one thread and skips discovery (it needs `--channel`: a thread id is only unique inside its channel), `--limit` overrides `sleep.maxThreadsPerSweep`. Exits 1 if any pass failed |
 | `mcp list` | Every configured MCP server: status, protocol era, negotiated version, server name, live tool count, last error. Never waits for a connection |
 | `mcp sync [<server>...] [--timeout-ms N]` | Connect, wait (15s default), and print what each server published to the catalog. Exits 1 if any named server did not connect, so it works as a deployment step |
 | `tools list [--scope <scope>]...` | The header/catalog split as a run would compute it: the catalog's rows through the same `partitionTools` and the same settings overlay. `--scope` repeats (an overlay is a list) |
 | `headless [--shell] [--a2a] [--shared]` | The JSONL service on stdin/stdout, plus [wake-on-message](#wake-on-message) from the A2A mailbox. `--shell` grants `bash`; `--a2a` also opens the relay port (inbound from another *node*); `--shared` drops the trusted-local recall scope |
-| `smoke` | In-process end-to-end check: migrate, agent loop, local A2A, memory round trip, event log |
+| `smoke` | In-process end-to-end check: migrate, agent loop, local A2A, memory round trip, event log, MCP + deferred tools, one sleep-time sweep |
 | `prompt "<text>"` | One agent turn on the local `cli:local/main` thread |
 
-`memory`, `mcp`, `tools`, `smoke`, `prompt` and `headless` auto-migrate at
-startup on a short-lived privileged connection; `config` and `stats` do not.
-Only `mcp list|sync`, `prompt` and `headless` open the MCP plane — `tools list`
-reads the catalog and starts no server, and `memory`, `stats` and `smoke` never
-touch it.
+`memory`, `mcp`, `tools`, `sleep run`, `smoke`, `prompt` and `headless`
+auto-migrate at startup on a short-lived privileged connection; `config` and
+`stats` do not. Only `mcp list|sync`, `prompt` and `headless` open the MCP plane
+— `tools list` reads the catalog and starts no server, and `memory`, `stats`,
+`sleep run` and `smoke` never touch it. The worker has no tool surface of its
+own (it forces three fixed schemas and reads the answers), so there is nothing
+for it to spawn a configured server for.
 
 `prompt` and `headless` install signal handlers, because a signal is how a
 supervisor stops a long-lived service and the default action is fatal: SIGTERM
@@ -236,6 +243,31 @@ cache-write counter)` where nobody counted. `--limit` samples the newest N
 turns and transitions are found inside that sample, so a thread's first sampled
 turn is never marked cold — widen `--limit`, or pin `--thread`, to see further
 back.
+
+`sleep run` prints one line per thread it touched, one for the reflect pass, and
+the model it used. A `done` line carries that pass's receipt in brackets:
+`scanned` events rendered into the transcript, `candidates` the model proposed,
+then `+A ~U -D =N` — rows **a**dded, **u**pdated, invalidated (`-D`, a
+retirement, never a `DELETE`) and left alone (`=N`, which is both "already
+known" and what a target the placement guard refused becomes) — plus billed
+tokens and wall-clock ms. `skipped` is the ordinary outcome rather than a
+problem: `no-new-events` (the cursor is caught up), `below-threshold` (fewer
+than `sleep.reflectMinMemories` new rows to consolidate), `not-idle` (the
+worker's own thread was written to less than `sleep.idleMs` ago) and
+`lost-claim` (a concurrent sweep committed the same range first). `halted:`
+means two consecutive threads failed with the *identical* error — one broken
+dependency, not N unlucky threads — so the sweep stopped, the threads behind it
+were never attempted and reflection was not run; that exits 1, like a failure.
+
+`stats sleep` reads the same numbers back out of the log. `range` is the seq
+span a pass consumed (`12..240`) for extraction, and for reflection the
+watermark it advanced the memory plane to (`-> 2026-08-29T12:00:00`) — those
+receipts live on the worker's own `sleep:<agentId>` thread, which is why the
+command lists every channel. `tokens` is `-` where no call reported usage,
+never `0`, and each phase's totals name their own denominator (`over N measured
+pass(es)`). The closing line is counted from the plane rather than summed off
+the receipts: how many worker-written rows are still **current**, which is the
+number that differs once the agent — or a later reflection — has retired some.
 
 `headless` runs as a **trusted local surface** by default: `user`- and
 `private`-visibility memories are recallable, and the subject user is whatever
@@ -300,6 +332,46 @@ Embeddings are optional everywhere. With no matching API key the process warns
 once on stderr and recall runs on the lexical voice alone; on a Postgres
 without pgvector the `embedding` column never exists and the same thing
 happens. Both are supported modes, not failures.
+
+**Sleep keys** — the [sleep-time
+worker](#how-memory-gets-written-while-the-agent-sleeps)
+([DESIGN.md §5.3](./DESIGN.md#53-write-paths)). Every bound is a cost bound:
+the worker runs unattended, so a value that reads as "more thorough" is one
+that spends money on a timer with nobody watching.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `sleep.enabled` | `false` | Run the sweep timer inside `pinky headless`. `pinky sleep run` ignores it — an operator asking for a sweep is not asking about a timer |
+| `sleep.intervalMs` | `300000` | Sweep cadence for that timer. Minimum `10000`: faster than that the worker is a load generator competing with the runs it serves |
+| `sleep.idleMs` | `600000` | A thread is due only once its newest event is this old. `0` disables the gate. It is also the retry backoff — a failed pass journals an `error`, which is a new event |
+| `sleep.model` | `""` | `provider/model-id` for the worker's calls; `""` means the run model. Extraction is structured output over a transcript, which a small cheap model does well while the conversation is on something expensive |
+| `sleep.maxEventsPerPass` | `200` | Events one pass consumes from a thread — the cursor advances by at most this. 1–5000 |
+| `sleep.maxThreadsPerSweep` | `10` | Threads one sweep may touch, oldest-idle first. 1–1000 |
+| `sleep.reflectMinMemories` | `5` | New rows since the last consolidation before a reflect pass runs at all |
+| `sleep.reflectBatch` | `50` | Rows one reflect pass reads. 1–500, and never below `reflectMinMemories` — a batch smaller than the threshold could never reach it, so the pass would skip forever, silently |
+
+Like `mcp.servers`, `sleep.*` is read **once, at bootstrap** by the `pinky
+headless` timer: one process-lifetime sweep over every thread of the tenant is
+not a per-run decision, so a `channel:<id>`-scoped row has no thread to be
+about (it is ignored, and warned about on stderr) and any change lands on the
+next restart. `pinky sleep run` has no such timer and reads the table as it
+stands.
+
+`sleep.*` *is* delegable through `settings_set`, unlike `mcp.servers` — but
+treat it as a **spend delegation**: a sweep is up to `maxThreadsPerSweep` × 2
+LLM calls, repeated every `intervalMs`, with no turn to show for it.
+`sleep.model` faces the same refusals as `model`, including inside a whole
+`sleep` object written at once: `{"enabled":true,"model":"fake/echo",…}` would
+otherwise point the worker at a scripted route whose answers become durable
+memory rows. `""` stays writable.
+
+Because the scheduler holds no state, cron is a first-class trigger — it and
+the timer are the same sweep, and running both is safe (the second takes the
+thread lock, sees the first's receipt, and reports `lost-claim`):
+
+```
+*/5 * * * * cd /path/to/PinkyAgent && bun run packages/cli/src/index.ts sleep run
+```
 
 **Tool keys** — which tools are in the request header and which live in the
 catalog ([Deferred tools](#deferred-tools-and-mcp)):
@@ -384,6 +456,60 @@ tool can only write `agent:<self>` or `channel:<current>`, never `global`.
 Writes land in the table, not in the running snapshot: settings are re-read per
 run, so a change takes effect on the next one.
 
+## How memory gets written while the agent sleeps
+
+The hot tools (`retain`, `memory_edit`) let the agent write down what it decides
+to write down, mid-conversation, while it is busy doing something else. The
+sleep-time worker is the other path: while nothing is talking, it reads the
+event log a thread already produced and turns it into memory rows
+([DESIGN.md §5.3](./DESIGN.md#53-write-paths)). It runs from a timer inside
+`pinky headless` (`sleep.enabled`) or from `pinky sleep run` in a cron entry —
+same sweep, different trigger.
+
+**Extraction**, per thread and idle-gated: render the events since this
+thread's last pass into a transcript, ask the model for candidate memories,
+then — for each candidate — retrieve the ten most similar existing rows and ask
+it to pick **ADD / UPDATE / DELETE / NOOP** (Mem0's loop). `DELETE` is an
+*invalidation*: the row gets a `valid_to` and a reason naming what contradicted
+it, and nothing here ever issues a SQL `DELETE`. A target the model names is
+only accepted if it lives in exactly the same place as the candidate — same
+visibility, same channel or user — because the neighbours a search returns are
+wider than the candidate, and rewriting a tenant-wide fact from inside one
+channel is a scope change wearing an edit's clothes; a mismatch is refused,
+logged, and counted as a NOOP.
+
+**Reflection**, once per sweep and across threads: read the memories retained
+since the last consolidation and ask for up to three synthesized insights, each
+citing its sources and optionally *superseding* them (invalidated, again, never
+deleted). This is the only consolidation path in the system. It never reads
+`user`- or `private`-visibility rows, and channel content never widens: an
+insight drawn from one channel stays in that channel, one drawn only from
+tenant/global rows becomes tenant-visible, and one whose sources span two
+channels is **dropped** rather than published to either. It also excludes its
+own previous output, or it would spend the rest of its life consolidating
+consolidations. Procedural promotion — turning a repeated lesson into a rule —
+is deliberately not part of this; §13 says that one starts human-approved.
+
+**Nothing it writes is model-visible.** The memory events and the pass's
+receipt are audit-only, so a thread's rendered prompt is byte-identical before
+and after a sweep; a row retained mid-window is first *seen* after the next
+continuity boundary, because auto-recall runs once per window and replays its
+journaled block.
+
+The bookkeeping is the log itself. Each pass journals a `sleep` **receipt** —
+what it consumed, what it wrote, which model, how many tokens, how long — in
+the *same transaction* as its memory writes, under the thread's lock. That is
+the whole scheduler: there is no "last run at" anywhere, the next pass reads
+its cursor from the newest receipt, a crash before commit leaves neither rows
+nor receipt (so the next sweep redoes the pass), and two sweeps racing on one
+thread produce exactly one set of rows. Extraction receipts live on the thread
+they read; reflection's live on the worker's own `sleep:<agentId>` thread,
+which discovery skips so it can never extract from its own paperwork.
+
+Which makes measurement a query rather than a study: `pinky stats sleep` prints
+every receipt, both phases, with per-phase totals and how many of the worker's
+rows are still current.
+
 ## Deferred tools and MCP
 
 Tool schemas render at prefix position 0 of every request (`tools → system →
@@ -448,9 +574,10 @@ endless respawn loop). Every diagnostic goes to **stderr**, always: `pinky
 headless` owns stdout.
 
 There is a keyless route for the whole round trip: `fake/deferred` (beside
-`fake/echo` and `fake/retain-recall`) scripts `tool_search → tool_describe →
-tool_call →` an answer carrying the tool's own output, which is how `bun run
-smoke` and the integration suite exercise the path with no API key.
+`fake/echo`, `fake/retain-recall` and `fake/sleep`) scripts `tool_search →
+tool_describe → tool_call →` an answer carrying the tool's own output, which is
+how `bun run smoke` and the integration suite exercise the path with no API
+key. `fake/sleep` does the same for the worker's three forced schemas.
 
 ## Testing
 
@@ -464,7 +591,7 @@ bun run test:integration # live Postgres, live HTTP, live subprocess
 The unit suite is entirely fakes. That is fast and it is also how a real
 cross-node mailbox bug shipped green (see *Fixed defects* below), so the SQL,
 the jsonb round-trip, the wire format and the CLI path have their own suite
-under `packages/{core,runtime,mcp,cli}/test/integration/`, gated on
+under `packages/{core,runtime,mcp,sleep,cli}/test/integration/`, gated on
 `PINKY_INTEGRATION=1`:
 
 | File | Covers |
@@ -479,6 +606,8 @@ under `packages/{core,runtime,mcp,cli}/test/integration/`, gated on
 | `cli/test/integration/headless.test.ts` | `pinky headless` as a real child process: the JSONL contract, and that *nothing* but the protocol reached stdout |
 | `cli/test/integration/stats.test.ts` | `pinky stats restarts` and `stats cache` as real child processes: the lateral join from each restart to the turn that paid for it, and the per-turn hit shares, cold transitions and uncounted-turn handling |
 | `mcp/test/integration/mcp-stdio.test.ts` | The MCP client against real child processes over real stdio — modern-era negotiation (2026-07-28) against an SDK-built fixture, the fallback to a hand-rolled legacy one (2025-06-18), byte-identical schemas from the cache and from a live sync, and a spawn that fails without emptying the catalog. Needs no database: what is under test is the wire |
+| `sleep/test/integration/sleep.test.ts` | The sleep worker against a live database, with no CLI: the discovery query (idle gate, cursor, `sleep:` exclusion), a whole extraction pass, and the three claims a fake store cannot make — an invalid tool call leaves no rows, no receipt and exactly one `error` event; a failure mid-apply rolls back the writes before it; two passes racing on one thread commit exactly one. Plus the reflect scope rules and the millisecond-truncated watermark |
+| `cli/test/integration/sleep.test.ts` | The worker through the CLI as real processes, inside a throwaway tenant: `pinky sleep run` extracting and consolidating a seeded thread, `pinky stats sleep` printing both receipts, a second run skipping, and the `pinky headless` timer sweeping without putting one non-protocol byte on stdout. The tenant override is not tidiness — the timer sweeps whatever the tenant has, so without it the test would move cursors on the operator's own threads |
 | `cli/test/integration/mcp-tools.test.ts` | Slice 9 through the CLI as real processes: `pinky mcp sync` publishing a server's tools, `pinky tools list` showing them as deferred, a `pinky headless` prompt answered by finding, describing and calling a tool that was never in its header — with every stdout line still parsing as JSON — and SIGTERM reaping the stdio child instead of orphaning it |
 
 One of those is gated twice over: `providers-cache.test.ts` runs only when
@@ -650,6 +779,7 @@ packages/core      event log, memory plane, tool catalog, mailbox, settings, mig
 packages/runtime   agent loop, providers, embedders, continuity, auto-recall, A2A messenger, tool partition
 packages/tools     read / write / edit / glob / grep / bash / a2a / recall / retain / memory_edit / settings / tool_search / tool_describe / tool_call
 packages/mcp       MCP client plane: naming + config hashing, connect/sync/dispatch, result rendering
+packages/sleep     sleep-time worker: discovery, extraction, reflection, the sweep and its timer
 packages/gateway   JSONL headless protocol, A2A relay
 packages/cli       pinky — the human-owned control surface
 ```

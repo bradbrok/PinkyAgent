@@ -512,3 +512,90 @@ describe("estimateTokens", () => {
     expect(small).toBeGreaterThan(0);
   });
 });
+
+/**
+ * Slice 6: a sleep-worker receipt is AUDIT-ONLY (DESIGN.md §5.3 item 3).
+ *
+ * The worker exists to run while nobody is looking, so a pass has to be free in
+ * context terms: a wake must render the same BYTES before and after one, or
+ * every pass would cold-start the thread's cached prefix (§4.5) — the exact
+ * cost the design says background consolidation must not have.
+ */
+describe("sleep receipts are audit-only (slice 6)", () => {
+  const extract = (seq?: number): ThreadEvent =>
+    ev(
+      {
+        type: "sleep",
+        phase: "extract",
+        fromSeq: 1,
+        toSeq: 9,
+        scanned: 4,
+        candidates: 2,
+        added: 1,
+        updated: 0,
+        invalidated: 0,
+        noop: 1,
+        model: "fake/sleep",
+        ms: 12,
+      },
+      seq,
+    );
+
+  const reflect = (seq?: number): ThreadEvent =>
+    ev(
+      {
+        type: "sleep",
+        phase: "reflect",
+        after: null,
+        through: { recordedAt: "2026-08-28T00:00:00.000Z", id: "m9" },
+        scanned: 5,
+        candidates: 1,
+        added: 1,
+        updated: 0,
+        invalidated: 0,
+        noop: 0,
+        model: "fake/sleep",
+        usage: { input: 900, output: 40 },
+        ms: 310,
+      },
+      seq,
+    );
+
+  it("renders nothing for either phase", () => {
+    nextSeq = 0;
+    expect(buildContext([extract(1), reflect(2)])).toEqual([]);
+  });
+
+  it("leaves a window byte-identical: inserting a pass changes no rendered text", () => {
+    nextSeq = 0;
+    const without = buildContext([continuity(1), ingress("hi", 2), assistant("hello", [], 3)]);
+    const withPasses = buildContext([
+      continuity(1),
+      extract(2),
+      ingress("hi", 3),
+      reflect(4),
+      assistant("hello", [], 5),
+      extract(6),
+    ]);
+    expect(JSON.stringify(withPasses)).toBe(JSON.stringify(without));
+  });
+
+  it("does not disturb the hoisted recall block or windowRecall", () => {
+    // A pass writes memory rows, but auto-recall is once per WINDOW and its
+    // block is journaled, so the rows it retained are first seen after the next
+    // continuity boundary — byte 0 does not move mid-window (invariant #9).
+    nextSeq = 0;
+    const events = [continuity(1), recall(BLOCK, 2), extract(3), ingress("carry on", 4), reflect(5)];
+    expect(windowRecall(events)).toEqual({ ran: true, block: BLOCK });
+    const msgs = buildContext(events);
+    expect(msgs[0]!.text).toBe(BLOCK);
+    expect(msgs.map((m) => m.role)).toEqual(["user", "user", "user"]);
+  });
+
+  it("is dropped before the boundary like every other pre-continuity event", () => {
+    nextSeq = 0;
+    const msgs = buildContext([extract(1), ingress("old", 2), continuity(3), ingress("new", 4)]);
+    expect(msgs.map((m) => m.text).join("\n")).not.toContain("old");
+    expect(msgs[msgs.length - 1]!.text).toContain("new");
+  });
+});

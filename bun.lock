@@ -18,6 +18,7 @@
         "@pinky/gateway": "workspace:*",
         "@pinky/mcp": "workspace:*",
         "@pinky/runtime": "workspace:*",
+        "@pinky/sleep": "workspace:*",
         "@pinky/tools": "workspace:*",
       },
     },
@@ -52,6 +53,14 @@
         "@pinky/core": "workspace:*",
       },
     },
+    "packages/sleep": {
+      "name": "@pinky/sleep",
+      "version": "0.0.1",
+      "dependencies": {
+        "@pinky/core": "workspace:*",
+        "@pinky/runtime": "workspace:*",
+      },
+    },
     "packages/tools": {
       "name": "@pinky/tools",
       "version": "0.0.1",
@@ -77,6 +86,8 @@
     "@pinky/mcp": ["@pinky/mcp@workspace:packages/mcp"],
 
     "@pinky/runtime": ["@pinky/runtime@workspace:packages/runtime"],
+
+    "@pinky/sleep": ["@pinky/sleep@workspace:packages/sleep"],
 
     "@pinky/tools": ["@pinky/tools@workspace:packages/tools"],
 

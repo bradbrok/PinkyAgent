@@ -818,3 +818,390 @@ describe("fuseHits", () => {
     expect(hits[0]!.score).toBeCloseTo(1, 10);
   });
 });
+
+// --- bind (slice 6) ---------------------------------------------------------
+
+/**
+ * `bind(tx)` is the only way to write memories inside a transaction the CALLER
+ * owns, which is the whole safety argument of the sleep worker: its rows and
+ * its receipt commit together or not at all (DESIGN.md §5.3 item 3).
+ */
+describe("MemoryStore.bind", () => {
+  it("issues its statements on the bound Db, not the parent's", async () => {
+    const parent = new FakeDb([VECTOR_NO, INSERT]);
+    const tx = new FakeDb([VECTOR_NO, INSERT]);
+    const out = await new MemoryStore(parent, "t1").bind(tx).retain({
+      agentId: "a1",
+      visibility: "tenant",
+      kind: "semantic",
+      text: "written inside someone else's transaction",
+    });
+
+    expect(tx.all(/insert into memories/)).toHaveLength(1);
+    expect(parent.all(/insert into memories/)).toHaveLength(0);
+    // Same tenant, restated on the row (RLS is bypassed by a superuser, so the
+    // store never relies on the GUC alone).
+    expect((tx.find(/insert into memories/)!.params as unknown[])[1]).toBe("t1");
+    expect(out.id).toBeTruthy();
+  });
+
+  it("shares the vector probe: no second information_schema query inside the tx", async () => {
+    // The tx db has NO route for information_schema, so a re-probe would throw.
+    // That is the assertion: the probe is a read the parent already made, and
+    // re-issuing it inside a caller's transaction puts a pointless statement on
+    // the critical path of every write the pass makes.
+    const parent = new FakeDb([VECTOR_YES]);
+    const tx = new FakeDb([INSERT]);
+    const store = new MemoryStore(parent, "t1");
+    expect(await store.supportsVectors()).toBe(true);
+
+    await store.bind(tx).retain({
+      agentId: "a1",
+      visibility: "tenant",
+      kind: "semantic",
+      text: "hi",
+      embedding: wide([0.5]),
+      embeddingModel: "openai/text-embedding-3-small",
+    });
+
+    expect(tx.all(/information_schema/)).toHaveLength(0);
+    expect(parent.all(/information_schema/)).toHaveLength(1);
+    expect(tx.find(/insert into memories/)!.sql).toContain("::vector");
+  });
+
+  it("shares the cache in BOTH directions — a bound store's probe answers for the parent", async () => {
+    const parent = new FakeDb([INSERT]); // no probe route: a probe here throws
+    const tx = new FakeDb([VECTOR_YES, INSERT]);
+    const store = new MemoryStore(parent, "t1");
+    const bound = store.bind(tx);
+
+    expect(await bound.supportsVectors()).toBe(true);
+    expect(await store.supportsVectors()).toBe(true); // cached, not re-probed
+    expect(tx.all(/information_schema/)).toHaveLength(1);
+    expect(parent.all(/information_schema/)).toHaveLength(0);
+  });
+
+  it("shares the warning sink, so a degraded write is still reported", async () => {
+    const tx = new FakeDb([VECTOR_YES, INSERT]);
+    const w = warnings();
+    const parent = new MemoryStore(new FakeDb([]), "t1", { onWarning: w.onWarning });
+
+    await parent.bind(tx).retain({
+      agentId: "a1",
+      visibility: "tenant",
+      kind: "semantic",
+      text: "hi",
+      embedding: new Array<number>(3072).fill(0.01),
+      embeddingModel: "openai/text-embedding-3-large",
+    });
+
+    expect(w.messages).toHaveLength(1);
+    expect(w.messages[0]).toContain("vector(1536)");
+    expect(tx.find(/insert into memories/)!.sql).not.toContain("::vector"); // row survived
+  });
+
+  it("update() through a bound store runs in the caller's transaction, not a new one", async () => {
+    // pg.ts reuses a tx-scoped client in place on a nested tx() (no nested
+    // BEGIN), which is what lets update()'s invalidate+insert pair join the
+    // caller's transaction instead of committing on its own.
+    const tx = new FakeDb([
+      VECTOR_NO,
+      { pattern: /from memories where id = \$1[\s\S]*for update/, respond: () => [rawRow("m1")] },
+      { pattern: /update memories set valid_to/, respond: () => [{ id: "m1" }] },
+      INSERT,
+    ]);
+    const store = new MemoryStore(new FakeDb([]), "t1");
+
+    await tx.tx(async (inner) =>
+      store.bind(inner).update("m1", { visibility: "tenant", kind: "semantic", text: "revised" }),
+    );
+
+    expect(tx.txLog).toEqual(["begin", "commit"]); // ONE transaction, the caller's
+    expect(tx.calls.every((c) => c.txDepth > 0)).toBe(true);
+  });
+});
+
+// --- since (slice 6) --------------------------------------------------------
+
+/**
+ * The reflect batch reads the plane FORWARDS from a tuple watermark, which is
+ * what makes a consolidation pass resumable from its own receipt.
+ */
+describe("MemoryStore.since", () => {
+  const ORDER = /order by date_trunc\('milliseconds', recorded_at\) asc, id asc/;
+  const SINCE: Route = { pattern: ORDER, respond: () => [rawRow("m1"), rawRow("m2")] };
+  const sinceCall = (db: FakeDb) => db.find(ORDER)!;
+
+  it("reads oldest-first, strictly after the (recorded_at, id) tuple", async () => {
+    const db = new FakeDb([SINCE]);
+    const rows = await new MemoryStore(db, "t1").since({
+      scope: channelScope,
+      after: { recordedAt: AT, id: "m0" },
+      limit: 25,
+    });
+
+    const call = sinceCall(db);
+    // A row comparison: "later, or the same instant with a larger id".
+    // recorded_at alone is not unique — every row one transaction retains
+    // shares it exactly — so a timestamp-only cursor would skip the siblings.
+    expect(call.sql).toContain(
+      "and (date_trunc('milliseconds', recorded_at), id) > ($4::timestamptz, $5::text)",
+    );
+    expect(call.sql).toContain("valid_to is null"); // current truth only
+    expect(call.params).toEqual(["t1", "a1", "slack:C1", AT, "m0", 25]);
+    expect(rows.map((r) => r.id)).toEqual(["m1", "m2"]);
+  });
+
+  it("truncates BOTH sides to milliseconds, with the same expression it orders by", async () => {
+    // DEFECT class: `recorded_at` is microsecond-precision, but the watermark a
+    // receipt journals came back through postgres.js's `new Date(text)`, which
+    // DROPS the sub-millisecond digits. Compared against the raw column, the
+    // boundary row (…123456) is still greater than the watermark it produced
+    // (…123000) and comes back on every later pass — together with every row
+    // its transaction wrote, since recorded_at defaults to the transaction's
+    // now(). The cursor would never get past such a group.
+    //
+    // And the ORDER BY has to use the same expression: cutting on the truncated
+    // value while ordering by the raw one lets two rows inside one millisecond
+    // disagree about which came first, and the loser is skipped forever.
+    const db = new FakeDb([SINCE]);
+    await new MemoryStore(db, "t1").since({
+      scope: channelScope,
+      after: { recordedAt: AT, id: "m0" },
+      limit: 5,
+    });
+    const sql = sinceCall(db).sql;
+    expect(sql).toContain("order by date_trunc('milliseconds', recorded_at) asc, id asc");
+    // The comparison side, spelled identically.
+    expect(sql.match(/date_trunc\('milliseconds', recorded_at\)/g)).toHaveLength(2);
+    // And the JS half really is millisecond-truncated, which is what makes the
+    // two sides the same precision (Bun/V8 both truncate, never round).
+    expect(new Date("2026-08-01 00:00:00.123999+00").toISOString()).toBe(
+      "2026-08-01T00:00:00.123Z",
+    );
+  });
+
+  it("goes through scopePredicate like every other read, never a later filter", async () => {
+    const db = new FakeDb([SINCE]);
+    await new MemoryStore(db, "t1").since({ scope: channelScope, after: null, limit: 10 });
+    const call = sinceCall(db);
+    expect(call.sql).toContain("agent_id = $2");
+    expect(call.sql).toContain("(visibility = 'channel' and channel_id = $3)");
+    expect(call.sql).not.toContain("visibility = 'private'");
+  });
+
+  it("a null watermark reads from the beginning: no tuple clause at all", async () => {
+    const db = new FakeDb([SINCE]);
+    await new MemoryStore(db, "t1").since({ scope: channelScope, after: null, limit: 10 });
+    const call = sinceCall(db);
+    expect(call.sql).not.toContain("recorded_at), id) >");
+    expect(call.params).toEqual(["t1", "a1", "slack:C1", 10]);
+  });
+
+  it("visibilities INTERSECT the scope predicate — they narrow, never widen", async () => {
+    // The reflect pass runs under a trusted scope but must not READ user or
+    // private rows: a tenant-visible insight synthesized from one user's facts
+    // leaks them into the shared scope (§5.1). The private arm is still in the
+    // predicate; the visibility list is what removes those rows.
+    const db = new FakeDb([SINCE]);
+    await new MemoryStore(db, "t1").since({
+      scope: cliScope,
+      after: null,
+      limit: 50,
+      visibilities: ["tenant", "channel", "global"],
+    });
+    const call = sinceCall(db);
+    expect(call.sql).toContain("visibility = 'private'"); // scope arm, untouched
+    expect(call.sql).toContain("and visibility = any($5::text[])");
+    expect(call.params).toEqual(["t1", "a1", "cli:local", "local", ["tenant", "channel", "global"], 50]);
+  });
+
+  it("refuses an EMPTY visibilities list rather than quietly reading everything", async () => {
+    // Unlike `kinds`, this filter narrows a privacy boundary. An empty list
+    // that meant "unfiltered" would widen the read exactly when a caller
+    // computed its list and got nothing.
+    const db = new FakeDb([SINCE]);
+    await expect(
+      new MemoryStore(db, "t1").since({
+        scope: channelScope,
+        after: null,
+        limit: 10,
+        visibilities: [],
+      }),
+    ).rejects.toThrow(/at least one visibility/);
+    expect(db.calls).toHaveLength(0);
+  });
+
+  it("rejects an unknown visibility or kind before issuing anything", async () => {
+    const db = new FakeDb([SINCE]);
+    const store = new MemoryStore(db, "t1");
+    await expect(
+      store.since({
+        scope: channelScope,
+        after: null,
+        limit: 10,
+        visibilities: ["tenant", "everyone" as never],
+      }),
+    ).rejects.toThrow(/unknown visibility/);
+    await expect(
+      store.since({ scope: channelScope, after: null, limit: 10, kinds: ["prose" as never] }),
+    ).rejects.toThrow(/unknown kind/);
+    expect(db.calls).toHaveLength(0);
+  });
+
+  it("composes kinds, visibilities and the watermark in placeholder order", async () => {
+    const db = new FakeDb([SINCE]);
+    await new MemoryStore(db, "t1").since({
+      scope: channelScope,
+      after: { recordedAt: AT, id: "m0" },
+      limit: 0, // clamped to 1, never an unbounded read
+      kinds: ["episodic"],
+      visibilities: ["tenant"],
+    });
+    const call = sinceCall(db);
+    expect(call.sql).toContain("and kind = any($4::text[])");
+    expect(call.sql).toContain("and visibility = any($5::text[])");
+    expect(call.sql).toContain(
+      "and (date_trunc('milliseconds', recorded_at), id) > ($6::timestamptz, $7::text)",
+    );
+    expect(call.params).toEqual(["t1", "a1", "slack:C1", ["episodic"], ["tenant"], AT, "m0", 1]);
+  });
+
+  it("excludeSources keeps the reflect pass from eating its own output", async () => {
+    // Without it reflection is self-sustaining: an insight lands at
+    // tenant/channel visibility under the SAME agent, AFTER the watermark, so
+    // the next pass reads it back as fresh material and consolidates
+    // consolidations on zero new conversation.
+    const db = new FakeDb([SINCE]);
+    await new MemoryStore(db, "t1").since({
+      scope: channelScope,
+      after: null,
+      limit: 50,
+      visibilities: ["tenant", "channel", "global"],
+      excludeSources: ["sleep:reflect"],
+    });
+
+    const call = sinceCall(db);
+    // The COALESCE is load-bearing: `meta->>'source'` is NULL for every row
+    // that never recorded one (anything a human or the agent retained), and
+    // `NULL <> all (...)` is NULL — not true — so without it the filter would
+    // silently drop most of the plane instead of one source.
+    expect(call.sql).toContain("and coalesce(meta->>'source', '') <> all($5::text[])");
+    expect(call.params).toEqual([
+      "t1",
+      "a1",
+      "slack:C1",
+      ["tenant", "channel", "global"],
+      ["sleep:reflect"],
+      50,
+    ]);
+  });
+
+  it("omits the source filter entirely when it is not asked for", async () => {
+    const db = new FakeDb([SINCE]);
+    await new MemoryStore(db, "t1").since({ scope: channelScope, after: null, limit: 10 });
+    expect(sinceCall(db).sql).not.toContain("meta->>'source'");
+  });
+
+  it("refuses an EMPTY excludeSources list rather than reading everything", async () => {
+    const db = new FakeDb([SINCE]);
+    await expect(
+      new MemoryStore(db, "t1").since({
+        scope: channelScope,
+        after: null,
+        limit: 10,
+        excludeSources: [],
+      }),
+    ).rejects.toThrow(/at least one source/);
+    expect(db.calls).toHaveLength(0);
+  });
+});
+
+// --- allChannels (slice 6) --------------------------------------------------
+
+/**
+ * The one cross-channel read in the system (DESIGN.md §5.3 item 3). Without it
+ * the reflect pass could never see a `channel` row — `scopePredicate` has no
+ * channel arm without a `channelId`, and extraction writes `channel` by
+ * default — so consolidation would sit below threshold forever.
+ */
+describe("scopePredicate allChannels", () => {
+  /** The BARE arm, as it renders after global/tenant. The filtered arm reads
+   *  `or (visibility = 'channel' and ...`, so the "(" tells the two apart. */
+  const BARE_CHANNEL_ARM = "or visibility = 'channel'";
+
+  it("adds the bare channel arm only when the flag is set", () => {
+    const params: unknown[] = [];
+    const sql = scopePredicate({ ...channelScope, allChannels: true }, params);
+    expect(sql).toContain(BARE_CHANNEL_ARM);
+    expect(sql).toContain("visibility = 'tenant'");
+    expect(sql).toContain("valid_to is null"); // current truth, like every read
+  });
+
+  it("replaces the channelId arm instead of joining it, binding no channel id", () => {
+    // `visibility = 'channel'` strictly subsumes `visibility = 'channel' and
+    // channel_id = $c`, so emitting both would bind a param that cannot change
+    // a row — and leave a redundant clause in a privacy predicate.
+    const params: unknown[] = [];
+    const sql = scopePredicate({ ...channelScope, allChannels: true }, params);
+    expect(sql).not.toContain("channel_id");
+    expect(params).toEqual(["a1"]); // the agent id, and nothing else
+  });
+
+  it("a scope WITHOUT the flag still has no bare channel arm (the §5.1 guard)", () => {
+    // This is the assertion that matters: a conversation run sees exactly one
+    // channel, and nothing about the new optional field may change that.
+    for (const scope of [channelScope, dmScope, cliScope]) {
+      const sql = scopePredicate(scope, []);
+      expect(sql).not.toContain(BARE_CHANNEL_ARM);
+      expect(sql).toContain("(visibility = 'channel' and channel_id = $2)");
+    }
+    // ...including a scope with no channelId at all, which is what the reflect
+    // pass used to pass: global + tenant only, never a channel row.
+    const bare = scopePredicate({ agentId: "a1", includeUser: false, includePrivate: false }, []);
+    expect(bare).not.toContain("visibility = 'channel'");
+  });
+
+  it("is orthogonal to the user and private arms", () => {
+    const params: unknown[] = [];
+    // The worker reads cross-channel but never personal: allChannels widens the
+    // CHANNEL arm and nothing else.
+    const sql = scopePredicate(
+      { agentId: "a1", allChannels: true, includeUser: false, includePrivate: false },
+      params,
+    );
+    expect(sql).toContain(BARE_CHANNEL_ARM);
+    expect(sql).not.toContain("visibility = 'user'");
+    expect(sql).not.toContain("visibility = 'private'");
+    expect(params).toEqual(["a1"]);
+  });
+});
+
+describe("MemoryStore.since with allChannels", () => {
+  const ORDER = /order by date_trunc\('milliseconds', recorded_at\) asc, id asc/;
+
+  it("can match a channel row from ANY channel, still narrowed by visibilities", async () => {
+    const db = new FakeDb([
+      { pattern: ORDER, respond: () => [rawRow("m1", { visibility: "channel", channel_id: "c9" })] },
+    ]);
+    const rows = await new MemoryStore(db, "t1").since({
+      scope: { agentId: "a1", allChannels: true, includeUser: false, includePrivate: false },
+      after: null,
+      limit: 50,
+      visibilities: ["tenant", "channel", "global"],
+    });
+
+    const call = db.find(ORDER)!;
+    expect(call.sql).toContain("or visibility = 'channel'"); // any channel
+    // No channel filter in the PREDICATE (the column is still selected, since
+    // the reflect payload groups insights by it).
+    expect(call.sql).not.toContain("channel_id = $");
+    // ...and the personal arms are still absent: the widening is channel-only.
+    expect(call.sql).not.toContain("visibility = 'user'");
+    expect(call.sql).not.toContain("visibility = 'private'");
+    expect(call.sql).toContain("and visibility = any($3::text[])");
+    expect(call.params).toEqual(["t1", "a1", ["tenant", "channel", "global"], 50]);
+    // The row carries its channelId, which is what lets reflect group by it.
+    expect(rows[0]!.channelId).toBe("c9");
+  });
+});

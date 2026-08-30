@@ -89,6 +89,7 @@ describe("DEFAULT_SETTINGS", () => {
       "model",
       "replyGate",
       "selfConfig",
+      "sleep",
       "tenantId",
       "tools",
     ]);

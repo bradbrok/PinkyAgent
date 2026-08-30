@@ -4,8 +4,10 @@
  * select ... for update) so concurrent writers serialize on the same thread.
  *
  * append(), appendBatch() and ingest() all funnel through ONE locking routine
- * (appendLockedTx) so the lock discipline exists in a single place; ingest()
- * additionally claims the platform's dedup id inside that same transaction.
+ * (appendLockedTx -> lockThreadTx) so the lock discipline exists in a single
+ * place; ingest() additionally claims the platform's dedup id inside that same
+ * transaction. lockThreadTx is exposed on its own for callers that must hold
+ * the lock across work that is not an append (the sleep worker, slice 6).
  */
 import type { Db } from "./db";
 import { jsonbParam } from "./pg";
@@ -98,6 +100,45 @@ export class EventStore {
   }
 
   /**
+   * Take the per-thread write lock inside a transaction the CALLER owns.
+   *
+   * Ensure the thread row exists, then lock THAT row. The lock target has to be
+   * a row that exists for every writer, which the newest *event* is not: on a
+   * fresh thread there is none, so `select ... from events ... for update`
+   * locks nothing and N concurrent first appends all compute seq 1 and collide
+   * on the unique constraint. The threads row is the stable per-conversation
+   * mutex (DESIGN.md §6: "per-conversation lock; one in-flight run per
+   * thread").
+   *
+   * Every append goes through here, so the lock discipline lives in ONE place.
+   * It is public because a caller sometimes has to hold the lock across work
+   * that is not an append: the sleep-time worker (DESIGN.md §5.3 item 3, slice
+   * 6) locks the thread, RE-READS its cursor under the lock, writes memory
+   * rows, and only then appends its receipt — all in one transaction, so a
+   * concurrent pass either wins the lock and is seen by the loser, or waits and
+   * finds the receipt already there.
+   *
+   * Taking the lock twice in one transaction is harmless (Postgres row locks
+   * are re-entrant within a transaction), so a caller that locks first and then
+   * calls {@link EventStore.appendTx} pays one extra statement and nothing else.
+   *
+   * MUST be called with `tx` already inside a transaction — outside one the
+   * lock is released at once and buys nothing.
+   */
+  static async lockThreadTx(tx: Db, ref: ThreadRef): Promise<void> {
+    await tx.query(
+      `insert into threads (tenant_id, channel_id, thread_id) values ($1, $2, $3)
+       on conflict do nothing`,
+      [ref.tenantId, ref.channelId, ref.threadId],
+    );
+    await tx.query(
+      `select 1 from threads where (tenant_id, channel_id, thread_id) = ($1, $2, $3)
+       for update`,
+      [ref.tenantId, ref.channelId, ref.threadId],
+    );
+  }
+
+  /**
    * The one append implementation: take the per-thread write lock, then insert
    * `data` in order under contiguous seqs. MUST be called with `tx` already
    * inside a transaction — the lock is worthless otherwise, and ingest() needs
@@ -109,23 +150,7 @@ export class EventStore {
     data: ThreadEventData[],
     label: string,
   ): Promise<ThreadEvent[]> {
-    // Ensure the thread row exists, then lock THAT row while computing the
-    // next seq. The lock target has to be a row that exists for every writer,
-    // which the newest *event* is not: on a fresh thread there is none, so
-    // `select ... from events ... for update` locks nothing and N concurrent
-    // first appends all compute seq 1 and collide on the unique constraint.
-    // The threads row is the stable per-conversation mutex (DESIGN.md §6:
-    // "per-conversation lock; one in-flight run per thread").
-    await tx.query(
-      `insert into threads (tenant_id, channel_id, thread_id) values ($1, $2, $3)
-       on conflict do nothing`,
-      [ref.tenantId, ref.channelId, ref.threadId],
-    );
-    await tx.query(
-      `select 1 from threads where (tenant_id, channel_id, thread_id) = ($1, $2, $3)
-       for update`,
-      [ref.tenantId, ref.channelId, ref.threadId],
-    );
+    await EventStore.lockThreadTx(tx, ref);
     const seqRow = await tx.queryOne<{ next: number | string }>(
       `select coalesce(max(seq), 0) + 1 as next from events
        where (tenant_id, channel_id, thread_id) = ($1, $2, $3)`,

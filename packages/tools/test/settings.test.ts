@@ -430,3 +430,161 @@ describe("settings_set rejections never land", () => {
     expect(res.text).not.toContain("hint:");
   });
 });
+
+// ---------------------------------------------------------------------------
+// slice 6: `sleep.model` is guarded exactly like `model`
+// ---------------------------------------------------------------------------
+
+/**
+ * The sleep-time worker's model is delegable (it is in SELF_CONFIG_KEYS and is
+ * not immutable), so `"*"` grants it — and a `fake/*` value there is worse
+ * than on `model`: the worker's answers become MEMORY ROWS, which outlive the
+ * setting that produced them. Same refusal, same message, one level down.
+ */
+describe("settings_set refuses a fake route for sleep.model too", () => {
+  it("refuses fake/sleep and writes nothing", async () => {
+    const { ctx, db, events } = harness({ allowedKeys: ["*"] });
+    const res = await set.execute({ key: "sleep.model", value: "fake/sleep" }, ctx);
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("test route");
+    // The hint names the key that was refused, not a generic one.
+    expect(res.text).toContain("pinky config set sleep.model fake/sleep");
+    expect(db.inserts()).toHaveLength(0);
+    expect(events).toHaveLength(0);
+  });
+
+  it("refuses an unknown provider for sleep.model", async () => {
+    const { ctx, db } = harness({ allowedKeys: ["*"] });
+    const res = await set.execute({ key: "sleep.model", value: "nope/whatever" }, ctx);
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("unknown provider 'nope'");
+    expect(res.text).toContain(SUPPORTED_PROVIDERS[0]!);
+    expect(db.inserts()).toHaveLength(0);
+  });
+
+  it("accepts a real provider id", async () => {
+    const { ctx, db } = harness({ allowedKeys: ["sleep.*"] });
+    const res = await set.execute({ key: "sleep.model", value: "anthropic/claude-x" }, ctx);
+    expect(res.isError).toBeUndefined();
+    expect(db.inserts()[0]!.params).toEqual(["agent:pinky", "sleep.model", "anthropic/claude-x"]);
+  });
+
+  // "" is the documented "use the run model" value: no provider prefix, so the
+  // guard has nothing to object to and the key stays writable.
+  it('accepts "" (inherit the run model)', async () => {
+    const { ctx, db } = harness({ allowedKeys: ["sleep.*"] });
+    const res = await set.execute({ key: "sleep.model", value: "" }, ctx);
+    expect(res.isError).toBeUndefined();
+    expect(db.inserts()[0]!.params).toEqual(["agent:pinky", "sleep.model", ""]);
+  });
+});
+
+/**
+ * The hole the keyed check had: `sleep` is a legal, non-immutable TOP-LEVEL
+ * key, so writing the whole object under a `"*"` allow-list smuggled a
+ * `fake/*` past a guard that only looked at `model` and `sleep.model`. A
+ * parent object is the same write as its leaves.
+ */
+describe("settings_set walks the written value for models", () => {
+  const sleepBlock = (model: string): Record<string, unknown> => ({
+    ...DEFAULT_SETTINGS.sleep,
+    enabled: true,
+    model,
+  });
+
+  it("refuses a fake route smuggled inside a whole `sleep` object", async () => {
+    const { ctx, db, events } = harness({ allowedKeys: ["*"] });
+    const res = await set.execute({ key: "sleep", value: sleepBlock("fake/echo") }, ctx);
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("test route");
+    // Named by the path it was found at, so the human hint is runnable.
+    expect(res.text).toContain("pinky config set sleep.model fake/echo");
+    expect(db.inserts()).toHaveLength(0);
+    expect(events).toHaveLength(0);
+  });
+
+  it("refuses an unknown provider smuggled the same way", async () => {
+    const { ctx, db } = harness({ allowedKeys: ["*"] });
+    const res = await set.execute({ key: "sleep", value: sleepBlock("nope/whatever") }, ctx);
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("unknown provider 'nope'");
+    expect(db.inserts()).toHaveLength(0);
+  });
+
+  it('accepts a whole `sleep` object whose model is "" (inherit the run model)', async () => {
+    const { ctx, db } = harness({ allowedKeys: ["*"] });
+    const value = sleepBlock("");
+    const res = await set.execute({ key: "sleep", value }, ctx);
+    expect(res.isError).toBeUndefined();
+    expect(db.inserts()[0]!.params).toEqual(["agent:pinky", "sleep", value]);
+  });
+
+  it("still refuses the top-level model key, and leaves other strings alone", async () => {
+    const { ctx } = harness({ allowedKeys: ["*"] });
+    const bad = await set.execute({ key: "model", value: "fake/echo" }, ctx);
+    expect(bad.text).toContain("pinky config set model fake/echo");
+
+    const { ctx: ctx2, db } = harness({ allowedKeys: ["*"] });
+    const ok = await set.execute(
+      { key: "memory.embeddingModel", value: "openai/text-embedding-3-small" },
+      ctx2,
+    );
+    expect(ok.isError).toBeUndefined();
+    expect(db.inserts()).toHaveLength(1);
+  });
+});
+
+/**
+ * `memory.embeddingModel` is the other `provider/model-id` leaf, and it is the
+ * one with the WORST failure: `createEmbedder` throws for an unknown provider
+ * and the wiring layer rethrows anything that is not the blank-key case, so a
+ * bad value here does not degrade recall — it stops the next boot of every
+ * surface. It gets its own list, because the embedding routes are not the chat
+ * routes.
+ */
+describe("settings_set guards memory.embeddingModel against its own routes", () => {
+  it("refuses a fake route written directly", async () => {
+    const { ctx, db, events } = harness({ allowedKeys: ["*"] });
+    const res = await set.execute({ key: "memory.embeddingModel", value: "fake/echo" }, ctx);
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("unknown embedding provider 'fake'");
+    expect(res.text).toContain("pinky config set memory.embeddingModel fake/echo");
+    expect(db.inserts()).toHaveLength(0);
+    expect(events).toHaveLength(0);
+  });
+
+  it("refuses it inside a whole `memory` object", async () => {
+    const { ctx, db } = harness({ allowedKeys: ["*"] });
+    const res = await set.execute(
+      { key: "memory", value: { ...DEFAULT_SETTINGS.memory, embeddingModel: "fake/echo" } },
+      ctx,
+    );
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("unknown embedding provider 'fake'");
+    expect(db.inserts()).toHaveLength(0);
+  });
+
+  it("refuses a provider that routes chat but not embeddings", async () => {
+    const { ctx, db } = harness({ allowedKeys: ["*"] });
+    const res = await set.execute(
+      { key: "memory.embeddingModel", value: "anthropic/claude-x" },
+      ctx,
+    );
+    expect(res.isError).toBe(true);
+    expect(res.text).toContain("unknown embedding provider 'anthropic'");
+    expect(db.inserts()).toHaveLength(0);
+    // The same value is perfectly fine as the CHAT model — the two leaves are
+    // judged against different lists, which is the whole reason for the split.
+    const { ctx: ctx2, db: db2 } = harness({ allowedKeys: ["*"] });
+    expect((await set.execute({ key: "model", value: "anthropic/claude-x" }, ctx2)).isError)
+      .toBeUndefined();
+    expect(db2.inserts()).toHaveLength(1);
+  });
+
+  it('accepts "none" (the documented way to turn the vector voice off)', async () => {
+    const { ctx, db } = harness({ allowedKeys: ["*"] });
+    const res = await set.execute({ key: "memory.embeddingModel", value: "none" }, ctx);
+    expect(res.isError).toBeUndefined();
+    expect(db.inserts()[0]!.params).toEqual(["agent:pinky", "memory.embeddingModel", "none"]);
+  });
+});

@@ -387,3 +387,146 @@ describe("EventStore.contextEvents", () => {
     expect(out.events.map((e) => e.seq)).toEqual([3, 4, 5]);
   });
 });
+
+/**
+ * The per-thread lock as a step of its own (slice 6).
+ *
+ * The sleep-time worker has to HOLD the lock across work that is not an append
+ * — re-read its cursor, write memory rows, then journal the receipt — so the
+ * discipline appendLockedTx already used is exposed rather than copied. A
+ * second copy of "insert if absent, then select for update" is exactly how the
+ * two would drift.
+ */
+describe("EventStore.lockThreadTx", () => {
+  const lockRoutes = () => [
+    { pattern: /insert into threads/i, respond: () => [] },
+    { pattern: /from threads[\s\S]*for update/i, respond: () => [] },
+  ];
+
+  it("inserts the thread row if absent, then locks THAT row", async () => {
+    const db = new FakeDb({ route: lockRoutes() });
+    await db.tx((tx) => EventStore.lockThreadTx(tx, ref));
+
+    expect(db.calls).toHaveLength(2);
+    expect(db.calls[0]!.sql).toMatch(/insert into threads/i);
+    // Insert-if-absent: the row must exist for EVERY writer, or concurrent
+    // first appends lock nothing and collide on seq 1.
+    expect(db.calls[0]!.sql).toMatch(/on conflict do nothing/i);
+    expect(db.calls[1]!.sql).toMatch(/from threads[\s\S]*for update/i);
+    for (const call of db.calls) {
+      expect(call.params).toEqual(["tenant1", "chan1", "t1"]);
+      expect(call.txDepth).toBeGreaterThan(0); // the lock is worthless outside a tx
+    }
+  });
+
+  it("is the ONE locking routine: append does not issue its own", async () => {
+    const db = new FakeDb({
+      route: [
+        ...lockRoutes(),
+        { pattern: /select coalesce\(max\(seq\), 0\) \+ 1 as next/i, respond: () => [{ next: 1 }] },
+        {
+          pattern: /insert into events/i,
+          respond: (params?: unknown[]) => {
+            const p = params as unknown[];
+            return [
+              {
+                id: p[0],
+                tenant_id: ref.tenantId,
+                channel_id: ref.channelId,
+                thread_id: ref.threadId,
+                seq: p[4],
+                ts: "t",
+                data: p[6],
+              },
+            ];
+          },
+        },
+      ],
+    });
+    await new EventStore(db).append(ref, eventData);
+    const matching = (re: RegExp) => db.calls.filter((c) => re.test(c.sql));
+    expect(matching(/insert into threads/i)).toHaveLength(1);
+    expect(matching(/for update/i)).toHaveLength(1);
+    // ...and in that order, ahead of the seq computation.
+    expect(db.calls.map((c) => /insert into threads/i.test(c.sql))).toEqual([
+      true,
+      false,
+      false,
+      false,
+    ]);
+  });
+
+  it("is re-entrant: taking it twice in one transaction is harmless", async () => {
+    // Postgres row locks are held per TRANSACTION, so a caller that locks and
+    // then calls appendTx (which locks again) pays one extra statement and
+    // never blocks on itself. That is what makes the sleep pass's
+    // lock-then-append shape safe without a "already locked" flag to get wrong.
+    const db = new FakeDb({ route: lockRoutes() });
+    await db.tx(async (tx) => {
+      await EventStore.lockThreadTx(tx, ref);
+      await EventStore.lockThreadTx(tx, ref);
+    });
+    expect(db.calls).toHaveLength(4);
+    expect(db.txLog).toEqual(["begin", "commit"]);
+  });
+
+  it("lets a caller lock FIRST, do other work, and append in the same transaction", async () => {
+    // The sleep worker's shape (DESIGN.md §5.3 item 3): whatever it writes
+    // between the lock and the receipt commits with the receipt or not at all.
+    const db = new FakeDb({
+      route: [
+        ...lockRoutes(),
+        { pattern: /insert into memories/i, respond: () => [{ id: "m1" }] },
+        { pattern: /select coalesce\(max\(seq\), 0\) \+ 1 as next/i, respond: () => [{ next: 4 }] },
+        {
+          pattern: /insert into events/i,
+          respond: (params?: unknown[]) => {
+            const p = params as unknown[];
+            return [
+              {
+                id: p[0],
+                tenant_id: ref.tenantId,
+                channel_id: ref.channelId,
+                thread_id: ref.threadId,
+                seq: p[4],
+                ts: "t",
+                data: p[6],
+              },
+            ];
+          },
+        },
+      ],
+    });
+
+    const receipt: ThreadEventData = {
+      type: "sleep",
+      phase: "extract",
+      fromSeq: 1,
+      toSeq: 3,
+      scanned: 2,
+      candidates: 1,
+      added: 1,
+      updated: 0,
+      invalidated: 0,
+      noop: 0,
+      model: "fake/sleep",
+      ms: 7,
+    };
+    const written = await db.tx(async (tx) => {
+      await EventStore.lockThreadTx(tx, ref);
+      await tx.query("insert into memories (id) values ($1)", ["m1"]);
+      return await EventStore.appendTx(tx, ref, [receipt]);
+    });
+
+    expect(written[0]!.seq).toBe(4);
+    expect(db.txLog).toEqual(["begin", "commit"]); // ONE transaction
+    expect(db.calls.every((c) => c.txDepth > 0)).toBe(true);
+    // The lock is taken BEFORE the memory write, which is the whole point: a
+    // concurrent pass either waits here or is seen by the cursor re-read.
+    const order = db.calls.map((c) => c.sql.replace(/\s+/g, " ").slice(0, 30));
+    expect(order[0]).toMatch(/insert into threads/i);
+    expect(order[1]).toMatch(/from threads/i);
+    expect(order[2]).toMatch(/insert into memories/i);
+    expect(db.calls.some((c) => /insert into events/i.test(c.sql))).toBe(true);
+  });
+});

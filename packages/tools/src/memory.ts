@@ -55,6 +55,11 @@ const MAX_QUERY_CHARS = 1000;
  *
  * `global` is tenant-scoped in v1 — cross-tenant global is a later slice — so
  * there is nothing tenant-ish to check here beyond what RLS already enforces.
+ *
+ * It deliberately ignores `RecallScope.allChannels` (slice 6), the sleep
+ * worker's cross-channel read arm: no tool scope ever sets it, and the twin
+ * fails CLOSED — a flag this function did not implement must narrow what an
+ * agent may rewrite, never widen it. Same for {@link allowedVisibility}.
  */
 export function visibleInScope(row: MemoryRow, scope: RecallScope): boolean {
   if (row.agentId !== scope.agentId) return false;

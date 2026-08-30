@@ -154,6 +154,31 @@ export interface SettingsSnapshot {
     recallTokenBudget: number;
   };
   /**
+   * Sleep-time worker (DESIGN.md §5.3 item 3, slice 6): extraction and
+   * reflection from the event log into the memory plane while the agent is
+   * idle. Behavioral, so it lives here; the worker's credentials are the
+   * model's. Read ONCE at bootstrap by the `pinky headless` timer (like
+   * `mcp.servers`); `pinky sleep run` reads the current table.
+   */
+  sleep: {
+    /** Run the sweep timer inside `pinky headless`. `pinky sleep run` ignores this. */
+    enabled: boolean;
+    /** Sweep cadence for the headless timer, ms (>= 10_000). */
+    intervalMs: number;
+    /** A thread is due only when its newest event is at least this old, ms. 0 = no gate. */
+    idleMs: number;
+    /** "provider/model-id" for the worker's LLM calls; "" = the run model (`model`). */
+    model: string;
+    /** Newest events consumed per thread per pass — the cursor advances by at most this. 1..5000. */
+    maxEventsPerPass: number;
+    /** Threads per sweep. 1..1000. */
+    maxThreadsPerSweep: number;
+    /** New memories since the last reflection before a reflect pass runs (>= 1). */
+    reflectMinMemories: number;
+    /** Memories read per reflect pass. 1..500 and >= reflectMinMemories. */
+    reflectBatch: number;
+  };
+  /**
    * Header vs catalog partition of the tool set (slice 9). Tool schemas render
    * at prefix position 0, so the header is a cache key: changing `alwaysOn`
    * invalidates every provider cache tier and is journaled like any setting;
@@ -238,6 +263,16 @@ export const DEFAULT_SETTINGS: SettingsSnapshot = {
     autoRecall: true,
     recallLimit: 12,
     recallTokenBudget: 5_000,
+  },
+  sleep: {
+    enabled: false,
+    intervalMs: 300_000,
+    idleMs: 600_000,
+    model: "",
+    maxEventsPerPass: 200,
+    maxThreadsPerSweep: 10,
+    reflectMinMemories: 5,
+    reflectBatch: 50,
   },
   tools: {
     defaultMode: { builtin: "always", mcp: "deferred" },

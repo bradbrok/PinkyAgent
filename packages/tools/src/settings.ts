@@ -27,7 +27,8 @@
  * The write is nonetheless validated against the whole overlay this run reads
  * (channel + agent), because that is the snapshot the next run assembles — a
  * value that is only valid against the scope it lands in is still a broken
- * wake. `model` gets two extra refusals on top (see `refuseModelValue`).
+ * wake. `model` — and `sleep.model`, the sleep-time worker's (slice 6) — get
+ * two extra refusals on top (see `refuseModelValue`).
  *
  * Every successful write emits a `config` event — audit-only, never projected
  * — so the log answers who changed what, from what, and when. And the write
@@ -37,7 +38,7 @@
  */
 import { SettingsStore, isImmutableSettingKey, isSelfConfigWritable } from "@pinky/core";
 import type { SettingsSnapshot } from "@pinky/core";
-import { SUPPORTED_PROVIDERS } from "@pinky/runtime";
+import { SUPPORTED_EMBEDDING_PROVIDERS, SUPPORTED_PROVIDERS } from "@pinky/runtime";
 import type { Tool, ToolContext, ToolResult } from "@pinky/runtime";
 
 const SCOPES = ["agent", "channel"] as const;
@@ -111,7 +112,7 @@ function quotedJsonHint(value: unknown): string {
  * including for values whose shape is wrong, which is validateSettings' job to
  * report with its own message.
  */
-export function refuseModelValue(value: unknown): string | null {
+export function refuseModelValue(value: unknown, key = "model"): string | null {
   if (typeof value !== "string") return null;
   const slash = value.indexOf("/");
   if (slash <= 0 || slash === value.length - 1) return null; // not "a/b": shape error
@@ -119,7 +120,7 @@ export function refuseModelValue(value: unknown): string | null {
   if (provider === "fake") {
     return (
       `'${value}' is a test route: fake/* replies from a script instead of a model. ` +
-      `A human can set it with \`pinky config set model ${value}\`.`
+      `A human can set it with \`pinky config set ${key} ${value}\`.`
     );
   }
   if (!(SUPPORTED_PROVIDERS as readonly string[]).includes(provider)) {
@@ -127,6 +128,82 @@ export function refuseModelValue(value: unknown): string | null {
       `unknown provider '${provider}' in '${value}'; this build can route: ` +
       `${SUPPORTED_PROVIDERS.join(", ")}`
     );
+  }
+  return null;
+}
+
+/**
+ * The same refusal for `memory.embeddingModel`, against the EMBEDDING routes.
+ *
+ * Not a copy of {@link refuseModelValue} for tidiness — the two lists genuinely
+ * differ. `anthropic/claude-x` is a fine `model` and an unroutable embedder,
+ * and `"none"` is a legal embeddingModel (it disables the vector voice) and a
+ * meaningless model.
+ *
+ * The stakes here are the HIGHER of the two, which is why this is a refusal and
+ * not a comment: `createEmbedder` throws for an unknown provider, and the
+ * wiring layer rethrows anything that is not the blank-key "embeddings
+ * disabled" case (cli/index.ts `openEmbedder`) — so a bad value does not
+ * degrade recall, it BRICKS THE NEXT BOOT of every surface, `pinky memory` and
+ * `pinky headless` included. A tool error now beats an unbootable process
+ * later.
+ */
+export function refuseEmbeddingModelValue(
+  value: unknown,
+  key = "memory.embeddingModel",
+): string | null {
+  if (typeof value !== "string") return null;
+  // "none" is the documented way to turn the vector voice off; "" is a shape
+  // error and validateSettings' to report, with its own message.
+  if (value === "" || value === "none") return null;
+  const slash = value.indexOf("/");
+  if (slash <= 0 || slash === value.length - 1) return null; // not "a/b": shape error
+  const provider = value.slice(0, slash);
+  // Minus "none": it is a whole-value sentinel, not a provider — `none/x`
+  // reaches createEmbedder's `default:` and throws like any other unknown.
+  const routable = SUPPORTED_EMBEDDING_PROVIDERS.filter((p) => p !== "none");
+  if ((routable as readonly string[]).includes(provider)) return null;
+  return (
+    `unknown embedding provider '${provider}' in '${value}'; this build can embed with: ` +
+    `${routable.join(", ")} (or "none" to run recall FTS-only). ` +
+    `A human can set it with \`pinky config set ${key} ${value}\`.`
+  );
+}
+
+/**
+ * How deep {@link refuseModelsIn} walks. The settings tree is two levels
+ * (`sleep.model`), so 3 is slack, not a policy — and a bound is required at
+ * all because the value is whatever JSON the model sent.
+ */
+const MODEL_WALK_DEPTH = 3;
+
+/**
+ * Every refusal reachable from ONE write, not just the one at `key`.
+ *
+ * The keyed check this replaced (`key === "model" || key === "sleep.model"`)
+ * had a hole with teeth: `sleep` is itself a legal, non-immutable key, so
+ * `settings_set { key: "sleep", value: { …, model: "fake/echo" } }` under a
+ * `"*"` allow-list validated and inserted cleanly — and pointed the
+ * sleep-time worker at a scripted route on the next boot, whose answers become
+ * durable MEMORY ROWS (slice 6). A parent object is the same write as its
+ * leaves, so it has to face the same guard.
+ *
+ * The rule is therefore positional, not enumerated: any `model` or
+ * `embeddingModel` LEAF the value would land in the snapshot is checked,
+ * wherever the write happens to enter the tree — each against ITS OWN provider
+ * list, which is why the two leaves do not share a checker. Nothing else about
+ * the value is inspected: shape is `validateSettings`' job, and an unknown key
+ * is rejected there anyway.
+ */
+export function refuseModelsIn(key: string, value: unknown, depth = 0): string | null {
+  const leaf = key.slice(key.lastIndexOf(".") + 1);
+  if (leaf === "model") return refuseModelValue(value, key);
+  if (leaf === "embeddingModel") return refuseEmbeddingModelValue(value, key);
+  if (depth >= MODEL_WALK_DEPTH) return null;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  for (const [name, child] of Object.entries(value as Record<string, unknown>)) {
+    const denied = refuseModelsIn(key === "" ? name : `${key}.${name}`, child, depth + 1);
+    if (denied) return denied;
   }
   return null;
 }
@@ -186,7 +263,11 @@ export class SettingsSetTool implements Tool {
     "Works only for keys a human delegated (see settings_get) and only in your agent or channel scope. " +
     "The value is validated before it is stored, so a bad one comes back as an error you can correct and " +
     "nothing is written. The change takes effect on your NEXT run — this run keeps the snapshot it " +
-    "started with. tenantId and selfConfig itself can never be changed this way.";
+    "started with. tenantId and selfConfig itself can never be changed this way. " +
+    "sleep.* is delegable, but the sleep-time worker's timer reads it ONCE when the process boots, so a " +
+    "change there takes effect on the next restart rather than the next run. Treat sleep.* as a SPEND " +
+    "delegation: every sweep is up to maxThreadsPerSweep x 2 LLM calls, repeated every intervalMs, so " +
+    "shortening the interval or widening the thread cap multiplies the bill without any turn to show for it.";
   readonly parameters = {
     type: "object",
     properties: {
@@ -260,10 +341,16 @@ export class SettingsSetTool implements Tool {
       return fail(`${this.name}: no agent id in this context, so there is no scope to write to`);
     }
 
-    if (key === "model") {
-      const denied = refuseModelValue(value);
-      if (denied) return fail(`${this.name}: ${denied}`);
-    }
+    // Every model-ish leaf this write would land, at any depth — `model`,
+    // `sleep.model`, `memory.embeddingModel`, and the same fields inside a
+    // parent object written whole.
+    // `sleep.model` is the same hazard as `model` one level down (slice 6):
+    // the sleep-time worker's answers become MEMORY ROWS, so a scripted route
+    // there writes durable facts into the plane on the next sweep, and the
+    // rows outlive the setting. `""` (meaning "use the run model") has no
+    // provider prefix, so it passes and stays writable.
+    const deniedModel = refuseModelsIn(key, value);
+    if (deniedModel) return fail(`${this.name}: ${deniedModel}`);
 
     const scope = scopeArg === "channel" ? `channel:${ctx.thread.channelId}` : `agent:${ctx.agentId}`;
     const previous = readSettingPath(snapshot, key);

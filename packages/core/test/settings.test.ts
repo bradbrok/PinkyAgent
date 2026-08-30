@@ -1,6 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import {
+  MAX_SLEEP_EVENTS_PER_PASS,
+  MAX_SLEEP_REFLECT_BATCH,
+  MAX_SLEEP_THREADS_PER_SWEEP,
   MAX_TOOL_SEARCH_LIMIT,
+  MIN_SLEEP_INTERVAL_MS,
   MIN_APPROX_WINDOW_TOKENS,
   MIN_FRACTION_GAP,
   SELF_CONFIG_KEYS,
@@ -1600,5 +1604,206 @@ describe("SettingsStore.set on tools and mcp (the human write path)", () => {
       "tools.alwaysOn",
       ["recall", "retain"],
     ]);
+  });
+});
+
+/**
+ * Sleep-time worker settings (DESIGN.md §5.3 item 3, slice 6).
+ *
+ * Every bound here is a cost bound: the worker runs unattended on a timer, so a
+ * value that reads as "more thorough" is a value that spends money and database
+ * connections with nobody watching.
+ */
+describe("sleep (slice 6): validateSettings", () => {
+  const withSleep = (sleep: unknown) => ({ ...DEFAULT_SETTINGS, sleep });
+  const someSleep = (patch: Record<string, unknown>) =>
+    withSleep({ ...DEFAULT_SETTINGS.sleep, ...patch });
+
+  it("accepts the shipped defaults", () => {
+    expect(validateSettings(structuredClone(DEFAULT_SETTINGS)).sleep).toEqual(
+      DEFAULT_SETTINGS.sleep,
+    );
+    // Off by default: enabling an unattended LLM loop is a human act.
+    expect(DEFAULT_SETTINGS.sleep.enabled).toBe(false);
+  });
+
+  const cases: Array<[name: string, candidate: unknown, match: RegExp]> = [
+    ["a non-object sleep block", withSleep("nope"), /sleep: expected an object/],
+    [
+      "an unknown sleep key",
+      someSleep({ intervalMS: 60_000 }),
+      /sleep\.intervalMS: unknown setting key/,
+    ],
+    ["a non-boolean enabled", someSleep({ enabled: "yes" }), /sleep\.enabled: expected a boolean/],
+    [
+      "an intervalMs under the floor",
+      someSleep({ intervalMs: 9_999 }),
+      /sleep\.intervalMs: expected an integer >= 10000/,
+    ],
+    ["a fractional intervalMs", someSleep({ intervalMs: 60_000.5 }), /sleep\.intervalMs/],
+    ["a negative idleMs", someSleep({ idleMs: -1 }), /sleep\.idleMs: expected an integer >= 0/],
+    ["a fractional idleMs", someSleep({ idleMs: 1.5 }), /sleep\.idleMs/],
+    [
+      "a model with no provider prefix",
+      someSleep({ model: "kimi-k2" }),
+      /sleep\.model: expected "" \(use the run model\) or "provider\/model-id"/,
+    ],
+    ["a model with a trailing slash", someSleep({ model: "openrouter/" }), /sleep\.model/],
+    ["a non-string model", someSleep({ model: 7 }), /sleep\.model: expected a string/],
+    [
+      "maxEventsPerPass of 0",
+      someSleep({ maxEventsPerPass: 0 }),
+      /sleep\.maxEventsPerPass: expected an integer in \[1, 5000\]/,
+    ],
+    ["maxEventsPerPass past the cap", someSleep({ maxEventsPerPass: 5001 }), /sleep\.maxEventsPerPass/],
+    [
+      "maxThreadsPerSweep of 0",
+      someSleep({ maxThreadsPerSweep: 0 }),
+      /sleep\.maxThreadsPerSweep: expected an integer in \[1, 1000\]/,
+    ],
+    [
+      "maxThreadsPerSweep past the cap",
+      someSleep({ maxThreadsPerSweep: 1001 }),
+      /sleep\.maxThreadsPerSweep/,
+    ],
+    [
+      "reflectMinMemories of 0",
+      someSleep({ reflectMinMemories: 0 }),
+      /sleep\.reflectMinMemories: expected an integer >= 1/,
+    ],
+    [
+      "reflectBatch of 0",
+      someSleep({ reflectBatch: 0 }),
+      /sleep\.reflectBatch: expected an integer in \[1, 500\]/,
+    ],
+    ["reflectBatch past the cap", someSleep({ reflectBatch: 501 }), /sleep\.reflectBatch/],
+  ];
+
+  for (const [name, candidate, match] of cases) {
+    it(`rejects ${name}`, () => {
+      expect(() => validateSettings(candidate)).toThrow(match);
+    });
+  }
+
+  it("accepts the boundary values on every bound", () => {
+    expect(() =>
+      validateSettings(
+        someSleep({
+          intervalMs: MIN_SLEEP_INTERVAL_MS,
+          idleMs: 0, // 0 = no idle gate (`pinky sleep run --now`, the smoke leg)
+          model: "",
+          maxEventsPerPass: MAX_SLEEP_EVENTS_PER_PASS,
+          maxThreadsPerSweep: MAX_SLEEP_THREADS_PER_SWEEP,
+          reflectMinMemories: 1,
+          reflectBatch: MAX_SLEEP_REFLECT_BATCH,
+        }),
+      ),
+    ).not.toThrow();
+    expect(() => validateSettings(someSleep({ model: "openrouter/moonshotai/kimi-k2" }))).not.toThrow();
+    expect(MIN_SLEEP_INTERVAL_MS).toBe(10_000);
+    expect(MAX_SLEEP_EVENTS_PER_PASS).toBe(5000);
+    expect(MAX_SLEEP_THREADS_PER_SWEEP).toBe(1000);
+    expect(MAX_SLEEP_REFLECT_BATCH).toBe(500);
+  });
+
+  it("refuses a reflectBatch below reflectMinMemories, naming BOTH keys", () => {
+    // Cross-field: the batch is what a pass READS and the minimum is what it
+    // needs before it runs at all, so a batch below the minimum can never reach
+    // the threshold — the reflect pass would skip forever, silently.
+    expect(() => validateSettings(someSleep({ reflectBatch: 3, reflectMinMemories: 5 }))).toThrow(
+      /sleep\.reflectBatch: expected to be at least sleep\.reflectMinMemories/,
+    );
+    // Equal is fine: one full batch is exactly enough.
+    expect(() =>
+      validateSettings(someSleep({ reflectBatch: 5, reflectMinMemories: 5 })),
+    ).not.toThrow();
+  });
+});
+
+describe("sleep (slice 6): the derived key set", () => {
+  it("is delegable and known at every depth, straight from DEFAULT_SETTINGS", () => {
+    for (const key of [
+      "sleep",
+      "sleep.enabled",
+      "sleep.intervalMs",
+      "sleep.idleMs",
+      "sleep.model",
+      "sleep.maxEventsPerPass",
+      "sleep.maxThreadsPerSweep",
+      "sleep.reflectMinMemories",
+      "sleep.reflectBatch",
+    ]) {
+      expect(SELF_CONFIG_KEYS).toContain(key);
+      expect(isKnownSettingPath(key)).toBe(true);
+      // Unlike mcp, nothing here is host execution: a human may delegate it.
+      expect(isImmutableSettingKey(key)).toBe(false);
+    }
+  });
+
+  it("is not an open map — its children are fixed by the schema", () => {
+    expect(isKnownSettingPath("sleep.anything")).toBe(false);
+    expect(isKnownSettingPath("sleep.model.provider")).toBe(false);
+  });
+
+  it("delegates through the usual entry forms", () => {
+    expect(isSelfConfigWritable("sleep.idleMs", ["sleep.*"])).toBe(true);
+    // "sleep.*" grants the children, never the sub-tree in one write.
+    expect(isSelfConfigWritable("sleep", ["sleep.*"])).toBe(false);
+    expect(isSelfConfigWritable("sleep", ["sleep"])).toBe(true);
+    expect(isSelfConfigWritable("sleep.model", ["*"])).toBe(true);
+    expect(isSelfConfigWritable("sleep.model", ["memory.*"])).toBe(false);
+  });
+});
+
+describe("sleep (slice 6): through the store", () => {
+  it("repairs one bad sleep leaf and keeps the rest of the block", async () => {
+    const db = dbWithAllRows([
+      ["global", "sleep.enabled", true],
+      ["global", "sleep.intervalMs", 5],
+    ]);
+    const { store, messages } = loudStore(db);
+    const snapshot = await store.load();
+
+    expect(snapshot.sleep.intervalMs).toBe(DEFAULT_SETTINGS.sleep.intervalMs);
+    expect(snapshot.sleep.enabled).toBe(true); // the good row survived
+    expect(messages.join("\n")).toContain("sleep.intervalMs");
+  });
+
+  it("escalates a cross-field conflict to the sleep sub-tree, never throwing", async () => {
+    // reflectBatch is at its DEFAULT and still wrong (50 < 400), so resetting
+    // that leaf again cannot help — the conflict is with its sibling, and the
+    // repair is the whole block. A wake with default sleep settings is a
+    // working agent; a throw here would be a dead one.
+    const db = dbWithAllRows([["global", "sleep.reflectMinMemories", 400]]);
+    const { store, messages } = loudStore(db);
+    const snapshot = await store.load();
+
+    expect(snapshot.sleep).toEqual(DEFAULT_SETTINGS.sleep);
+    expect(messages.join("\n")).toContain('falling back to the default for "sleep"');
+  });
+
+  it("set() rejects a bad value before any insert, and writes a good one plainly", async () => {
+    const bad = dbWithScopedRows([]);
+    await expect(new SettingsStore(bad).set("global", "sleep.intervalMs", 1_000)).rejects.toThrow(
+      /sleep\.intervalMs: expected an integer >= 10000/,
+    );
+    expect(insertCalls(bad)).toHaveLength(0);
+
+    const ok = dbWithScopedRows([]);
+    await new SettingsStore(ok).set("agent:pinky", "sleep.model", "openrouter/moonshotai/kimi-k2");
+    // JSONB CONTRACT: the value itself, never JSON.stringify(...).
+    expect(insertCalls(ok)[0]!.params).toEqual([
+      "agent:pinky",
+      "sleep.model",
+      "openrouter/moonshotai/kimi-k2",
+    ]);
+  });
+
+  it("set() sees the cross-field rule against the scope's effective snapshot", async () => {
+    const db = dbWithScopedRows([["global", "sleep.reflectMinMemories", 100]]);
+    await expect(new SettingsStore(db).set("global", "sleep.reflectBatch", 10)).rejects.toThrow(
+      /at least sleep\.reflectMinMemories/,
+    );
+    expect(insertCalls(db)).toHaveLength(0);
   });
 });

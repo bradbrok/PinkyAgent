@@ -80,6 +80,19 @@ export interface RecallScope {
   channelId?: string;
   /** Subject user whose `user`-visibility rows are visible (DMs only). */
   userId?: string;
+  /**
+   * SLEEP-WORKER ONLY (DESIGN.md §5.3 item 3, slice 6): read `channel`-visibility
+   * rows of EVERY channel, not just `channelId`'s.
+   *
+   * Never set by a conversation run — a run sees exactly one channel, and that
+   * is the whole point of `channel` visibility (§5.1). The reflect pass is the
+   * one reader that is legitimately cross-thread: it consolidates the plane
+   * itself, so it has to be able to SEE what extraction wrote, and extraction
+   * writes `channel` by default. What it may then WRITE stays narrow — an
+   * insight drawn from one channel stays in that channel, and one drawn from
+   * two is dropped rather than widened to the tenant (see reflect.ts).
+   */
+  allChannels?: boolean;
   /** DM or trusted local surface: include `user` rows for userId. */
   includeUser: boolean;
   /** Trusted local surface (cli) or the agent's own DM: include the agent's `private` rows. */
@@ -114,6 +127,42 @@ export interface SearchInput {
   weights?: { recency?: number; relevance?: number; importance?: number };
   /** Injectable clock for the recency decay. */
   now?: Date;
+}
+
+/**
+ * Watermark read for the sleep-time worker (DESIGN.md §5.3 item 3, slice 6):
+ * "every current row in scope recorded after this point, oldest first".
+ *
+ * The watermark is a TUPLE, not a timestamp. `recorded_at` defaults to `now()`,
+ * which in Postgres is the transaction's start time, so every row a single
+ * transaction retains shares it exactly — a timestamp-only cursor set to that
+ * value would skip every sibling but one, permanently. `(recorded_at, id)` is
+ * unique because `id` is the primary key.
+ */
+export interface MemorySinceInput {
+  scope: RecallScope;
+  /** Exclusive: rows strictly after this tuple. `null` = from the beginning. */
+  after: { recordedAt: string; id: string } | null;
+  limit: number;
+  kinds?: MemoryKind[];
+  /**
+   * Narrow to these visibilities, INTERSECTED with the scope predicate — it can
+   * only ever remove rows the scope already allowed, never add one. The reflect
+   * pass uses it to keep `user`/`private` rows out of a batch whose synthesized
+   * insight lands at `tenant` visibility (§5.1: a shared insight must not carry
+   * one user's facts into the shared scope).
+   */
+  visibilities?: MemoryVisibility[];
+  /**
+   * Drop rows whose `meta.source` is one of these (slice 6).
+   *
+   * The reflect pass excludes `"sleep:reflect"`, because otherwise it CONSUMES
+   * ITS OWN OUTPUT: an insight lands at tenant/channel visibility under the same
+   * agent, after the watermark, so the next pass reads it back as fresh
+   * material. With a low `reflectMinMemories` that is a loop which sustains
+   * itself forever on zero new conversation — consolidating consolidations.
+   */
+  excludeSources?: string[];
 }
 
 export interface MemoryHit extends MemoryRow {
@@ -160,6 +209,15 @@ export const DEFAULT_ID_PREFIX_LIMIT = 2;
  * concatenated into a LIKE pattern.
  */
 const ID_PREFIX_RE = /^[0-9a-f-]{4,36}$/;
+
+/**
+ * `recorded_at` at the precision the application can actually see it
+ * (see {@link MemoryStore.since}): postgres.js hands a timestamptz back through
+ * `new Date(text)`, which truncates microseconds, so a watermark round-tripped
+ * through JS is a MILLISECOND value. Both the cursor comparison and the ORDER
+ * BY use this expression so the two agree exactly.
+ */
+const RECORDED_MS = `date_trunc('milliseconds', recorded_at)`;
 
 /** Every column the store reads. `embedding`/`tsv` are never selected: the
  *  first may not exist (no pgvector) and neither is useful in JS. */
@@ -286,6 +344,7 @@ function normalizeImportance(value: number | undefined): number {
  *        visibility = 'global'
  *     OR visibility = 'tenant'
  *     OR (visibility = 'channel' AND channel_id = $c)   -- only with scope.channelId
+ *     OR visibility = 'channel'                         -- only with allChannels
  *     OR (visibility = 'user'    AND user_id    = $u)   -- only with includeUser + userId
  *     OR visibility = 'private'                         -- only with includePrivate
  *   )
@@ -297,6 +356,13 @@ function normalizeImportance(value: number | undefined): number {
  * The channel/user arms are omitted rather than bound to NULL, because
  * `channel_id = NULL` is NULL, not false — a subtle way to write a clause that
  * looks like a filter and matches nothing. Omitting says what is meant.
+ *
+ * `allChannels` REPLACES the channelId arm rather than joining it: the bare
+ * `visibility = 'channel'` strictly subsumes `visibility = 'channel' and
+ * channel_id = $c`, so emitting both would bind a parameter that cannot change
+ * a single row — and a redundant clause inside a privacy predicate is one a
+ * later reader has to re-derive as harmless before they can touch it. One arm,
+ * one meaning.
  *
  * `includeInvalid` drops the `valid_to is null` conjunct; that is the ONLY
  * caller-visible switch, and only `list()` uses it (audit/CLI history).
@@ -313,7 +379,11 @@ export function scopePredicate(
   const agent = `$${params.length}`;
 
   const arms: string[] = ["visibility = 'global'", "visibility = 'tenant'"];
-  if (scope.channelId) {
+  if (scope.allChannels) {
+    // Cross-channel read (slice 6). Subsumes the channelId arm, so that one is
+    // not also emitted — see the note above.
+    arms.push("visibility = 'channel'");
+  } else if (scope.channelId) {
     params.push(scope.channelId);
     arms.push(`(visibility = 'channel' and channel_id = $${params.length})`);
   }
@@ -335,6 +405,52 @@ function kindsClause(kinds: MemoryKind[] | undefined, params: unknown[]): string
   // Explicit ::text[] cast: without it the driver's inferred array type and
   // the column's text type do not always unify on `= any($n)`.
   return ` and kind = any($${params.length}::text[])`;
+}
+
+/**
+ * Optional `and visibility = any(...)` fragment (slice 6). Unlike
+ * {@link kindsClause}, an EMPTY array throws rather than meaning "unfiltered":
+ * this narrows a privacy boundary, and a filter that silently widens itself
+ * when its list comes back empty is exactly the bug §5.1 cannot afford. Omit
+ * the field to mean no restriction.
+ */
+function visibilitiesClause(
+  visibilities: MemoryVisibility[] | undefined,
+  params: unknown[],
+): string {
+  if (visibilities === undefined) return "";
+  if (visibilities.length === 0) {
+    throw new Error(
+      "memory: visibilities must name at least one visibility (omit the field for no restriction)",
+    );
+  }
+  for (const v of visibilities) assertVisibility(v);
+  params.push(visibilities);
+  return ` and visibility = any($${params.length}::text[])`;
+}
+
+/**
+ * Optional `and coalesce(meta->>'source', '') <> all(...)` fragment (slice 6).
+ *
+ * The COALESCE is the whole point: `meta->>'source'` is NULL for every row that
+ * never recorded one (anything a human or the agent retained), and `NULL <> all
+ * (...)` is NULL, not true — so without it the filter would silently drop every
+ * row it was not asked about, which is most of the plane. `''` stands in for
+ * "no source" and matches no real source string.
+ *
+ * Empty array throws, for the same reason as {@link visibilitiesClause}: an
+ * exclusion list that came back empty must not read as "exclude nothing" by
+ * accident. Omit the field to mean that.
+ */
+function excludeSourcesClause(sources: string[] | undefined, params: unknown[]): string {
+  if (sources === undefined) return "";
+  if (sources.length === 0) {
+    throw new Error(
+      "memory: excludeSources must name at least one source (omit the field for no restriction)",
+    );
+  }
+  params.push(sources);
+  return ` and coalesce(meta->>'source', '') <> all($${params.length}::text[])`;
 }
 
 export interface FuseOptions {
@@ -448,6 +564,17 @@ export interface MemoryStoreOptions {
 }
 
 /**
+ * The `supportsVectors()` cache, held in a cell rather than a field so
+ * {@link MemoryStore.bind} can hand the SAME cache to a tx-scoped store instead
+ * of a copy: whichever store probes first answers for both, and a bound store
+ * never issues a second information_schema query inside a caller's transaction.
+ */
+interface VectorProbe {
+  /** Null = not probed yet, or the last probe failed (so it is retried). */
+  promise: Promise<boolean> | null;
+}
+
+/**
  * Read/write access to the memory plane for one tenant.
  *
  * `db` should be withTenant()-wrapped so the RLS policy has its GUC; the
@@ -459,8 +586,9 @@ export class MemoryStore {
   private db: Db;
   private tenantId: string;
   private onWarning: (message: string) => void;
-  /** Cached promise, so N concurrent recalls issue ONE probe (and share it). */
-  private vectorProbe: Promise<boolean> | null = null;
+  /** Cached promise, so N concurrent recalls issue ONE probe (and share it).
+   *  Shared by reference with every store {@link MemoryStore.bind} produced. */
+  private vectorProbe: VectorProbe = { promise: null };
 
   /**
    * The width `memories.embedding` accepts. A vector of any other length is
@@ -494,7 +622,8 @@ export class MemoryStore {
    * elsewhere) would otherwise answer for ours.
    */
   supportsVectors(): Promise<boolean> {
-    if (this.vectorProbe) return this.vectorProbe;
+    const cell = this.vectorProbe;
+    if (cell.promise) return cell.promise;
     const probe = this.db
       .query<{ ok: number }>(
         `select 1 as ok from information_schema.columns
@@ -502,11 +631,38 @@ export class MemoryStore {
            and table_schema = current_schema()`,
       )
       .then((rows) => rows.length > 0);
-    this.vectorProbe = probe;
+    cell.promise = probe;
     probe.catch(() => {
-      if (this.vectorProbe === probe) this.vectorProbe = null;
+      if (cell.promise === probe) cell.promise = null;
     });
     return probe;
+  }
+
+  /**
+   * The same store over another {@link Db} — a transaction handle — sharing
+   * this store's tenant id, warning sink AND vector probe (slice 6).
+   *
+   * Why it composes with a transaction the CALLER owns: pg.ts's `tx()` reuses a
+   * tx-scoped client IN PLACE when a nested transaction is requested (no nested
+   * BEGIN), so `store.bind(tx).update(...)` — which opens its own `tx()` to pair
+   * the invalidate with the replacement insert — runs inside the caller's
+   * transaction and commits or rolls back with it. The tenant GUC that
+   * withTenant() set at the head of that transaction is still in force too, so
+   * RLS keys on the right tenant.
+   *
+   * The probe is shared rather than re-run because it is an information_schema
+   * read: issuing it from inside the caller's transaction would be a second
+   * statement on the critical path for an answer the parent already has, and
+   * running it as a fresh statement per pass would multiply it by every write.
+   *
+   * This is the ONLY way to write memories inside someone else's transaction —
+   * the sleep worker's whole safety argument is that its rows and its receipt
+   * commit together (DESIGN.md §5.3 item 3).
+   */
+  bind(db: Db): MemoryStore {
+    const bound = new MemoryStore(db, this.tenantId, { onWarning: this.onWarning });
+    bound.vectorProbe = this.vectorProbe; // the same cell, not a copy
+    return bound;
   }
 
   /** Write a new memory (§5.2: rows are only ever added). */
@@ -663,6 +819,74 @@ export class MemoryStore {
       `select ${COLUMNS} from memories
        where tenant_id = $1 and ${where}${kinds}
        order by recorded_at desc, id desc
+       limit $${params.length}`,
+      params,
+    );
+    return rows.map(mapRow);
+  }
+
+  /**
+   * Current rows in scope recorded strictly after a tuple watermark, OLDEST
+   * first — the sleep worker's reflect batch (DESIGN.md §5.3 item 3, slice 6).
+   *
+   * The opposite direction from {@link MemoryStore.list} on purpose: a
+   * consolidation pass consumes the plane forwards, so its watermark advances
+   * monotonically and the pass is resumable from the log alone. See
+   * {@link MemorySinceInput} for why the cursor is `(recorded_at, id)` and not
+   * a timestamp.
+   *
+   * `(..., id) > ($ts, $id)` is a ROW comparison, which is lexicographic over
+   * the tuple — "later, or the same instant with a larger id".
+   *
+   * BOTH SIDES ARE TRUNCATED TO MILLISECONDS, and that is load-bearing.
+   * `recorded_at` is timestamptz, i.e. MICROSECOND precision, but the watermark
+   * a caller hands back came out of {@link MemoryRow.recordedAt} — postgres.js
+   * parses a timestamp with `new Date(text)`, which DROPS the sub-millisecond
+   * digits. Compared against the raw column, the boundary row's own
+   * `recorded_at` (…123456) is still strictly greater than the watermark it
+   * produced (…123000), so the pass re-reads it — and since `recorded_at`
+   * defaults to `now()`, which is the TRANSACTION's start time, every row a
+   * batch's last transaction wrote comes back too. The cursor would never
+   * advance past such a group. `date_trunc('milliseconds', ...)` on the column
+   * puts both sides in the same precision, which makes the cut exact.
+   *
+   * The ORDER BY uses the SAME expression, deliberately. Ordering by the raw
+   * column while cutting on the truncated one lets two rows inside one
+   * millisecond disagree about which came first, and a row on the wrong side of
+   * that disagreement is skipped FOREVER — losing a row is worse than re-reading
+   * one, so the two expressions have to be identical.
+   *
+   * `id` is `text`, so its half of both the comparison and the ORDER BY is
+   * collation-dependent; they use the SAME collation, so the order is total and
+   * consistent, but a test must not assume it matches a JS `.sort()` (the CI
+   * image is glibc en_US, alpine is C).
+   *
+   * Scope goes through {@link scopePredicate} like every other read (§5.1);
+   * `visibilities` and `excludeSources` can only narrow it further — the latter
+   * is what stops the reflect pass reading its own insights back as fresh
+   * material (see {@link MemorySinceInput}).
+   */
+  async since(input: MemorySinceInput): Promise<MemoryRow[]> {
+    // Clamped, never trusted: a non-finite limit would bind NaN as the LIMIT
+    // and take the whole statement down with a parse error naming no column.
+    const limit = Number.isFinite(input.limit) ? Math.max(1, Math.floor(input.limit)) : 1;
+    const params: unknown[] = [this.tenantId];
+    const where = scopePredicate(input.scope, params);
+    const kinds = kindsClause(input.kinds, params);
+    const visibilities = visibilitiesClause(input.visibilities, params);
+    const excluded = excludeSourcesClause(input.excludeSources, params);
+    let after = "";
+    if (input.after) {
+      params.push(input.after.recordedAt);
+      const ts = `$${params.length}::timestamptz`;
+      params.push(input.after.id);
+      after = ` and (${RECORDED_MS}, id) > (${ts}, $${params.length}::text)`;
+    }
+    params.push(limit);
+    const rows = await this.db.query<MemoryRowRaw>(
+      `select ${COLUMNS} from memories
+       where tenant_id = $1 and ${where}${kinds}${visibilities}${excluded}${after}
+       order by ${RECORDED_MS} asc, id asc
        limit $${params.length}`,
       params,
     );

@@ -10,8 +10,10 @@
  *   pinky memory search "<query>" [--limit N]
  *   pinky memory show <id-or-prefix>
  *   pinky memory forget <id-or-prefix> [--reason "..."]
+ *   pinky sleep run [--now] [--channel <id>] [--thread <id>] [--limit N]  one sweep, now
  *   pinky stats restarts [--channel <id>] [--limit N]   what context restarts cost
  *   pinky stats cache [--channel <id>] [--thread <id>] [--limit N]  prompt-cache hit rate
+ *   pinky stats sleep [--channel <id>] [--limit N]      what the sleep worker wrote
  *   pinky mcp list                         configured MCP servers and their state
  *   pinky mcp sync [<server>...] [--timeout-ms N]   connect and republish the catalog
  *   pinky tools list [--scope <scope>...]  head vs deferred, as a run would partition it
@@ -49,6 +51,7 @@ import {
   assertScope,
   parseA2AAddress,
   threadKey,
+  DEFAULT_SETTINGS,
   type CatalogRecord,
   type Db,
   type EnvConfig,
@@ -56,7 +59,9 @@ import {
   type MemoryRow,
   type RecallScope,
   type SettingsSnapshot,
+  type ThreadEventData,
   type ThreadRef,
+  type TokenUsage,
 } from "@pinky/core";
 import {
   createEmbedder,
@@ -67,6 +72,7 @@ import {
   runAgentLoop,
   buildSystemPrompt,
   FAKE_DEFERRED_MARKER,
+  FAKE_SLEEP_REFLECT_PREFIX,
   DeferredToolRegistry,
   FakeEmbedder,
   FakeProvider,
@@ -86,6 +92,18 @@ import {
 import { runHeadless, startGateway, type RawIngress, type WakeEnqueue } from "@pinky/gateway";
 import { createTools } from "@pinky/tools";
 import { McpManager, defaultTransportFactory, type McpServerState } from "@pinky/mcp";
+import {
+  reflectThread,
+  startSleepSweep,
+  // Aliased: `startA2ASweep` already has a local `sweep`, and two different
+  // sweeps in one file should not be told apart by scope alone.
+  sweep as sleepSweep,
+  type ExtractReceipt,
+  type ReflectReceipt,
+  type SleepDeps,
+  type SleepScope,
+  type SweepReport,
+} from "@pinky/sleep";
 
 const SCHEMA_DIR = new URL("../../core/schema", import.meta.url).pathname;
 
@@ -424,6 +442,12 @@ export function makeRunAgent(boot: Bootstrap, opts: RunAgentOptions): RunAgent {
   // identical text on a long-lived process.
   const bootServers = JSON.stringify(boot.settings.mcp.servers);
   const warnedServers = new Set<string>();
+  // `sleep.*` is read once at bootstrap for the same reason (slice 6): the
+  // sweep timer belongs to the PROCESS and walks every thread of the tenant,
+  // so a channel-scoped row has no thread to be about. Warned here rather than
+  // in the timer because this is the only place a reloaded snapshot is seen.
+  const bootSleep = JSON.stringify(boot.settings.sleep);
+  const warnedSleep = new Set<string>();
 
   return async (thread, overrides = {}, batch) => {
     const settings = opts.settingsFor ? await opts.settingsFor(thread) : boot.settings;
@@ -436,6 +460,16 @@ export function makeRunAgent(boot: Bootstrap, opts: RunAgentOptions): RunAgent {
         `[mcp] channel ${thread.channelId} overrides mcp.servers; IGNORED — the MCP plane is ` +
           "built once at startup from the global + agent scopes. Set servers there, or run a " +
           "separate process for that channel.",
+      );
+    }
+
+    const runSleep = JSON.stringify(settings.sleep);
+    if (runSleep !== bootSleep && !warnedSleep.has(runSleep)) {
+      warnedSleep.add(runSleep);
+      logStderr(
+        `[sleep] channel ${thread.channelId} overrides sleep.*; IGNORED — the sweep timer is ` +
+          "built once at startup from the global + agent scopes. Set it there (and restart), or " +
+          "run a separate process for that channel.",
       );
     }
 
@@ -1015,11 +1049,14 @@ const mean = (xs: number[]): number | null =>
   xs.length === 0 ? null : xs.reduce((a, b) => a + b, 0) / xs.length;
 
 const STATS_USAGE =
-  "usage: pinky stats <restarts|cache> ...\n" +
+  "usage: pinky stats <restarts|cache|sleep> ...\n" +
   "  pinky stats restarts [--channel <id>] [--limit N]\n" +
   "  pinky stats cache [--channel <id>] [--thread <id>] [--limit N]\n" +
   "    --limit samples the newest N turns (default 50); warm -> cold\n" +
-  "    transitions are detected within that sampled window.";
+  "    transitions are detected within that sampled window.\n" +
+  "  pinky stats sleep [--channel <id>] [--limit N]\n" +
+  "    the newest N sleep-worker receipts (default 50), both phases, every\n" +
+  "    thread — reflect receipts live on `sleep:<agentId>`.";
 
 /**
  * `pinky stats restarts` — what context restarts cost this tenant.
@@ -1452,12 +1489,486 @@ async function cmdStatsCache(raw: string[]): Promise<void> {
   }
 }
 
-/** `pinky stats <restarts|cache>` — the DESIGN.md §13 eval, as two queries. */
+// --- stats sleep -----------------------------------------------------------
+//
+// DESIGN.md §12 slice 6 says the sleep-time worker is "measured with `pinky
+// stats`", and there is nothing to instrument: every pass journals a receipt
+// (`sleep`/`extract` per thread, `sleep`/`reflect` on the worker's own thread)
+// inside the transaction that made its memory writes, so what the worker cost
+// and what it produced are already two columns of one query.
+
+/** One `sleep` receipt. Both phases share the row; `phase` says which. */
+interface SleepRow {
+  channel_id: string;
+  thread_id: string;
+  seq: number | string;
+  ts: string;
+  phase: string | null;
+  from_seq: number | null;
+  to_seq: number | null;
+  /** reflect only: the watermark this pass advanced the memory plane to. */
+  through_at: string | null;
+  scanned: number | null;
+  candidates: number | null;
+  added: number | null;
+  updated: number | null;
+  invalidated: number | null;
+  noop: number | null;
+  model: string | null;
+  usage_input: number | null;
+  usage_output: number | null;
+  usage_cache_read: number | null;
+  usage_cache_creation: number | null;
+  ms: number | null;
+}
+
+/**
+ * Every receipt, newest first, across EVERY thread — `sleep:<agentId>`
+ * included, because that is where the reflect receipts live (the worker
+ * journals its cross-thread bookkeeping in the log like everything else, and
+ * discovery excludes that channel so it can never extract from itself).
+ *
+ * Every count comes back through a `::int` cast (the jsonb accessors are
+ * text); `seq` is `bigint`, a STRING on the wire, so it goes through
+ * `toSeqNumber` before it is compared to anything.
+ */
+const SLEEP_SQL = `
+  select channel_id,
+         thread_id,
+         seq::int                               as seq,
+         ts,
+         data->>'phase'                         as phase,
+         (data->>'fromSeq')::int                as from_seq,
+         (data->>'toSeq')::int                  as to_seq,
+         data->'through'->>'recordedAt'         as through_at,
+         (data->>'scanned')::int                as scanned,
+         (data->>'candidates')::int             as candidates,
+         (data->>'added')::int                  as added,
+         (data->>'updated')::int                as updated,
+         (data->>'invalidated')::int            as invalidated,
+         (data->>'noop')::int                   as noop,
+         data->>'model'                         as model,
+         (data->'usage'->>'input')::int         as usage_input,
+         (data->'usage'->>'output')::int        as usage_output,
+         (data->'usage'->>'cacheRead')::int     as usage_cache_read,
+         (data->'usage'->>'cacheCreation')::int as usage_cache_creation,
+         (data->>'ms')::int                     as ms
+    from events
+   where tenant_id = $1
+     and type = 'sleep'
+     and ($2::text is null or channel_id = $2)
+   order by ts desc, seq desc
+   limit $3`;
+
+/**
+ * What the worker actually put in the plane, counted from the plane itself
+ * rather than summed off the receipts.
+ *
+ * The two numbers answer different questions and are both worth having: the
+ * receipts say how many rows each pass WROTE, this says how many of them are
+ * still CURRENT — a row the agent (or a later reflection) has since
+ * invalidated is history, not belief (DESIGN.md §5.2).
+ */
+const SLEEP_MEMORY_SQL = `
+  select count(*)::int as n
+    from memories
+   where tenant_id = $1
+     and valid_to is null
+     and meta->>'source' like 'sleep:%'`;
+
+/** Width of the range column: `1..240` or `-> 2026-08-29T12:00:00`. */
+const RANGE_COL = 24;
+
+/** What range of material this pass consumed — a seq span, or a watermark. */
+function sleepRange(row: SleepRow): string {
+  if (row.phase === "reflect") return `-> ${(row.through_at ?? "-").slice(0, 19)}`;
+  return `${count(row.from_seq)}..${count(row.to_seq)}`;
+}
+
+/** Sum of the four numbers `pinky sleep run` prints as `+A ~U -D =N`. */
+function sleepCounts(row: SleepRow): string {
+  return `+${count(row.added)} ~${count(row.updated)} -${count(row.invalidated)} =${count(row.noop)}`;
+}
+
+/** Billed tokens for one receipt, or `-` when no call reported usage. */
+function sleepTokens(row: SleepRow): string {
+  if (
+    row.usage_input === null &&
+    row.usage_output === null &&
+    row.usage_cache_read === null &&
+    row.usage_cache_creation === null
+  ) {
+    return "-";
+  }
+  return String(
+    (row.usage_input ?? 0) +
+      (row.usage_output ?? 0) +
+      (row.usage_cache_read ?? 0) +
+      (row.usage_cache_creation ?? 0),
+  );
+}
+
+/** Per-phase totals. `tokens` is summed only over receipts that reported any. */
+interface SleepTotals {
+  passes: number;
+  scanned: number;
+  candidates: number;
+  added: number;
+  updated: number;
+  invalidated: number;
+  noop: number;
+  tokens: number;
+  /** Receipts whose pass reported usage — the `tokens` denominator. */
+  measured: number;
+  ms: number;
+}
+
+function totalSleep(rows: SleepRow[]): SleepTotals {
+  const totals: SleepTotals = {
+    passes: rows.length,
+    scanned: 0,
+    candidates: 0,
+    added: 0,
+    updated: 0,
+    invalidated: 0,
+    noop: 0,
+    tokens: 0,
+    measured: 0,
+    ms: 0,
+  };
+  for (const row of rows) {
+    totals.scanned += row.scanned ?? 0;
+    totals.candidates += row.candidates ?? 0;
+    totals.added += row.added ?? 0;
+    totals.updated += row.updated ?? 0;
+    totals.invalidated += row.invalidated ?? 0;
+    totals.noop += row.noop ?? 0;
+    totals.ms += row.ms ?? 0;
+    const tokens = sleepTokens(row);
+    if (tokens !== "-") {
+      totals.tokens += Number(tokens);
+      totals.measured++;
+    }
+  }
+  return totals;
+}
+
+function sleepTotalsLine(phase: string, rows: SleepRow[]): string {
+  const t = totalSleep(rows);
+  return (
+    `${padRight(phase, 8)} ${t.passes} pass(es)  scanned ${t.scanned}  candidates ${t.candidates}  ` +
+    `+${t.added} ~${t.updated} -${t.invalidated} =${t.noop}  ` +
+    `tokens ${t.measured === 0 ? "n/a" : `${t.tokens} over ${t.measured} measured pass(es)`}  ` +
+    `ms ${t.ms}`
+  );
+}
+
+/**
+ * `pinky stats sleep` — what the sleep-time worker has done to this tenant.
+ *
+ * Read-only, so it does not migrate and takes no embedder — but it DOES boot
+ * with `agent:pinky` in scope, unlike the other two stats commands: `tenantId`
+ * is overlayable, and the receipts were written by `pinky sleep run` /
+ * `pinky headless`, both of which resolve it from exactly this overlay.
+ * Reading them back under a narrower snapshot could look in the wrong tenant.
+ */
+async function cmdStatsSleep(raw: string[]): Promise<void> {
+  const { flags } = parseFlags(raw);
+  const channel = stringFlag(flags, "channel");
+  const limit = intFlag(flags, "limit", 50);
+
+  const boot = await bootstrap({
+    migrate: false,
+    embedder: null,
+    mcp: false,
+    scopes: [`agent:${AGENT_ID}`],
+  });
+  try {
+    const rows = await boot.db.query<SleepRow>(SLEEP_SQL, [
+      boot.settings.tenantId,
+      channel ?? null,
+      limit,
+    ]);
+
+    console.log(
+      `${padRight("thread", THREAD_COL)}  ${padRight("phase", 7)}  ${padRight("range", RANGE_COL)}  ` +
+        `${padLeft("scanned", 7)}  ${padLeft("cand", 4)}  ${padRight("written", 16)}  ` +
+        `${padLeft("tokens", 7)}  ${padLeft("ms", 6)}`,
+    );
+    for (const row of rows) {
+      console.log(
+        `${padRight(clip(`${row.channel_id}/${row.thread_id}`, THREAD_COL), THREAD_COL)}  ` +
+          `${padRight(row.phase ?? "-", 7)}  ${padRight(sleepRange(row), RANGE_COL)}  ` +
+          `${padLeft(count(row.scanned), 7)}  ${padLeft(count(row.candidates), 4)}  ` +
+          `${padRight(sleepCounts(row), 16)}  ${padLeft(sleepTokens(row), 7)}  ` +
+          `${padLeft(count(row.ms), 6)}`,
+      );
+    }
+    if (rows.length === 0) {
+      console.log(
+        `(no sleep receipts${channel ? ` in channel ${channel}` : ""} for tenant ${boot.settings.tenantId};` +
+          " run `pinky sleep run --now` or enable `sleep.enabled` in `pinky headless`)",
+      );
+    }
+
+    console.log("");
+    console.log(sleepTotalsLine("extract", rows.filter((r) => r.phase === "extract")));
+    console.log(sleepTotalsLine("reflect", rows.filter((r) => r.phase === "reflect")));
+    // The plane's own count, not a sum of the rows above: this one is not
+    // capped by --limit and it excludes everything since invalidated.
+    const written = await boot.db.queryOne<{ n: number }>(SLEEP_MEMORY_SQL, [
+      boot.settings.tenantId,
+    ]);
+    // Tenant-wide and NOT filtered to this command's agent, unlike the boot
+    // scope: the receipts above are every agent's too (a receipt carries no
+    // agent id — the reflect ones only encode it in their `sleep:<agentId>`
+    // channel), so filtering one half and not the other would print two
+    // numbers that cannot be compared. Say which set it is instead.
+    console.log(
+      `memories written by the worker: ${written?.n ?? 0} (current rows, all agents, all time)`,
+    );
+  } finally {
+    await boot.close();
+  }
+}
+
+/** `pinky stats <restarts|cache|sleep>` — the DESIGN.md §13 eval, as queries. */
 async function cmdStats(args: string[]): Promise<void> {
   const [sub, ...raw] = args;
   if (sub === "restarts") return cmdStatsRestarts(raw);
   if (sub === "cache") return cmdStatsCache(raw);
+  if (sub === "sleep") return cmdStatsSleep(raw);
   throw new Error(STATS_USAGE);
+}
+
+// ---------------------------------------------------------------------------
+// sleep — the sleep-time worker (DESIGN.md §5.3 item 3, slice 6)
+// ---------------------------------------------------------------------------
+
+/**
+ * Assemble the worker's dependencies for one surface.
+ *
+ * Nothing here is stateful — that is the invariant the whole slice rests on
+ * (CLAUDE.md #6): the sweep discovers its work by reading the log and journals
+ * a receipt inside the transaction that made its memory writes, so this object
+ * can be rebuilt from scratch on every process start with nothing to
+ * reconcile.
+ *
+ * The model is `sleep.model` when set and the run model otherwise, and the
+ * FULL `provider/model-id` is what gets journaled on every receipt — the log
+ * has to answer "which model wrote this memory", and a bare id could not.
+ * Splitting a worker model out at all is worth it because extraction is a
+ * structured-output job on a transcript, which a small cheap model does well,
+ * while the conversation may be on something expensive.
+ */
+function sleepDepsFor(
+  boot: Bootstrap,
+  opts: {
+    scope: SleepScope;
+    /** The snapshot to read `sleep.*` (and the fallback `model`) from. */
+    settings: SettingsSnapshot;
+    /** `--limit`: threads this sweep may touch, overriding maxThreadsPerSweep. */
+    limit?: number;
+    /** Smoke pins a per-run agent id so its reflect batch is its own rows. */
+    agentId?: string;
+    /** Smoke pins the provider (createFakeProvider), like makeRunAgent does. */
+    provider?: Provider;
+    /**
+     * Shutdown switch. Without one every abort guard in the worker is DEAD:
+     * a SIGTERM mid-sweep would leave it issuing provider calls for every
+     * remaining due thread while `boot.close()` ends the pool underneath, and
+     * the resulting failure takes the non-abort path — which journals an
+     * `error` event onto a live conversation thread for something that was
+     * only a shutdown. Every long-lived surface passes one.
+     */
+    signal?: AbortSignal;
+  },
+): SleepDeps {
+  const model = opts.settings.sleep.model || opts.settings.model;
+  return {
+    db: boot.db,
+    events: boot.events,
+    memory: boot.memory,
+    // Absent => FTS-only neighbour search and rows stored without an embedding.
+    // Degraded, never fatal (the same ladder runtime/memory-recall.ts walks).
+    ...(boot.embedder ? { embedder: boot.embedder } : {}),
+    provider: opts.provider ?? createProvider(model, process.env),
+    model,
+    agentId: opts.agentId ?? AGENT_ID,
+    tenantId: opts.settings.tenantId,
+    settings:
+      opts.limit === undefined
+        ? opts.settings.sleep
+        : { ...opts.settings.sleep, maxThreadsPerSweep: opts.limit },
+    scope: opts.scope,
+    ...(opts.signal ? { signal: opts.signal } : {}),
+    // STDERR. `pinky sleep run` prints its report on stdout because a human
+    // asked for it; everything the worker itself says is a log line, and this
+    // same deps object is what runs inside `pinky headless`.
+    log: logStderr,
+  };
+}
+
+const SLEEP_USAGE =
+  "usage: pinky sleep run [--now] [--channel <id>] [--thread <id>] [--limit N]\n" +
+  "  --now      ignore the idle gate (sleep.idleMs) for this sweep\n" +
+  "  --channel  restrict discovery to one channel\n" +
+  "  --thread   pin ONE thread (requires --channel); discovery is skipped\n" +
+  "  --limit N  threads this sweep may touch (overrides sleep.maxThreadsPerSweep)";
+
+/** `+2 ~1 -0 =3` — what a pass did to the memory plane, in one column. */
+function passCounts(r: {
+  added: number;
+  updated: number;
+  invalidated: number;
+  noop: number;
+}): string {
+  return `+${r.added} ~${r.updated} -${r.invalidated} =${r.noop}`;
+}
+
+/** Billed tokens for a pass, or `-` when no call reported usage — never 0.
+ *  "nothing counted" and "nobody counted" are different facts (CLAUDE.md #7). */
+function passTokens(usage: TokenUsage | undefined): string {
+  if (!usage) return "-";
+  return String(
+    usage.input + usage.output + (usage.cacheRead ?? 0) + (usage.cacheCreation ?? 0),
+  );
+}
+
+/** The bracketed detail both `pinky sleep run` and `pinky stats sleep` print. */
+function passDetail(receipt: ExtractReceipt | ReflectReceipt): string {
+  return (
+    `scanned ${receipt.scanned}, candidates ${receipt.candidates}, ${passCounts(receipt)}, ` +
+    `tokens ${passTokens(receipt.usage)}, ms ${receipt.ms}`
+  );
+}
+
+/** One thread's or the reflect pass's outcome, as the human reads it. */
+function passStatus(
+  result:
+    | SweepReport["threads"][number]["result"]
+    | NonNullable<SweepReport["reflect"]>,
+): string {
+  if (result.status === "done") return `done  [${passDetail(result.receipt)}]`;
+  if (result.status === "skipped") return `skipped (${result.reason})`;
+  return `failed: ${result.error}`;
+}
+
+/**
+ * `pinky sleep run` — one sweep, right now, from a terminal or a cron entry.
+ *
+ * The scheduler holds no state, so this and the `pinky headless` timer are the
+ * SAME sweep with a different trigger: whichever runs, the receipts in the log
+ * are the only record either consults. Running both is safe — the second takes
+ * the thread lock, sees the first's receipt, and reports `lost-claim`.
+ *
+ * `--thread` pins the thread set outright (discovery is skipped), which is how
+ * you re-run one conversation without waiting for its idle gate; it needs
+ * `--channel` because a thread id is only unique inside its channel.
+ *
+ * Exits 1 when any pass FAILED. Skips are the ordinary outcome — most sweeps
+ * find nothing new — and never a failure.
+ */
+async function cmdSleepRun(raw: string[]): Promise<void> {
+  const { flags } = parseFlags(raw, ["now"]);
+  const channel = stringFlag(flags, "channel");
+  const threadId = stringFlag(flags, "thread");
+  if (threadId !== undefined && channel === undefined) {
+    throw new Error(
+      "--thread requires --channel (a thread id is only unique inside its channel)",
+    );
+  }
+  const limit = flags.limit === undefined ? undefined : intFlag(flags, "limit", 1);
+
+  // No MCP plane: the worker has no tool surface of its own — it forces three
+  // fixed schemas and reads the answers — so there is nothing to spawn a
+  // configured server for. `agent:pinky` because `sleep.*` is the agent's own
+  // configuration, the same scope `pinky headless` boots with.
+  const boot = await bootstrap({ mcp: false, scopes: [`agent:${AGENT_ID}`] });
+  let failed = 0;
+  // A cron entry is exactly what a supervisor sends SIGTERM to, and a sweep
+  // holds a thread lock across two provider round trips. Aborting is what lets
+  // the pass return instead of being killed mid-transaction — and the abort
+  // path deliberately journals NO `error` event, because a shutdown is not a
+  // broken thread.
+  const interrupted = new AbortController();
+  let running: Promise<SweepReport> | undefined;
+  const stopShutdown = installShutdown({
+    drain: async () => {
+      interrupted.abort(new Error("shutdown signal"));
+      await running?.catch(() => {});
+    },
+    close: () => boot.close(),
+  });
+  try {
+    const deps = sleepDepsFor(boot, {
+      // A trusted local operator, like `pinky memory`: this terminal may read
+      // and write `user` rows (DESIGN.md §5.1). `pinky headless --shared`
+      // is the surface that narrows.
+      scope: { includeUser: true, includePrivate: true },
+      settings: boot.settings,
+      signal: interrupted.signal,
+      ...(limit !== undefined ? { limit } : {}),
+    });
+    running = sleepSweep(deps, {
+      ...(threadId !== undefined && channel !== undefined
+        ? {
+            threads: [
+              { tenantId: boot.settings.tenantId, channelId: channel, threadId },
+            ],
+          }
+        : {}),
+      ...(channel !== undefined ? { channelId: channel } : {}),
+      ...(flags.now === true ? { ignoreIdle: true } : {}),
+    });
+    const report = await running;
+
+    for (const { thread, result } of report.threads) {
+      const label = clip(`${thread.channelId}/${thread.threadId}`, THREAD_COL);
+      console.log(`${padRight(label, THREAD_COL)}  ${passStatus(result)}`);
+      if (result.status === "failed") failed++;
+    }
+    if (report.threads.length === 0) {
+      console.log(
+        `(no threads due${channel ? ` in channel ${channel}` : ""}` +
+          `${flags.now === true ? "" : `; idle gate is ${boot.settings.sleep.idleMs}ms — --now ignores it`})`,
+      );
+    }
+    // Reflection is cross-thread, so it gets its own line rather than a row.
+    // `null` means it was not attempted at all, which is not the same as a skip.
+    console.log(
+      `${padRight("reflect", THREAD_COL)}  ` +
+        (report.reflect === null ? "not attempted" : passStatus(report.reflect)),
+    );
+    if (report.reflect?.status === "failed") failed++;
+    console.log(`model ${deps.model}`);
+    // The sweep gave up after two CONSECUTIVE threads failed identically —
+    // a broken provider or a dead database, not one bad thread. Everything
+    // after it was never attempted, so `threads` above is a PARTIAL report and
+    // this run must not look like a clean one to a cron entry.
+    if (report.halted !== undefined) {
+      console.log(`halted: ${report.halted}`);
+      failed++;
+    }
+  } finally {
+    stopShutdown();
+    // Nothing is in flight on the normal path; this is so the controller never
+    // outlives the command with a live listener on it.
+    interrupted.abort(new Error("sweep finished"));
+    await boot.close();
+  }
+  if (failed > 0) {
+    console.error(
+      `sleep run: ${failed} pass(es) failed or halted (see the error events on those threads)`,
+    );
+    process.exit(1);
+  }
+}
+
+async function cmdSleep(args: string[]): Promise<void> {
+  const [sub, ...rest] = args;
+  if (sub === "run") return cmdSleepRun(rest);
+  throw new Error(SLEEP_USAGE);
 }
 
 // ---------------------------------------------------------------------------
@@ -1725,6 +2236,20 @@ const SMOKE_MCP_REAP_MS = 3_000;
 const SMOKE_MCP_PROMPT = "please echo pinky-smoke-42 through a catalog tool";
 
 /**
+ * Agent id owning every memory row and receipt the sleep leg writes (slice 6).
+ *
+ * Deliberately NOT `SMOKE_MEMORY_AGENT`: the reflect pass reads across every
+ * channel (RecallScope.allChannels), so an agent id shared with the other legs
+ * would put their canaries in its batch and make `added` unpredictable. A
+ * smoke-only id pins the batch to what this run just extracted, and makes the
+ * cleanup one exact delete — the same trick `SMOKE_MEMORY_AGENT` plays.
+ */
+const SMOKE_SLEEP_AGENT = "smoke-sleep";
+/** `fake/sleep` extracts whatever follows `remember:` verbatim, so this is the
+ *  exact text the pass must end up storing. */
+const SMOKE_SLEEP_CANARY = "the smoke sleep canary is amber-falcon";
+
+/**
  * Newest seq in a thread, or 0 when it has none — smoke's per-run mark.
  *
  * NOT `(await events.history(ref)).length`. `history()` is a FORWARD page
@@ -1825,6 +2350,9 @@ async function cmdSmoke(): Promise<void> {
   const threadM: ThreadRef = { tenantId: settings.tenantId, channelId: "cli:smoke", threadId: "memory" };
   const threadR: ThreadRef = { tenantId: settings.tenantId, channelId: "cli:smoke", threadId: "memory-recall" };
   const threadT: ThreadRef = { tenantId: settings.tenantId, channelId: "cli:smoke", threadId: "mcp-tools" };
+  const threadS: ThreadRef = { tenantId: settings.tenantId, channelId: "cli:smoke", threadId: "sleep" };
+  /** Where the reflect receipt lands: the worker's own thread (slice 6). */
+  const threadSR = reflectThread(settings.tenantId, SMOKE_SLEEP_AGENT);
 
   // `alpha` and `beta` are smoke's own addresses on this node, and the receipt
   // counts below are exact counts — so anything an interrupted earlier run
@@ -1837,11 +2365,13 @@ async function cmdSmoke(): Promise<void> {
   // Smoke reuses fixed thread ids, so the log carries every previous run.
   // Everything asserted below is read from these marks FORWARD — otherwise a
   // run that journaled nothing would still "pass" on yesterday's events.
-  const [markA, markB, markM, markT] = await Promise.all([
+  const [markA, markB, markM, markT, markS, markSR] = await Promise.all([
     latestSeq(db, threadA),
     latestSeq(db, threadB),
     latestSeq(db, threadM),
     latestSeq(db, threadT),
+    latestSeq(db, threadS),
+    latestSeq(db, threadSR),
   ]);
 
   const betaHeard: A2AEnvelope[] = [];
@@ -2028,6 +2558,82 @@ async function cmdSmoke(): Promise<void> {
     SMOKE_MCP_SERVER,
   ]);
 
+  // --- 5. the sleep-time worker (slice 6) --------------------------------
+  //
+  // The whole slice in one leg: events the agent already lived through become
+  // memory-plane rows while nothing is talking, and the pass's RECEIPT is
+  // journaled in the same transaction as the rows (DESIGN.md §5.3 item 3,
+  // CLAUDE.md invariant #6) — so "did it run" and "what did it write" are the
+  // same question asked of the log. `fake/sleep` answers the three forced tool
+  // calls, which is what makes this keyless and deterministic.
+  //
+  // Nothing here touches live context: every event a pass appends is
+  // audit-only, so this thread's rendered prompt is byte-identical before and
+  // after (DESIGN.md §3, §4.5).
+  await events.appendBatch(threadS, [
+    {
+      type: "ingress",
+      platform: "cli",
+      author: { platform: "cli", userId: "local" },
+      text: `remember: ${SMOKE_SLEEP_CANARY}`,
+      refs: [],
+    },
+    // A second event so the consumed range is a real span, and so the
+    // transcript renderer has more than one line to render.
+    { type: "message", role: "assistant", text: "Noted.", toolCalls: [], model: "fake/sleep" },
+  ]);
+  const sleepSettings: SettingsSnapshot = {
+    ...settings,
+    // Not the dev database's rows — this leg IS the thing under test.
+    // `reflectMinMemories: 1` is what makes the single row this pass extracts
+    // enough to trigger the consolidation pass in the same sweep.
+    sleep: { ...DEFAULT_SETTINGS.sleep, model: "fake/sleep", reflectMinMemories: 1 },
+  };
+  const sleepDeps = sleepDepsFor(boot, {
+    // The local surface is trusted (DESIGN.md §5.1), like `pinky sleep run`.
+    scope: { includeUser: true, includePrivate: true },
+    settings: sleepSettings,
+    agentId: SMOKE_SLEEP_AGENT,
+    provider: createFakeProvider("sleep"),
+  });
+  const sleepReport = await sleepSweep(sleepDeps, { threads: [threadS], ignoreIdle: true });
+  // Idempotence, which is the property that makes a stateless scheduler safe:
+  // the cursor moved past everything extractable, and everything the pass
+  // itself appended (`memory`, `sleep`) is material the worker does not read.
+  // `reflect: false` because the first sweep's insight is itself a new memory
+  // row, so a second reflection would consolidate the consolidation — legal
+  // (and bounded by reflectMinMemories), but not what this check is about.
+  const sleepAgain = await sleepSweep(sleepDeps, {
+    threads: [threadS],
+    ignoreIdle: true,
+    reflect: false,
+  });
+  const sleepSecond = sleepAgain.threads[0]?.result;
+
+  // Read back through the plane's own scope predicate, not by id: a row the
+  // §5.1 predicate cannot see is a row the agent will never recall.
+  const sleepHits = await boot.memory.search({
+    scope: {
+      agentId: SMOKE_SLEEP_AGENT,
+      channelId: threadS.channelId,
+      userId: "local",
+      includeUser: true,
+      includePrivate: true,
+    },
+    query: "smoke sleep canary amber-falcon",
+    limit: 10,
+  });
+  const isExtractReceipt = (d: ThreadEventData): d is ExtractReceipt =>
+    d.type === "sleep" && d.phase === "extract";
+  const isReflectReceipt = (d: ThreadEventData): d is ReflectReceipt =>
+    d.type === "sleep" && d.phase === "reflect";
+  const extractReceipt = (await events.history(threadS, { afterSeq: markS }))
+    .map((e) => e.data)
+    .find(isExtractReceipt);
+  const reflectReceipt = (await events.history(threadSR, { afterSeq: markSR }))
+    .map((e) => e.data)
+    .find(isReflectReceipt);
+
   // From this run's marks forward: one forward page each, which is orders of
   // magnitude more than a run appends.
   const historyA = await events.history(threadA, { afterSeq: markA });
@@ -2039,10 +2645,12 @@ async function cmdSmoke(): Promise<void> {
   const recallText = recallResult?.data.type === "tool_result" ? recallResult.data.text : "";
   const injected = prompts[0]?.[0];
 
-  // Cleanup before reporting: a failed check must not leave rows behind.
-  await db.query(`delete from memories where tenant_id = $1 and agent_id = $2`, [
+  // Cleanup before reporting: a failed check must not leave rows behind. The
+  // sleep agent's rows go too — the next run's reflect batch reads across
+  // channels, and yesterday's canary in it would make `added` unpredictable.
+  await db.query(`delete from memories where tenant_id = $1 and agent_id = any($2)`, [
     settings.tenantId,
-    SMOKE_MEMORY_AGENT,
+    [SMOKE_MEMORY_AGENT, SMOKE_SLEEP_AGENT],
   ]);
 
   const checks: [string, boolean][] = [
@@ -2108,6 +2716,27 @@ async function cmdSmoke(): Promise<void> {
       answer.includes("pinky-smoke-42") && answer.includes(FAKE_DEFERRED_MARKER),
     ],
     ["closing the mcp plane reaped its child process", reaped],
+    // --- slice 6 -----------------------------------------------------------
+    ["sleep extraction pass completed", sleepReport.threads[0]?.result.status === "done"],
+    [
+      "the worker turned an event into a memory row",
+      sleepHits.some((h) => h.text.includes("amber-falcon") && h.meta.source === "sleep:extract"),
+    ],
+    // The receipt is the pass's only durable record, and it committed with the
+    // rows above or not at all.
+    ["the extract pass journaled its receipt", (extractReceipt?.added ?? 0) >= 1],
+    [
+      "a second sweep over the same thread has nothing to extract",
+      sleepSecond?.status === "skipped" && sleepSecond.reason === "no-new-events",
+    ],
+    [
+      "reflection journaled its receipt on the worker's own thread",
+      reflectReceipt?.added === 1,
+    ],
+    [
+      "the consolidated insight is itself a memory row",
+      sleepHits.some((h) => h.text.startsWith(FAKE_SLEEP_REFLECT_PREFIX)),
+    ],
   ];
 
   let failed = 0;
@@ -2345,6 +2974,11 @@ function a2aWakeSource(
  *    sender half is idle without peers, but its consumer half (redelivering
  *    unconsumed messages) matters on a single node too.
  *
+ * The sleep-time worker's timer (slice 6) also lives here, and only here, when
+ * the BOOTSTRAP snapshot says `sleep.enabled`. Like `mcp.servers` it is read
+ * once — it sweeps every thread of the tenant, so it belongs to the process,
+ * not to a run — which means a `sleep.*` change lands on the next restart.
+ *
  * Wake-on-message is wired here and nowhere else: `wakes` (a2aWakeSource)
  * subscribes this process to its own mailbox, so a peer's message journals an
  * `a2a` event and wakes a run on that peer's thread — `run_started` carries
@@ -2409,14 +3043,33 @@ async function cmdHeadless(args: string[]): Promise<void> {
   let boot: Bootstrap | undefined;
   let server: ReturnType<typeof startGateway> | undefined;
   let stopSweep: (() => void) | undefined;
+  let stopSleep: (() => Promise<void>) | undefined;
   let session: Promise<void> | undefined;
   let released = false;
+  /**
+   * The sleep worker's shutdown switch, aborted BEFORE the pool closes.
+   *
+   * Without it the worker's abort guards never fire: a sweep in flight would
+   * keep opening provider round trips for every remaining due thread while the
+   * pool went away underneath, and the failure that followed would take the
+   * NON-abort path — journaling an `error` event onto a live conversation
+   * thread for what was only a SIGTERM.
+   */
+  const sleepStopping = new AbortController();
   // Everything this process holds, released once. Called by the shutdown
   // handler on a signal and by the `finally` on the normal path.
   const release = async (): Promise<void> => {
     if (released) return;
     released = true;
     stopSweep?.();
+    // Order matters: ABORT first, then await. `stopSleep()` clears the timer
+    // and waits for the sweep in flight, so awaiting it without the abort
+    // would wait for every remaining due thread's LLM round trip. With it, the
+    // pass returns at its next guard and the pool closes on a settled sweep —
+    // no transaction torn mid-flight. `installShutdown`'s grace timer is the
+    // valve if a provider hangs past it.
+    sleepStopping.abort(new Error("headless is shutting down"));
+    await stopSleep?.();
     server?.stop();
     await boot?.close();
   };
@@ -2467,6 +3120,39 @@ async function cmdHeadless(args: string[]): Promise<void> {
     // without peers, but the consumer-side redelivery does — an unconsumed
     // message is a single-node failure mode too (issue #4).
     stopSweep = startA2ASweep(started.messenger, logStderr, { redeliverFor: AGENT_ID });
+
+    // The sleep-time worker's timer (slice 6, DESIGN.md §5.3 item 3, §8.1).
+    //
+    // `sleep.*` is read ONCE here, from the BOOTSTRAP snapshot, exactly like
+    // `mcp.servers`: this is one process-lifetime timer sweeping EVERY thread
+    // of the tenant, not a per-run decision, so a `channel:`-scoped
+    // `sleep.enabled` has no thread to belong to and a change of any kind
+    // takes effect on the next restart rather than the next wake.
+    //
+    // A misconfigured worker must not cost the session: `createProvider`
+    // throws on an unroutable `sleep.model`, and refusing to serve stdin
+    // because a background sweep could not be built is exactly the
+    // "bad value stops the boot" failure the settings table exists to avoid
+    // (CLAUDE.md #3). So it degrades to no sweep, loudly, on stderr.
+    if (started.settings.sleep.enabled) {
+      try {
+        const deps = sleepDepsFor(started, {
+          // The worker inherits the surface's width (DESIGN.md §5.1): a shared
+          // bridge must not mint `user` rows it could not read back.
+          scope: { includeUser: !shared, includePrivate: !shared },
+          settings: started.settings,
+          signal: sleepStopping.signal,
+        });
+        stopSleep = startSleepSweep(deps, { intervalMs: started.settings.sleep.intervalMs });
+        logStderr(
+          `[sleep] sweep every ${started.settings.sleep.intervalMs}ms with ${deps.model} ` +
+            `(idle gate ${started.settings.sleep.idleMs}ms, ` +
+            `<= ${started.settings.sleep.maxThreadsPerSweep} thread(s) per sweep)`,
+        );
+      } catch (err) {
+        logStderr(`[sleep] disabled: ${errorMessage(err)}`);
+      }
+    }
 
     session = runHeadless({
       tenantId: started.settings.tenantId,
@@ -2526,6 +3212,9 @@ try {
     case "tools":
       await cmdTools(rest);
       break;
+    case "sleep":
+      await cmdSleep(rest);
+      break;
     case "smoke":
       await cmdSmoke();
       break;
@@ -2537,7 +3226,9 @@ try {
       await cmdHeadless(rest);
       break;
     default:
-      console.error("usage: pinky <migrate|config|memory|stats|mcp|tools|smoke|prompt|headless>");
+      console.error(
+        "usage: pinky <migrate|config|memory|stats|mcp|tools|sleep|smoke|prompt|headless>",
+      );
       process.exit(cmd ? 1 : 0);
   }
 } catch (err) {

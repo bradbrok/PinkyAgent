@@ -8,7 +8,7 @@
  * Model-visible: `continuity`, `ingress`, `a2a`, `notice`, `message`,
  * `tool_result`, and the `block` on the ONE `memory` recall event that opens a
  * window. Everything else (`decision`, `egress`, `error`, `restart`, `config`,
- * every other `memory` event) is audit-only and never costs context.
+ * `sleep`, every other `memory` event) is audit-only and never costs context.
  */
 import { canonicalizeArgs } from "./events";
 import type { ContinuityDoc, ThreadEvent, ToolCall } from "./events";
